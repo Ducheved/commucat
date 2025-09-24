@@ -26,6 +26,14 @@ payload_len = varint
 payload_bytes = opaque bytes interpreted per frame type
 ```
 
+### Limits
+
+* `frame_len` MUST be ≤ 16,777,216 bytes (16 MiB). Larger frames are rejected.
+* JSON control payloads MUST be ≤ 262,144 bytes (256 KiB) after serialization.
+* `channel_id` and `sequence` MUST fit into 32-bit unsigned integers; higher values are rejected.
+* Implementations MUST reject frames whose declared `payload_len` exceeds the remaining buffer.
+* Varints longer than 10 bytes or overflowing 64 bits MUST raise a decoding error.
+
 ### Frame Types
 
 | Type | Code | Payload semantics |
@@ -140,9 +148,24 @@ The payload is hashed with BLAKE3 and signed using the configured Ed25519 key. T
 ```
 Clients should treat receipt of `ERROR` as fatal for the stream.
 
+### Codec Diagnostics
+
+Codec failures surfaced during framing SHOULD be translated into terminal `ERROR` frames with machine-readable causes:
+
+| Condition | Suggested `title` |
+|-----------|-------------------|
+| Unknown frame type | `Invalid Frame Type` |
+| Control JSON cannot be parsed | `Invalid Control Payload` |
+| Declared frame length exceeds limits | `Frame Too Large` |
+| Declared payload length exceeds limits | `Payload Too Large` |
+| Control payload exceeds JSON limits | `Control Payload Too Large` |
+| Channel or sequence outside allowed range | `Identifier Out Of Range` |
+| Varint exceeds 64-bit width | `Varint Overflow` |
+| Buffer underrun before payload end | `Truncated Frame` |
+
 ## Sequence Numbers
 
-* Each sender maintains an independent 64-bit sequence per connection.
+* Each sender maintains an independent monotonic 32-bit sequence per connection. When reaching `u32::MAX`, peers MUST re-establish the tunnel to reset counters.
 * The server asserts monotonic behaviour but does not reset numbers across reconnects.
 * `ACK` frames echo the confirmed sequence in the control payload. Clients can resend unacknowledged frames as idempotent envelopes when needed.
 
