@@ -1,4 +1,4 @@
-use crate::config::{LedgerAdapter, ServerConfig};
+use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
 use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
 use blake3::hash as blake3_hash;
@@ -28,6 +28,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tokio::select;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
@@ -97,6 +98,7 @@ pub struct AppState {
     pub connections: RwLock<HashMap<String, ConnectionEntry>>,
     pub channel_routes: RwLock<HashMap<u64, ChannelRoute>>,
     pub peer_sessions: RwLock<HashMap<String, PeerPresence>>,
+    pub allowed_peers: HashMap<String, PeerConfig>,
     pub federation_signer: EventSigner,
     pub noise_private: [u8; 32],
     pub noise_public: [u8; 32],
@@ -107,20 +109,14 @@ pub struct AppState {
 pub struct ConnectionEntry {
     pub sender: mpsc::Sender<Frame>,
     pub session_id: String,
-    pub remote_addr: Option<String>,
     next_sequence: AtomicU64,
 }
 
 impl ConnectionEntry {
-    pub fn new(
-        sender: mpsc::Sender<Frame>,
-        session_id: String,
-        remote_addr: Option<String>,
-    ) -> Self {
+    pub fn new(sender: mpsc::Sender<Frame>, session_id: String) -> Self {
         ConnectionEntry {
             sender,
             session_id,
-            remote_addr,
             next_sequence: AtomicU64::new(1),
         }
     }
@@ -175,6 +171,12 @@ impl CommuCatApp {
                 Box::new(adapter)
             }
         };
+        let allowed_peers = config
+            .peers
+            .iter()
+            .cloned()
+            .map(|peer| (peer.domain.to_ascii_lowercase(), peer))
+            .collect::<HashMap<String, PeerConfig>>();
         storage.migrate().await?;
         let signer = EventSigner::new(&config.federation_seed);
         Ok(Arc::new(AppState {
@@ -184,6 +186,7 @@ impl CommuCatApp {
             connections: RwLock::new(HashMap::new()),
             channel_routes: RwLock::new(HashMap::new()),
             peer_sessions: RwLock::new(HashMap::new()),
+            allowed_peers,
             federation_signer: signer,
             noise_private: config.noise_private,
             noise_public: config.noise_public,
@@ -277,6 +280,28 @@ impl CommuCatApp {
                 return None;
             }
             "/metrics" => {
+                if !self.authorize_admin(&session) {
+                    let mut response = ResponseHeader::build_no_case(401, None).ok()?;
+                    response
+                        .append_header("content-type", "application/problem+json")
+                        .ok()?;
+                    let body = json!({
+                        "type": "about:blank",
+                        "title": "Unauthorized",
+                        "status": 401,
+                    })
+                    .to_string();
+                    let _ = session
+                        .write_response_header(Box::new(response))
+                        .await
+                        .ok()?;
+                    let _ = session
+                        .write_response_body(body.into_bytes().into(), true)
+                        .await
+                        .ok()?;
+                    let _ = session.finish().await.ok()?;
+                    return None;
+                }
                 let payload = self.state.metrics.encode_prometheus();
                 let mut response = ResponseHeader::build_no_case(200, None).ok()?;
                 response
@@ -318,6 +343,25 @@ impl CommuCatApp {
             .ok()?;
         let _ = session.finish().await.ok()?;
         None
+    }
+
+    fn authorize_admin(&self, session: &ServerSession) -> bool {
+        match self.state.config.admin_token.as_ref() {
+            None => true,
+            Some(expected) => {
+                let header = session
+                    .req_header()
+                    .headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok());
+                if let Some(value) = header {
+                    if let Some(token) = value.trim().strip_prefix("Bearer ") {
+                        return bool::from(token.as_bytes().ct_eq(expected.as_bytes()));
+                    }
+                }
+                false
+            }
+        }
     }
 
     async fn process_connect(
@@ -430,7 +474,7 @@ impl CommuCatApp {
             let mut connections = self.state.connections.write().await;
             connections.insert(
                 device_id.clone(),
-                ConnectionEntry::new(tx_out.clone(), session_id.clone(), remote_addr.clone()),
+                ConnectionEntry::new(tx_out.clone(), session_id.clone()),
             );
         }
 
@@ -774,14 +818,24 @@ impl CommuCatApp {
                         },
                     );
                 }
-                let candidates = {
+                let candidates = if relay {
+                    Vec::new()
+                } else {
+                    let now = Utc::now();
                     let peers = self.state.peer_sessions.read().await;
                     members
                         .iter()
                         .filter_map(|member| {
-                            peers
-                                .get(member)
-                                .and_then(|p| p.address.clone().map(|addr| (member.clone(), addr)))
+                            peers.get(member).and_then(|p| {
+                                let addr = p.address.clone()?;
+                                let elapsed = now.signed_duration_since(p.last_seen);
+                                let fresh = elapsed <= Duration::seconds(self.state.presence_ttl);
+                                if fresh {
+                                    Some((member.clone(), addr))
+                                } else {
+                                    None
+                                }
+                            })
                         })
                         .collect::<Vec<_>>()
                 };
@@ -923,6 +977,7 @@ impl CommuCatApp {
         let Some(route) = route else {
             return Err(ServerError::Invalid);
         };
+        let relay_mode = route.relay;
         let mut online_targets = Vec::new();
         let mut offline_targets = Vec::new();
         {
@@ -946,7 +1001,7 @@ impl CommuCatApp {
             let mut deliver = frame.clone();
             deliver.sequence = sequence;
             let _ = sender_channel.send(deliver).await;
-            info!("delivered frame to {}", member);
+            info!(target = %member, relay = relay_mode, "delivered frame");
         }
         if !offline_targets.is_empty() {
             let encoded = frame.encode()?;
@@ -964,25 +1019,33 @@ impl CommuCatApp {
                 if let Some(pos) = target.find('@') {
                     let domain = &target[pos + 1..];
                     if domain != self.state.config.domain {
-                        let event = FederationEvent {
-                            event_id: generate_id(target),
-                            origin: self.state.config.domain.clone(),
-                            created_at: Utc::now(),
-                            payload: json!({
-                                "channel": frame.channel_id,
-                                "sequence": frame.sequence,
-                                "payload": encode_hex(&encoded),
-                                "sender": sender,
-                                "target": target,
-                            }),
-                            scope: domain.to_string(),
-                        };
-                        let signed = sign_event(event, &self.state.federation_signer);
-                        info!(
-                            peer = %domain,
-                            event = %signed.event.event_id,
-                            "federation event queued"
-                        );
+                        let normalized = domain.to_ascii_lowercase();
+                        if let Some(peer) = self.state.allowed_peers.get(&normalized) {
+                            let event = FederationEvent {
+                                event_id: generate_id(target),
+                                origin: self.state.config.domain.clone(),
+                                created_at: Utc::now(),
+                                payload: json!({
+                                    "channel": frame.channel_id,
+                                    "sequence": frame.sequence,
+                                    "payload": encode_hex(&encoded),
+                                    "sender": sender,
+                                    "target": target,
+                                    "peer_endpoint": peer.endpoint,
+                                    "peer_public_key": encode_hex(&peer.public_key),
+                                }),
+                                scope: domain.to_string(),
+                            };
+                            let signed = sign_event(event, &self.state.federation_signer);
+                            info!(
+                                peer = %domain,
+                                endpoint = %peer.endpoint,
+                                event = %signed.event.event_id,
+                                "federation event queued"
+                            );
+                        } else {
+                            warn!(peer = %domain, "federation peer not allowed");
+                        }
                     }
                 }
             }

@@ -1,5 +1,4 @@
 use blake3::Hasher;
-use chrono::{DateTime, Utc};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Decodes a hexadecimal string into raw bytes.
@@ -49,11 +48,6 @@ pub fn generate_id(context: &str) -> String {
         .to_le_bytes();
     hasher.update(&now);
     encode_hex(hasher.finalize().as_bytes())
-}
-
-/// Returns the current timestamp in RFC3339 format.
-pub fn now_rfc3339() -> String {
-    DateTime::<Utc>::from(SystemTime::now()).to_rfc3339()
 }
 
 fn decode_hex_digit(digit: u8) -> Result<u8, &'static str> {

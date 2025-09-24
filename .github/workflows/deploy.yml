@@ -52,11 +52,11 @@ jobs:
           tar -czf commucat-server-${VERSION}.tar.gz -C dist commucat-server
 
       - name: Upload bundle to host
-        uses: appleboy/scp-action@v1.2.0
+        uses: appleboy/scp-action@v0.1.7
         with:
           host: ${{ secrets.PROD_SSH_HOST }}
           username: ${{ secrets.PROD_SSH_USER }}
-          key: ${{ secrets.PROD_SSH_KEY }}
+          password: ${{ secrets.PROD_SSH_PASSWORD }}
           source: commucat-server-${{ steps.meta.outputs.version }}.tar.gz
           target: /home/${{ secrets.PROD_SSH_USER }}/releases
           overwrite: true
@@ -67,7 +67,7 @@ jobs:
         with:
           host: ${{ secrets.PROD_SSH_HOST }}
           username: ${{ secrets.PROD_SSH_USER }}
-          key: ${{ secrets.PROD_SSH_KEY }}
+          password: ${{ secrets.PROD_SSH_PASSWORD }}
           script_stop: true
           script: |
             set -euo pipefail
