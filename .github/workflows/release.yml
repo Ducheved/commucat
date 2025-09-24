@@ -1,7 +1,6 @@
 name: Release
 
 on:
-  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -13,7 +12,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Checkout
@@ -30,11 +29,10 @@ jobs:
       - name: Install cargo-edit
         run: cargo install cargo-edit --locked
 
-      - name: Compute version
+      - name: Extract version
         id: meta
         run: |
-          COUNT=$(git rev-list --count HEAD)
-          VERSION="1.0.${COUNT}"
+          VERSION="${GITHUB_REF_NAME#v}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Apply workspace version
@@ -70,14 +68,6 @@ jobs:
           strip dist/commucat-server || true
           cp README.md dist/README.md
           tar -czf commucat-server-linux-amd64.tar.gz -C dist commucat-server README.md
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: commucat-server-${{ steps.meta.outputs.version }}
-          path: |
-            target/release/commucat-server
-            commucat-server-linux-amd64.tar.gz
 
       - name: Publish GitHub release asset
         if: github.event_name == 'push'
