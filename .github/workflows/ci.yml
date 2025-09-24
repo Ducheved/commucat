@@ -11,8 +11,6 @@ env:
 jobs:
   lint-test:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -37,17 +35,3 @@ jobs:
       - name: Docs
         run: cargo doc --workspace --no-deps
 
-      - name: Tag release
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch --tags
-          COUNT=$(git rev-list --count HEAD)
-          VERSION="1.0.${COUNT}"
-          TAG="v${VERSION}"
-          if git rev-parse "$TAG" >/dev/null 2>&1; then
-            exit 0
-          fi
-          git tag "$TAG"
-          git push origin "$TAG"
