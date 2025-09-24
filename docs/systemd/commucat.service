@@ -1,0 +1,19 @@
+[Unit]
+Description=CommuCat Secure Routing Server
+Documentation=https://github.com/ducheved/commucat
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=commucat
+Group=commucat
+WorkingDirectory=/home/commucat
+Environment=COMMUCAT_CONFIG=/etc/commucat/commucat.toml
+EnvironmentFile=-/etc/commucat/commucat.env
+ExecStart=/home/commucat/bin/commucat-server
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

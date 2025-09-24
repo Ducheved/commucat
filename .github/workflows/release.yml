@@ -74,16 +74,22 @@ jobs:
             sleep 20
           done
 
-      - name: Build release binary
-        run: cargo build --release -p commucat-server
+      - name: Build release binaries
+        run: cargo build --release -p commucat-server -p commucat-cli
 
-      - name: Package binary
+      - name: Package bundle
         run: |
-          mkdir -p dist
-          cp target/release/commucat-server dist/
-          strip dist/commucat-server || true
+          VERSION="${{ steps.meta.outputs.version }}"
+          PACKAGE="commucat-server-linux-amd64.tar.gz"
+          mkdir -p dist/bin dist/systemd
+          cp target/release/commucat-server dist/bin/
+          cp target/release/commucat-cli dist/bin/
+          strip dist/bin/commucat-server || true
+          strip dist/bin/commucat-cli || true
           cp README.md dist/README.md
-          tar -czf commucat-server-linux-amd64.tar.gz -C dist commucat-server README.md
+          cp commucat.toml dist/commucat.toml
+          cp docs/systemd/commucat.service dist/systemd/commucat.service
+          tar -czf "$PACKAGE" -C dist .
 
       - name: Publish GitHub release asset
         uses: softprops/action-gh-release@v2
@@ -96,3 +102,4 @@ jobs:
         run: |
           echo "Published crates at version ${{ steps.meta.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "Release tarball: commucat-server-linux-amd64.tar.gz" >> $GITHUB_STEP_SUMMARY
+          echo "Bundle includes server, cli, sample config, and systemd unit" >> $GITHUB_STEP_SUMMARY
