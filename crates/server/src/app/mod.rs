@@ -40,6 +40,8 @@ use tokio::select;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 
+const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>CommuCat</title>\n<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0b1120;color:#f9fafb;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;}main{max-width:480px;text-align:center;padding:2rem;background:rgba(15,23,42,0.85);border-radius:20px;box-shadow:0 10px 30px rgba(15,23,42,0.4);}h1{font-size:2.25rem;margin-bottom:0.5rem;}p{margin:0.75rem 0;color:#cbd5f5;}a{color:#38bdf8;text-decoration:none;}a:hover{text-decoration:underline;}</style>\n</head>\n<body>\n<main>\n<h1>CommuCat Server</h1>\n<p>Secure Noise + TLS relay for CCP-1 chats.</p>\n<p><a href=\"https://github.com/ducheved/commucat\">Project documentation</a></p>\n<p><a href=\"/healthz\">Health</a> · <a href=\"/readyz\">Readiness</a></p>\n</main>\n</body>\n</html>\n";
+
 #[derive(Debug)]
 pub enum ServerError {
     Storage,
@@ -301,6 +303,23 @@ impl CommuCatApp {
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.to_string();
         match path.as_str() {
+            "/" | "/index.html" => {
+                self.state.metrics.mark_ingress();
+                let mut response = ResponseHeader::build_no_case(200, None).ok()?;
+                response
+                    .append_header("content-type", "text/html; charset=utf-8")
+                    .ok()?;
+                session
+                    .write_response_header(Box::new(response))
+                    .await
+                    .ok()?;
+                session
+                    .write_response_body(Vec::from(LANDING_PAGE.as_bytes()).into(), true)
+                    .await
+                    .ok()?;
+                session.finish().await.ok()?;
+                return None;
+            }
             "/healthz" => {
                 self.state.metrics.mark_ingress();
                 let mut response = ResponseHeader::build_no_case(200, None).ok()?;

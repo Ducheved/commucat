@@ -28,9 +28,11 @@ target
 # A cat files (my personal notes)
 A.md
 ACat.md
+commucat.my.toml
 
 # Certs
 certs/
 *.crt
 *.key
 *.pem
+
