@@ -13,7 +13,7 @@ use commucat_ledger::{
 };
 use commucat_proto::{ControlEnvelope, Frame, FramePayload, FrameType};
 use commucat_storage::{
-    connect, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage, StorageError,
+    connect, DeviceRecord, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage, StorageError,
 };
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
@@ -660,9 +660,51 @@ impl CommuCatApp {
                 let client_static =
                     decode_hex32(client_static_hex).map_err(|_| ServerError::Invalid)?;
 
-                let record = self.state.storage.load_device(&device_id).await?;
-                if record.public_key != client_static.to_vec() {
-                    return Err(ServerError::Invalid);
+                let mut ledger_action = None;
+                match self.state.storage.load_device(&device_id).await {
+                    Ok(record) => {
+                        if record.public_key != client_static.to_vec() {
+                            if !self.state.config.auto_approve_devices {
+                                return Err(ServerError::Invalid);
+                            }
+                            let update = DeviceRecord {
+                                device_id: device_id.clone(),
+                                public_key: client_static.to_vec(),
+                                status: "active".to_string(),
+                                created_at: Utc::now(),
+                            };
+                            self.state.storage.upsert_device(&update).await?;
+                            ledger_action = Some("rotate");
+                        }
+                    }
+                    Err(StorageError::Missing) => {
+                        if !self.state.config.auto_approve_devices {
+                            return Err(ServerError::Invalid);
+                        }
+                        let insert = DeviceRecord {
+                            device_id: device_id.clone(),
+                            public_key: client_static.to_vec(),
+                            status: "active".to_string(),
+                            created_at: Utc::now(),
+                        };
+                        self.state.storage.upsert_device(&insert).await?;
+                        ledger_action = Some("register");
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+                if let Some(action) = ledger_action {
+                    let ledger_entry = LedgerRecord {
+                        digest: client_static,
+                        recorded_at: Utc::now(),
+                        metadata: json!({
+                            "device": device_id,
+                            "action": action,
+                            "source": "auto-approve",
+                        }),
+                    };
+                    if let Err(err) = self.state.ledger.submit(&ledger_entry) {
+                        warn!("ledger submission failed: {}", err);
+                    }
                 }
 
                 let noise = NoiseConfig {

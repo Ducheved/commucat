@@ -3,6 +3,7 @@ bind="0.0.0.0:8443"
 tls_cert="certs/server.crt"
 tls_key="certs/server.key"
 domain="localhost"
+auto_approve_devices=true
 keepalive="60"
 
 [storage]

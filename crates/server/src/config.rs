@@ -56,6 +56,7 @@ pub struct ServerConfig {
     pub postgres_dsn: String,
     pub redis_url: String,
     pub domain: String,
+    pub auto_approve_devices: bool,
     pub admin_token: Option<String>,
     pub noise_private: [u8; 32],
     pub noise_public: [u8; 32],
@@ -176,6 +177,13 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         .unwrap_or_else(|| "60".to_string())
         .parse::<u64>()
         .map_err(|_| ConfigError::Invalid)?;
+    let auto_approve = override_env(
+        "COMMUCAT_AUTO_APPROVE_DEVICES",
+        map.remove("server.auto_approve_devices"),
+    )?
+    .unwrap_or_else(|| "false".to_string())
+    .parse::<bool>()
+    .map_err(|_| ConfigError::Invalid)?;
 
     Ok(ServerConfig {
         bind: required(bind)?,
@@ -184,6 +192,7 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         postgres_dsn,
         redis_url,
         domain,
+        auto_approve_devices: auto_approve,
         admin_token,
         noise_private,
         noise_public,
