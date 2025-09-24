@@ -10,7 +10,7 @@ use tracing::info;
 
 fn main() {
     let _ = dotenvy::dotenv();
-    
+
     let subscriber = tracing_subscriber::fmt()
         .with_env_filter("info")
         .json()
