@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls};
 
-const INIT_SQL: &str = include_str!("../../../migrations/001_init.sql");
+const INIT_SQL: &str = include_str!("../migrations/001_init.sql");
 
 #[derive(Debug)]
 pub enum StorageError {
