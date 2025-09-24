@@ -1,0 +1,18 @@
+[package]
+name = "commucat-federation"
+version = "1.0.0"
+edition = "2021"
+description = "Federation event signing and verification for CommuCat domains"
+license = "MPL-2.0"
+homepage = "https://commucat.tech"
+repository = "https://github.com/ducheved/commucat"
+readme = "README.md"
+keywords = ["commucat", "federation", "signature"]
+categories = ["network-programming", "cryptography"]
+
+[dependencies]
+blake3 = { workspace = true }
+chrono = { workspace = true }
+commucat-crypto = { path = "../crypto", version = "1.0" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }

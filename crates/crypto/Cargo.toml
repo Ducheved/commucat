@@ -1,0 +1,18 @@
+[package]
+name = "commucat-crypto"
+version = "1.0.0"
+edition = "2021"
+description = "Noise handshake helpers and Ed25519 tooling for CommuCat"
+license = "MPL-2.0"
+homepage = "https://commucat.tech"
+repository = "https://github.com/ducheved/commucat"
+readme = "README.md"
+keywords = ["commucat", "noise", "crypto"]
+categories = ["cryptography", "network-programming"]
+
+[dependencies]
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+snow = { workspace = true }

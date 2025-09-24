@@ -1,0 +1,84 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. 1.0.42). Leave empty to use latest tag."
+        required: false
+  release:
+    types: [published]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: meta
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+            TAG="${TAG#v}"
+            echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="dev-$(git rev-parse --short HEAD)"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build server binary
+        run: cargo build --release -p commucat-server
+
+      - name: Package artifact
+        run: |
+          VERSION="${{ steps.meta.outputs.version }}"
+          mkdir -p dist
+          cp target/release/commucat-server dist/
+          strip dist/commucat-server || true
+          tar -czf commucat-server-${VERSION}.tar.gz -C dist commucat-server
+
+      - name: Upload bundle to host
+        uses: appleboy/scp-action@v1.2.0
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          source: commucat-server-${{ steps.meta.outputs.version }}.tar.gz
+          target: /home/${{ secrets.PROD_SSH_USER }}/releases
+          overwrite: true
+          strip_components: 0
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          key: ${{ secrets.PROD_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            VERSION="${{ steps.meta.outputs.version }}"
+            mkdir -p ~/releases ~/bin
+            tar -xzf ~/releases/commucat-server-${VERSION}.tar.gz -C ~/releases
+            install -Dm755 ~/releases/commucat-server ~/bin/commucat-server
+            rm -f ~/releases/commucat-server-${VERSION}.tar.gz
+            sudo systemctl restart commucat
+
+      - name: Summary
+        run: |
+          echo "Deployed commucat-server version ${{ steps.meta.outputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "Host: ${{ secrets.PROD_SSH_HOST }}" >> $GITHUB_STEP_SUMMARY

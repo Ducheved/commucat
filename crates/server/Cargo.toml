@@ -1,0 +1,29 @@
+[package]
+name = "commucat-server"
+version = "1.0.0"
+edition = "2021"
+description = "CommuCat secure messaging router built on Pingora"
+license = "MPL-2.0"
+homepage = "https://commucat.tech"
+repository = "https://github.com/ducheved/commucat"
+readme = "README.md"
+keywords = ["commucat", "server", "pingora"]
+categories = ["network-programming", "asynchronous"]
+publish = false
+
+[dependencies]
+chrono = { workspace = true }
+commucat-crypto = { path = "../crypto", version = "1.0" }
+commucat-federation = { path = "../federation", version = "1.0" }
+commucat-ledger = { path = "../ledger", version = "1.0" }
+commucat-proto = { path = "../proto", version = "1.0" }
+commucat-storage = { path = "../storage", version = "1.0" }
+blake3 = { workspace = true }
+redis = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+snow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+pingora = { workspace = true }

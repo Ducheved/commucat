@@ -1,0 +1,35 @@
+[workspace]
+members = [
+    "crates/server",
+    "crates/proto",
+    "crates/crypto",
+    "crates/storage",
+    "crates/federation",
+    "crates/ledger",
+    "crates/cli"
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+description = "CommuCat secure routing server and supporting crates"
+license = "MPL-2.0"
+authors = ["Ducheved <me@ducheved.ru>"]
+repository = "https://github.com/ducheved/commucat"
+homepage = "https://commucat.tech"
+readme = "README.md"
+publish = false
+
+[workspace.dependencies]
+blake3 = { version = "1.5" }
+ed25519-dalek = { version = "2.1", features = ["std"] }
+pingora = { version = "0.6.0", features = ["rustls"] }
+redis = { version = "0.24", features = ["aio", "tokio-comp"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+snow = { version = "0.10" }
+tokio = { version = "1.35", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4"] }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
