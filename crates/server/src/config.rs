@@ -41,7 +41,7 @@ pub struct LedgerConfig {
     pub target: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerAdapter {
     Null,
     File,
@@ -241,11 +241,10 @@ fn parse_peers(raw: String) -> Result<Vec<PeerConfig>, ConfigError> {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::path::PathBuf;
 
     #[test]
     fn parse_configuration_minimal() {
-        let mut path = PathBuf::from(env::temp_dir());
+        let mut path = env::temp_dir();
         path.push("commucat_test_config.toml");
         let mut file = fs::File::create(&path).unwrap();
         file.write_all(

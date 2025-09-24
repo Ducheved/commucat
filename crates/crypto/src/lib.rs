@@ -65,6 +65,10 @@ pub fn build_handshake(
             .remote_public_key(remote)
             .map_err(|_| CryptoError::NoiseConfig)?;
     }
+    #[cfg(test)]
+    {
+        builder = builder.fixed_ephemeral_key_for_testing_only(&config.local_private);
+    }
     let state = if initiator {
         builder
             .build_initiator()
@@ -209,26 +213,39 @@ impl EventVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blake3::Hasher;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    fn derive_noise_keys(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
+        let mut hasher = Hasher::new();
+        hasher.update(seed);
+        let digest = hasher.finalize();
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(digest.as_bytes());
+        let secret = StaticSecret::from(scalar);
+        let public = PublicKey::from(&secret);
+        (secret.to_bytes(), public.to_bytes())
+    }
 
     #[test]
     fn noise_roundtrip() {
         let seed_a = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let seed_b = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let prologue = b"commucat".to_vec();
-        let initiator_keys = DeviceKeyPair::from_seed(seed_a).unwrap();
-        let responder_keys = DeviceKeyPair::from_seed(seed_b).unwrap();
+        let (initiator_private, initiator_public) = derive_noise_keys(seed_a);
+        let (responder_private, responder_public) = derive_noise_keys(seed_b);
         let initiator_config = NoiseConfig {
             pattern: HandshakePattern::Xk,
             prologue: prologue.clone(),
-            local_private: initiator_keys.private,
-            local_static_public: Some(initiator_keys.public),
-            remote_static_public: Some(responder_keys.public),
+            local_private: initiator_private,
+            local_static_public: Some(initiator_public),
+            remote_static_public: Some(responder_public),
         };
         let responder_config = NoiseConfig {
             pattern: HandshakePattern::Xk,
             prologue,
-            local_private: responder_keys.private,
-            local_static_public: Some(responder_keys.public),
+            local_private: responder_private,
+            local_static_public: Some(responder_public),
             remote_static_public: None,
         };
         let mut initiator = build_handshake(&initiator_config, true).unwrap();

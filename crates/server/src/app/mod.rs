@@ -241,42 +241,42 @@ impl CommuCatApp {
                 self.state.metrics.mark_ingress();
                 let mut response = ResponseHeader::build_no_case(200, None).ok()?;
                 response.append_header("content-type", "text/plain").ok()?;
-                let _ = session
+                session
                     .write_response_header(Box::new(response))
                     .await
                     .ok()?;
-                let _ = session
+                session
                     .write_response_body(Vec::from("ok".as_bytes()).into(), true)
                     .await
                     .ok()?;
-                let _ = session.finish().await.ok()?;
+                session.finish().await.ok()?;
                 return None;
             }
             "/readyz" => {
                 if self.state.storage.readiness().await.is_ok() {
                     let mut response = ResponseHeader::build_no_case(200, None).ok()?;
                     response.append_header("content-type", "text/plain").ok()?;
-                    let _ = session
+                    session
                         .write_response_header(Box::new(response))
                         .await
                         .ok()?;
-                    let _ = session
+                    session
                         .write_response_body(Vec::from("ready".as_bytes()).into(), true)
                         .await
                         .ok()?;
                 } else {
                     let mut response = ResponseHeader::build_no_case(503, None).ok()?;
                     response.append_header("content-type", "text/plain").ok()?;
-                    let _ = session
+                    session
                         .write_response_header(Box::new(response))
                         .await
                         .ok()?;
-                    let _ = session
+                    session
                         .write_response_body(Vec::from("degraded".as_bytes()).into(), true)
                         .await
                         .ok()?;
                 }
-                let _ = session.finish().await.ok()?;
+                session.finish().await.ok()?;
                 return None;
             }
             "/metrics" => {
@@ -291,15 +291,15 @@ impl CommuCatApp {
                         "status": 401,
                     })
                     .to_string();
-                    let _ = session
+                    session
                         .write_response_header(Box::new(response))
                         .await
                         .ok()?;
-                    let _ = session
+                    session
                         .write_response_body(body.into_bytes().into(), true)
                         .await
                         .ok()?;
-                    let _ = session.finish().await.ok()?;
+                    session.finish().await.ok()?;
                     return None;
                 }
                 let payload = self.state.metrics.encode_prometheus();
@@ -307,15 +307,15 @@ impl CommuCatApp {
                 response
                     .append_header("content-type", "text/plain; version=0.0.4")
                     .ok()?;
-                let _ = session
+                session
                     .write_response_header(Box::new(response))
                     .await
                     .ok()?;
-                let _ = session
+                session
                     .write_response_body(payload.into_bytes().into(), true)
                     .await
                     .ok()?;
-                let _ = session.finish().await.ok()?;
+                session.finish().await.ok()?;
                 return None;
             }
             _ => {}
@@ -333,15 +333,15 @@ impl CommuCatApp {
             "status": 404,
         })
         .to_string();
-        let _ = session
+        session
             .write_response_header(Box::new(response))
             .await
             .ok()?;
-        let _ = session
+        session
             .write_response_body(body.into_bytes().into(), true)
             .await
             .ok()?;
-        let _ = session.finish().await.ok()?;
+        session.finish().await.ok()?;
         None
     }
 
@@ -375,7 +375,7 @@ impl CommuCatApp {
             .append_header("content-type", "application/octet-stream")
             .ok()?;
         response.append_header("cache-control", "no-store").ok()?;
-        let _ = session
+        session
             .write_response_header(Box::new(response))
             .await
             .ok()?;
@@ -427,7 +427,7 @@ impl CommuCatApp {
                                 }),
                             };
                             let _ = self.write_frame(&mut session, error_frame).await;
-                            let _ = session.finish().await.ok()?;
+                            session.finish().await.ok()?;
                             return None;
                         }
                         if matches!(handshake.stage, HandshakeStage::Established) {
@@ -448,7 +448,7 @@ impl CommuCatApp {
                             }),
                         };
                         let _ = self.write_frame(&mut session, error_frame).await;
-                        let _ = session.finish().await.ok()?;
+                        session.finish().await.ok()?;
                         return None;
                     }
                 }
@@ -609,7 +609,7 @@ impl CommuCatApp {
         }
 
         self.cleanup_connection(&device_id).await;
-        let _ = session.finish().await.ok()?;
+        session.finish().await.ok()?;
         None
     }
 

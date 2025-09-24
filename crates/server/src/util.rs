@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Decodes a hexadecimal string into raw bytes.
 pub fn decode_hex(input: &str) -> Result<Vec<u8>, &'static str> {
-    if input.len() % 2 != 0 {
+    if !input.len().is_multiple_of(2) {
         return Err("invalid hex length");
     }
     let mut output = Vec::with_capacity(input.len() / 2);
