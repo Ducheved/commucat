@@ -54,8 +54,8 @@ payload_bytes = opaque bytes interpreted per frame type
 | `TYPING` | `0x07` | Ciphertext or lightweight hint routed like `MSG` |
 | `PRESENCE` | `0x08` | JSON control heartbeat/availability update |
 | `KEY_UPDATE` | `0x09` | Ciphertext with new encryption material |
-| `GROUP_CREATE` | `0x0a` | JSON control describing new group |
-| `GROUP_INVITE` | `0x0b` | JSON control inviting member to group |
+| `GROUP_CREATE` | `0x0a` | JSON control describing new group (persists roster) |
+| `GROUP_INVITE` | `0x0b` | JSON control inviting member to group (role aware) |
 | `GROUP_EVENT` | `0x0c` | Ciphertext or control for group fanout |
 | `ERROR` | `0x0d` | JSON control describing protocol errors |
 
@@ -114,6 +114,8 @@ After message three the Noise state switches into transport mode. The server nev
 
 *Noise parameters*: `Noise_XK_25519_ChaChaPoly_BLAKE2s` or `Noise_IK_25519_ChaChaPoly_BLAKE2s` with empty PSKs and configurable prologue. Clients derive AEAD keys for subsequent ciphertext frames.
 
+*Device key audit*: whenever a device is auto-approved or rotates a static key, the server records a row in `device_key_event` (event id, device id, public key, timestamp). Registrations that fail to persist this audit trail are rejected to prevent unauthenticated devices from joining silently.
+
 ## Routing Semantics
 
 * `channel_id` identifies the virtual channel. Clients must send a `JOIN` control frame before routing ciphertext on a new channel.
@@ -127,6 +129,29 @@ After message three the Noise state switches into transport mode. The server nev
   Setting `relay=true` forces server fan-out even if direct connectivity is possible.
 * `LEAVE` removes the sender from server-side routing tables.
 * For direct channels the server distributes observed socket addresses via `PRESENCE` control frames, enabling UDP/TCP hole punching attempts. Clients fall back to server relay upon timeout.
+
+### Group Channels
+
+* When a `JOIN` control payload carries `group_id`, the server loads `chat_group` and `group_member` state to validate the roster. Join requests from non-members are rejected.
+* `GROUP_CREATE` bridges in-memory routes with persistent membership. The payload shape is:
+  ```json
+  {
+    "group_id": "optional-client-generated",
+    "members": ["owner-device", "peer-device"],
+    "roles": {"peer-device": "admin"},
+    "relay": true
+  }
+  ```
+  The server assigns the sender as `owner`, upserts all listed members, and acknowledges with `{"ack": <seq>, "group_id": "resolved"}`. Subsequent reconnects reuse the stored roster.
+* `GROUP_INVITE` lets owners/admins extend the roster:
+  ```json
+  {
+    "group_id": "grp-123",
+    "device": "new-device",
+    "role": "member"
+  }
+  ```
+  The server normalises roles (promoting requests for `owner` to `admin`) and updates routing tables in-memory and in PostgreSQL. Acks echo the invited device id.
 
 ## Federation
 
@@ -144,6 +169,8 @@ When a `JOIN` announces members outside the local domain (`device@remote.example
 }
 ```
 The payload is hashed with BLAKE3 and signed using the configured Ed25519 key. The signed envelope is queued for HTTPS (HTTP/2) delivery to the peer domain.
+
+Peer metadata (`federation_peer`) records domain, endpoint, public key, and status (`active`, `pending`, `blocked`). Static peers from configuration are merged with this registry; runtime discoveries promote `pending` peers to `active` once traffic is queued.
 
 ## Error Frames
 
@@ -182,7 +209,7 @@ Codec failures surfaced during framing SHOULD be translated into terminal `ERROR
 
 ## Offline Delivery
 
-Encrypted frames destined for offline members are persisted in PostgreSQL (`relay_queue`) under key `inbox:{device_id}`. Upon reconnect the server replays stored frames assigning fresh sequence numbers for the recipient.
+Encrypted frames destined for offline members are persisted in PostgreSQL (`relay_queue`) under key `inbox:{device_id}`. Upon reconnect the server replays stored frames assigning fresh sequence numbers for the recipient. Each replay updates `inbox_offset` so clients can resume idempotently and operators can audit the last delivered envelope per entity/channel pair.
 
 ## Presence Metadata
 

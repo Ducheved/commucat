@@ -424,4 +424,46 @@ mod tests {
             Err(CodecError::FrameTooLarge)
         ));
     }
+
+    #[test]
+    fn encode_group_control_frame() {
+        let frame = Frame {
+            channel_id: 99,
+            sequence: 1,
+            frame_type: FrameType::GroupInvite,
+            payload: FramePayload::Control(ControlEnvelope {
+                properties: serde_json::json!({
+                    "group_id": "grp-1",
+                    "device": "dev-1",
+                }),
+            }),
+        };
+        let encoded = frame.encode().unwrap();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.frame_type, FrameType::GroupInvite);
+    }
+
+    #[test]
+    fn encode_large_batch() {
+        let mut buffer = Vec::new();
+        for index in 0..512u64 {
+            let frame = Frame {
+                channel_id: index,
+                sequence: index,
+                frame_type: FrameType::Msg,
+                payload: FramePayload::Opaque(vec![0u8; 16]),
+            };
+            let encoded = frame.encode().unwrap();
+            buffer.extend_from_slice(&encoded);
+        }
+        let mut cursor = buffer.as_slice();
+        let mut decoded = 0;
+        while !cursor.is_empty() {
+            let (frame, read) = Frame::decode(cursor).unwrap();
+            assert_eq!(frame.frame_type, FrameType::Msg);
+            cursor = &cursor[read..];
+            decoded += 1;
+        }
+        assert_eq!(decoded, 512);
+    }
 }

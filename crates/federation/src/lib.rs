@@ -104,4 +104,23 @@ mod tests {
         let signed = sign_event(event, &signer);
         verify_event(&signed, &verifier).unwrap();
     }
+
+    #[test]
+    fn verify_event_rejects_tampered_payload() {
+        let keys = DeviceKeyPair::from_seed(b"tamper-detection-seed-tamper-detect").unwrap();
+        let signer = EventSigner::new(&keys);
+        let verifier = EventVerifier {
+            public: keys.public,
+        };
+        let event = FederationEvent {
+            event_id: "evt-2".to_string(),
+            origin: "example.org".to_string(),
+            created_at: Utc::now(),
+            payload: serde_json::json!({"channel": "1337", "payload": "cipher"}),
+            scope: "relay".to_string(),
+        };
+        let mut signed = sign_event(event, &signer);
+        signed.event.payload = serde_json::json!({"channel": "1337", "payload": "altered"});
+        assert!(verify_event(&signed, &verifier).is_err());
+    }
 }

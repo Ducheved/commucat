@@ -16,7 +16,8 @@ use commucat_proto::{
     FramePayload, FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use commucat_storage::{
-    connect, DeviceRecord, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
+    connect, ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
+    InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
     StorageError, UserProfile,
 };
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
@@ -31,6 +32,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use subtle::ConstantTimeEq;
@@ -64,6 +66,26 @@ impl Display for ServerError {
                 write!(f, "protocol negotiation failed: {}", reason)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_route_retains_group_metadata() {
+        let mut members = HashSet::new();
+        members.insert("dev-1".to_string());
+        let route = ChannelRoute {
+            members: members.clone(),
+            relay: true,
+            group_id: Some("grp-1".to_string()),
+        };
+        let cloned = route.clone();
+        assert!(cloned.members.contains("dev-1"));
+        assert_eq!(cloned.group_id.as_deref(), Some("grp-1"));
+        assert!(route.relay);
     }
 }
 
@@ -108,6 +130,7 @@ pub struct AppState {
     pub channel_routes: RwLock<HashMap<u64, ChannelRoute>>,
     pub peer_sessions: RwLock<HashMap<String, PeerPresence>>,
     pub allowed_peers: HashMap<String, PeerConfig>,
+    pub dynamic_peers: RwLock<HashMap<String, PeerConfig>>,
     pub federation_signer: EventSigner,
     pub noise_private: [u8; 32],
     pub noise_public: [u8; 32],
@@ -141,6 +164,7 @@ impl ConnectionEntry {
 pub struct ChannelRoute {
     pub members: HashSet<String>,
     pub relay: bool,
+    pub group_id: Option<String>,
 }
 
 pub struct PeerPresence {
@@ -192,6 +216,31 @@ impl CommuCatApp {
             .map(|peer| (peer.domain.to_ascii_lowercase(), peer))
             .collect::<HashMap<String, PeerConfig>>();
         storage.migrate().await?;
+        let stored_peers = storage
+            .list_federation_peers()
+            .await?
+            .into_iter()
+            .filter(|peer| {
+                matches!(
+                    peer.status,
+                    FederationPeerStatus::Active | FederationPeerStatus::Pending
+                )
+            })
+            .map(|peer| {
+                let route = PeerConfig {
+                    domain: peer.domain.clone(),
+                    endpoint: peer.endpoint.clone(),
+                    public_key: peer.public_key,
+                };
+                (peer.domain.to_ascii_lowercase(), route)
+            })
+            .collect::<HashMap<String, PeerConfig>>();
+        let mut dynamic_seed = HashMap::new();
+        for (domain, peer) in stored_peers.into_iter() {
+            if !allowed_peers.contains_key(&domain) {
+                dynamic_seed.insert(domain, peer);
+            }
+        }
         let signer = EventSigner::new(&config.federation_seed);
         Ok(Arc::new(AppState {
             storage,
@@ -201,6 +250,7 @@ impl CommuCatApp {
             channel_routes: RwLock::new(HashMap::new()),
             peer_sessions: RwLock::new(HashMap::new()),
             allowed_peers,
+            dynamic_peers: RwLock::new(dynamic_seed),
             federation_signer: signer,
             noise_private: config.noise_private,
             noise_public: config.noise_public,
@@ -585,6 +635,7 @@ impl CommuCatApp {
             .claim_envelopes(&format!("inbox:{}", device_id), 128)
             .await
         {
+            let mut last_envelope = None;
             for item in pending {
                 if let Ok((mut stored_frame, _)) = Frame::decode(&item.payload) {
                     let sequence = {
@@ -596,7 +647,19 @@ impl CommuCatApp {
                     if let Some(seq) = sequence {
                         stored_frame.sequence = seq;
                         let _ = tx_out.send(stored_frame).await;
+                        last_envelope = Some(item.envelope_id.clone());
                     }
+                }
+            }
+            if let Some(last) = last_envelope {
+                let offset = InboxOffset {
+                    entity_id: device_id.clone(),
+                    channel_id: format!("inbox:{}", device_id),
+                    last_envelope_id: Some(last),
+                    updated_at: Utc::now(),
+                };
+                if let Err(err) = self.state.storage.store_inbox_offset(&offset).await {
+                    warn!("inbox offset persist failed: {}", err);
                 }
             }
         }
@@ -667,7 +730,7 @@ impl CommuCatApp {
                     return Err(ServerError::Invalid);
                 }
                 let envelope = match frame.payload {
-                    FramePayload::Control(env) => env,
+                    FramePayload::Control(ref env) => env,
                     _ => return Err(ServerError::Invalid),
                 };
                 let negotiated_version = if let Some(list_value) =
@@ -868,9 +931,21 @@ impl CommuCatApp {
                 }
 
                 if let Some(action) = ledger_action {
+                    let recorded_at = Utc::now();
+                    let event = DeviceKeyEvent {
+                        event_id: generate_id(&format!(
+                            "dke:{}:{}",
+                            device_id,
+                            recorded_at.timestamp_nanos_opt().unwrap_or_default()
+                        )),
+                        device_id: device_id.clone(),
+                        public_key: client_static.to_vec(),
+                        recorded_at,
+                    };
+                    self.state.storage.record_device_key_event(&event).await?;
                     let ledger_entry = LedgerRecord {
                         digest: client_static,
-                        recorded_at: Utc::now(),
+                        recorded_at,
                         metadata: json!({
                             "device": device_id,
                             "user": user_id,
@@ -931,7 +1006,7 @@ impl CommuCatApp {
                     return Err(ServerError::Invalid);
                 }
                 let envelope = match frame.payload {
-                    FramePayload::Control(env) => env,
+                    FramePayload::Control(ref env) => env,
                     _ => return Err(ServerError::Invalid),
                 };
                 let handshake_hex = envelope
@@ -1012,26 +1087,45 @@ impl CommuCatApp {
         match frame.frame_type {
             FrameType::Join => {
                 let envelope = match frame.payload {
-                    FramePayload::Control(env) => env,
+                    FramePayload::Control(ref env) => env,
                     _ => return Err(ServerError::Invalid),
                 };
-                let members_value = envelope
-                    .properties
-                    .get("members")
-                    .and_then(|v| v.as_array())
-                    .ok_or(ServerError::Invalid)?;
-                let mut members = HashSet::new();
-                for entry in members_value {
-                    if let Some(value) = entry.as_str() {
-                        members.insert(value.to_string());
-                    }
-                }
-                members.insert(device_id.to_string());
                 let relay = envelope
                     .properties
                     .get("relay")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                let mut declared = HashSet::new();
+                if let Some(members_value) = envelope
+                    .properties
+                    .get("members")
+                    .and_then(|v| v.as_array())
+                {
+                    for entry in members_value {
+                        if let Some(value) = entry.as_str() {
+                            declared.insert(value.to_string());
+                        }
+                    }
+                }
+                let group_id = envelope
+                    .properties
+                    .get("group_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let mut members = if let Some(ref gid) = group_id {
+                    let persisted = self.state.storage.list_group_members(gid).await?;
+                    let mut set = HashSet::new();
+                    for member in persisted {
+                        set.insert(member.device_id);
+                    }
+                    if !set.contains(device_id) {
+                        return Err(ServerError::Invalid);
+                    }
+                    set
+                } else {
+                    declared
+                };
+                members.insert(device_id.to_string());
                 {
                     let mut routes = self.state.channel_routes.write().await;
                     routes.insert(
@@ -1039,6 +1133,7 @@ impl CommuCatApp {
                         ChannelRoute {
                             members: members.clone(),
                             relay,
+                            group_id: group_id.clone(),
                         },
                     );
                 }
@@ -1085,14 +1180,18 @@ impl CommuCatApp {
                         }
                     }
                 }
+                let mut ack_payload = json!({
+                    "ack": frame.sequence,
+                });
+                if let Some(gid) = group_id {
+                    ack_payload["group_id"] = json!(gid);
+                }
                 let ack = Frame {
                     channel_id: frame.channel_id,
                     sequence: *server_sequence,
                     frame_type: FrameType::Ack,
                     payload: FramePayload::Control(ControlEnvelope {
-                        properties: json!({
-                            "ack": frame.sequence,
-                        }),
+                        properties: ack_payload,
                     }),
                 };
                 *server_sequence += 1;
@@ -1182,7 +1281,78 @@ impl CommuCatApp {
                 );
                 Ok(())
             }
-            FrameType::GroupCreate | FrameType::GroupInvite => {
+            FrameType::GroupCreate => {
+                let envelope = match frame.payload {
+                    FramePayload::Control(ref env) => env,
+                    _ => return Err(ServerError::Invalid),
+                };
+                let provided_group_id = envelope
+                    .properties
+                    .get("group_id")
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let group_id = provided_group_id
+                    .unwrap_or_else(|| generate_id(&format!("group:{}", device_id)));
+                let created_at = Utc::now();
+                let relay = envelope
+                    .properties
+                    .get("relay")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let mut members = HashSet::new();
+                members.insert(device_id.to_string());
+                if let Some(array) = envelope
+                    .properties
+                    .get("members")
+                    .and_then(|v| v.as_array())
+                {
+                    for entry in array {
+                        if let Some(value) = entry.as_str() {
+                            members.insert(value.to_string());
+                        }
+                    }
+                }
+                let roles_map = envelope
+                    .properties
+                    .get("roles")
+                    .and_then(|v| v.as_object())
+                    .cloned();
+                let group = ChatGroup {
+                    group_id: group_id.clone(),
+                    owner_device: device_id.to_string(),
+                    created_at,
+                };
+                self.state.storage.create_group(&group).await?;
+                for member in members.iter() {
+                    let role = if member == device_id {
+                        GroupRole::Owner
+                    } else if let Some(map) = roles_map.as_ref() {
+                        map.get(member)
+                            .and_then(|value| value.as_str())
+                            .and_then(|name| GroupRole::from_str(name).ok())
+                            .unwrap_or(GroupRole::Member)
+                    } else {
+                        GroupRole::Member
+                    };
+                    let record = GroupMember {
+                        group_id: group_id.clone(),
+                        device_id: member.clone(),
+                        role,
+                        joined_at: created_at,
+                    };
+                    self.state.storage.add_group_member(&record).await?;
+                }
+                {
+                    let mut routes = self.state.channel_routes.write().await;
+                    routes.insert(
+                        frame.channel_id,
+                        ChannelRoute {
+                            members: members.clone(),
+                            relay,
+                            group_id: Some(group_id.clone()),
+                        },
+                    );
+                }
                 self.broadcast_frame(device_id, frame.clone()).await?;
                 let ack = Frame {
                     channel_id: frame.channel_id,
@@ -1191,6 +1361,89 @@ impl CommuCatApp {
                     payload: FramePayload::Control(ControlEnvelope {
                         properties: json!({
                             "ack": frame.sequence,
+                            "group_id": group_id,
+                        }),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::GroupInvite => {
+                let envelope = match frame.payload {
+                    FramePayload::Control(ref env) => env,
+                    _ => return Err(ServerError::Invalid),
+                };
+                let group_id = envelope
+                    .properties
+                    .get("group_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or(ServerError::Invalid)?
+                    .to_string();
+                let invitee = envelope
+                    .properties
+                    .get("device")
+                    .and_then(|v| v.as_str())
+                    .ok_or(ServerError::Invalid)?
+                    .to_string();
+                let requested_role = envelope
+                    .properties
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .and_then(|value| GroupRole::from_str(value).ok())
+                    .unwrap_or(GroupRole::Member);
+                let role = match requested_role {
+                    GroupRole::Owner => GroupRole::Admin,
+                    other => other,
+                };
+                let members = self.state.storage.list_group_members(&group_id).await?;
+                let mut inviter_role = None;
+                let mut member_set = HashSet::new();
+                for record in members.iter() {
+                    if record.device_id == device_id {
+                        inviter_role = Some(record.role.clone());
+                    }
+                    member_set.insert(record.device_id.clone());
+                }
+                let inviter_role = inviter_role.ok_or(ServerError::Invalid)?;
+                if matches!(inviter_role, GroupRole::Member) {
+                    return Err(ServerError::Invalid);
+                }
+                let now = Utc::now();
+                let record = GroupMember {
+                    group_id: group_id.clone(),
+                    device_id: invitee.clone(),
+                    role,
+                    joined_at: now,
+                };
+                self.state.storage.add_group_member(&record).await?;
+                member_set.insert(invitee.clone());
+                {
+                    let mut routes = self.state.channel_routes.write().await;
+                    routes
+                        .entry(frame.channel_id)
+                        .and_modify(|route| {
+                            route.members.insert(invitee.clone());
+                            if route.group_id.is_none() {
+                                route.group_id = Some(group_id.clone());
+                            }
+                        })
+                        .or_insert_with(|| ChannelRoute {
+                            members: member_set.clone(),
+                            relay: true,
+                            group_id: Some(group_id.clone()),
+                        });
+                }
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: json!({
+                            "ack": frame.sequence,
+                            "group_id": group_id,
+                            "device": invitee,
                         }),
                     }),
                 };
@@ -1215,6 +1468,9 @@ impl CommuCatApp {
         let Some(route) = route else {
             return Err(ServerError::Invalid);
         };
+        if !route.members.contains(sender) {
+            return Err(ServerError::Invalid);
+        }
         let relay_mode = route.relay;
         let mut online_targets = Vec::new();
         let mut offline_targets = Vec::new();
@@ -1244,25 +1500,81 @@ impl CommuCatApp {
         if !offline_targets.is_empty() {
             let encoded = frame.encode()?;
             for target in offline_targets.iter() {
+                let now = Utc::now();
                 let inbox_key = format!("inbox:{}", target);
                 let envelope = RelayEnvelope {
-                    envelope_id: generate_id(&format!("{}:{}", sender, target)),
-                    channel_id: inbox_key,
+                    envelope_id: generate_id(&format!(
+                        "{}:{}:{}",
+                        sender,
+                        target,
+                        now.timestamp_nanos_opt().unwrap_or_default()
+                    )),
+                    channel_id: inbox_key.clone(),
                     payload: encoded.clone(),
-                    deliver_after: Utc::now(),
-                    expires_at: Utc::now() + Duration::seconds(self.state.relay_ttl),
+                    deliver_after: now,
+                    expires_at: now + Duration::seconds(self.state.relay_ttl),
                 };
                 self.state.storage.enqueue_relay(&envelope).await?;
+                let offset = InboxOffset {
+                    entity_id: target.clone(),
+                    channel_id: inbox_key,
+                    last_envelope_id: Some(envelope.envelope_id.clone()),
+                    updated_at: now,
+                };
+                self.state.storage.store_inbox_offset(&offset).await?;
                 self.state.metrics.mark_relay();
                 if let Some(pos) = target.find('@') {
                     let domain = &target[pos + 1..];
                     if domain != self.state.config.domain {
                         let normalized = domain.to_ascii_lowercase();
-                        if let Some(peer) = self.state.allowed_peers.get(&normalized) {
+                        let peer = if let Some(peer) = self.state.allowed_peers.get(&normalized) {
+                            Some(peer.clone())
+                        } else {
+                            let cached = {
+                                let peers = self.state.dynamic_peers.read().await;
+                                peers.get(&normalized).cloned()
+                            };
+                            if let Some(peer) = cached {
+                                Some(peer)
+                            } else {
+                                match self.state.storage.load_federation_peer(&normalized).await {
+                                    Ok(record)
+                                        if matches!(
+                                            record.status,
+                                            FederationPeerStatus::Active
+                                                | FederationPeerStatus::Pending
+                                        ) =>
+                                    {
+                                        let peer = PeerConfig {
+                                            domain: record.domain.clone(),
+                                            endpoint: record.endpoint.clone(),
+                                            public_key: record.public_key,
+                                        };
+                                        {
+                                            let mut peers = self.state.dynamic_peers.write().await;
+                                            peers.insert(normalized.clone(), peer.clone());
+                                        }
+                                        if matches!(record.status, FederationPeerStatus::Pending) {
+                                            let _ = self
+                                                .state
+                                                .storage
+                                                .set_federation_peer_status(
+                                                    &record.domain,
+                                                    FederationPeerStatus::Active,
+                                                )
+                                                .await;
+                                        }
+                                        Some(peer)
+                                    }
+                                    _ => None,
+                                }
+                            }
+                        };
+                        if let Some(peer) = peer {
                             let event = FederationEvent {
                                 event_id: generate_id(target),
                                 origin: self.state.config.domain.clone(),
-                                created_at: Utc::now(),
+                                created_at: now,
                                 payload: json!({
                                     "channel": frame.channel_id,
                                     "sequence": frame.sequence,

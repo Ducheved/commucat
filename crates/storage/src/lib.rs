@@ -1,7 +1,9 @@
 use chrono::{DateTime, Utc};
 use serde_json::Value;
+use std::convert::TryInto;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -100,6 +102,106 @@ pub struct PresenceSnapshot {
     pub avatar_url: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceKeyEvent {
+    pub event_id: String,
+    pub device_id: String,
+    pub public_key: Vec<u8>,
+    pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChatGroup {
+    pub group_id: String,
+    pub owner_device: String,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GroupRole {
+    Owner,
+    Admin,
+    Member,
+}
+
+impl GroupRole {
+    fn as_str(&self) -> &'static str {
+        match self {
+            GroupRole::Owner => "owner",
+            GroupRole::Admin => "admin",
+            GroupRole::Member => "member",
+        }
+    }
+}
+
+impl FromStr for GroupRole {
+    type Err = StorageError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "owner" => Ok(GroupRole::Owner),
+            "admin" => Ok(GroupRole::Admin),
+            "member" => Ok(GroupRole::Member),
+            _ => Err(StorageError::Serialization),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupMember {
+    pub group_id: String,
+    pub device_id: String,
+    pub role: GroupRole,
+    pub joined_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FederationPeerStatus {
+    Active,
+    Pending,
+    Blocked,
+}
+
+impl FederationPeerStatus {
+    fn as_str(&self) -> &'static str {
+        match self {
+            FederationPeerStatus::Active => "active",
+            FederationPeerStatus::Pending => "pending",
+            FederationPeerStatus::Blocked => "blocked",
+        }
+    }
+}
+
+impl FromStr for FederationPeerStatus {
+    type Err = StorageError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "active" => Ok(FederationPeerStatus::Active),
+            "pending" => Ok(FederationPeerStatus::Pending),
+            "blocked" => Ok(FederationPeerStatus::Blocked),
+            _ => Err(StorageError::Serialization),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationPeerRecord {
+    pub domain: String,
+    pub endpoint: String,
+    pub public_key: [u8; 32],
+    pub status: FederationPeerStatus,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxOffset {
+    pub entity_id: String,
+    pub channel_id: String,
+    pub last_envelope_id: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Establishes connectivity to PostgreSQL and Redis backends.
 pub async fn connect(postgres_dsn: &str, redis_url: &str) -> Result<Storage, StorageError> {
     let (client, connection) = tokio_postgres::connect(postgres_dsn, NoTls)
@@ -164,6 +266,47 @@ impl Storage {
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(())
+    }
+
+    /// Persists an audit trail entry for device key material.
+    pub async fn record_device_key_event(
+        &self,
+        event: &DeviceKeyEvent,
+    ) -> Result<(), StorageError> {
+        let query = "INSERT INTO device_key_event (event_id, device_id, public_key, recorded_at) VALUES ($1, $2, $3, $4)";
+        self.client
+            .execute(
+                query,
+                &[
+                    &event.event_id,
+                    &event.device_id,
+                    &event.public_key,
+                    &event.recorded_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Fetches the newest device key event for a device identifier.
+    pub async fn latest_device_key_event(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<DeviceKeyEvent>, StorageError> {
+        let query = "SELECT event_id, device_id, public_key, recorded_at
+            FROM device_key_event WHERE device_id = $1 ORDER BY recorded_at DESC LIMIT 1";
+        let row = self
+            .client
+            .query_opt(query, &[&device_id])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(row.map(|row| DeviceKeyEvent {
+            event_id: row.get(0),
+            device_id: row.get(1),
+            public_key: row.get(2),
+            recorded_at: row.get(3),
+        }))
     }
 
     /// Creates a session binding a device to a TLS fingerprint.
@@ -301,6 +444,246 @@ impl Storage {
         Ok(())
     }
 
+    /// Creates a chat group entry and enrolls the owner as a member.
+    pub async fn create_group(&self, group: &ChatGroup) -> Result<(), StorageError> {
+        self.client
+            .execute(
+                "INSERT INTO chat_group (group_id, owner_device, created_at) VALUES ($1, $2, $3)
+                ON CONFLICT (group_id) DO NOTHING",
+                &[&group.group_id, &group.owner_device, &group.created_at],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .execute(
+                "INSERT INTO group_member (group_id, device_id, role, joined_at) VALUES ($1, $2, $3, $4)
+                ON CONFLICT (group_id, device_id) DO UPDATE SET role = excluded.role",
+                &[
+                    &group.group_id,
+                    &group.owner_device,
+                    &GroupRole::Owner.as_str(),
+                    &group.created_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Adds or updates group membership information.
+    pub async fn add_group_member(&self, member: &GroupMember) -> Result<(), StorageError> {
+        let query = "INSERT INTO group_member (group_id, device_id, role, joined_at) VALUES ($1, $2, $3, $4)
+            ON CONFLICT (group_id, device_id) DO UPDATE SET role = excluded.role, joined_at = excluded.joined_at";
+        self.client
+            .execute(
+                query,
+                &[
+                    &member.group_id,
+                    &member.device_id,
+                    &member.role.as_str(),
+                    &member.joined_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Removes a member from the given group.
+    pub async fn remove_group_member(
+        &self,
+        group_id: &str,
+        device_id: &str,
+    ) -> Result<(), StorageError> {
+        let affected = self
+            .client
+            .execute(
+                "DELETE FROM group_member WHERE group_id = $1 AND device_id = $2",
+                &[&group_id, &device_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
+    }
+
+    /// Lists all members of a group ordered by join time.
+    pub async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<GroupMember>, StorageError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT group_id, device_id, role, joined_at FROM group_member WHERE group_id = $1 ORDER BY joined_at ASC",
+                &[&group_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let mut members = Vec::with_capacity(rows.len());
+        for row in rows {
+            let role: String = row.get(2);
+            let parsed = GroupRole::from_str(role.as_str())?;
+            members.push(GroupMember {
+                group_id: row.get(0),
+                device_id: row.get(1),
+                role: parsed,
+                joined_at: row.get(3),
+            });
+        }
+        Ok(members)
+    }
+
+    /// Loads group metadata by identifier.
+    pub async fn load_group(&self, group_id: &str) -> Result<ChatGroup, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT group_id, owner_device, created_at FROM chat_group WHERE group_id = $1",
+                &[&group_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let row = row.ok_or(StorageError::Missing)?;
+        Ok(ChatGroup {
+            group_id: row.get(0),
+            owner_device: row.get(1),
+            created_at: row.get(2),
+        })
+    }
+
+    /// Lists groups that include the target device.
+    pub async fn list_groups_for_device(
+        &self,
+        device_id: &str,
+    ) -> Result<Vec<ChatGroup>, StorageError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT g.group_id, g.owner_device, g.created_at FROM chat_group g
+                INNER JOIN group_member m ON g.group_id = m.group_id
+                WHERE m.device_id = $1 ORDER BY g.created_at ASC",
+                &[&device_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ChatGroup {
+                group_id: row.get(0),
+                owner_device: row.get(1),
+                created_at: row.get(2),
+            })
+            .collect())
+    }
+
+    /// Upserts federation peer descriptors for S2S routing.
+    pub async fn upsert_federation_peer(
+        &self,
+        peer: &FederationPeerRecord,
+    ) -> Result<(), StorageError> {
+        let query = "INSERT INTO federation_peer (domain, endpoint, public_key, status, updated_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (domain) DO UPDATE SET endpoint = excluded.endpoint, public_key = excluded.public_key, status = excluded.status, updated_at = excluded.updated_at";
+        self.client
+            .execute(
+                query,
+                &[
+                    &peer.domain,
+                    &peer.endpoint,
+                    &peer.public_key.as_slice(),
+                    &peer.status.as_str(),
+                    &peer.updated_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Loads a federation peer by domain.
+    pub async fn load_federation_peer(
+        &self,
+        domain: &str,
+    ) -> Result<FederationPeerRecord, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT domain, endpoint, public_key, status, updated_at FROM federation_peer WHERE domain = $1",
+                &[&domain],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let row = row.ok_or(StorageError::Missing)?;
+        let key: Vec<u8> = row.get(2);
+        let status: String = row.get(3);
+        let status = FederationPeerStatus::from_str(status.as_str())?;
+        let public_key: [u8; 32] = key
+            .as_slice()
+            .try_into()
+            .map_err(|_| StorageError::Serialization)?;
+        Ok(FederationPeerRecord {
+            domain: row.get(0),
+            endpoint: row.get(1),
+            public_key,
+            status,
+            updated_at: row.get(4),
+        })
+    }
+
+    /// Enumerates all known federation peers.
+    pub async fn list_federation_peers(&self) -> Result<Vec<FederationPeerRecord>, StorageError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT domain, endpoint, public_key, status, updated_at FROM federation_peer",
+                &[],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let mut peers = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key: Vec<u8> = row.get(2);
+            let status: String = row.get(3);
+            let status = FederationPeerStatus::from_str(status.as_str())?;
+            let public_key: [u8; 32] = key
+                .as_slice()
+                .try_into()
+                .map_err(|_| StorageError::Serialization)?;
+            peers.push(FederationPeerRecord {
+                domain: row.get(0),
+                endpoint: row.get(1),
+                public_key,
+                status,
+                updated_at: row.get(4),
+            });
+        }
+        Ok(peers)
+    }
+
+    /// Sets the peer status and refresh timestamp.
+    pub async fn set_federation_peer_status(
+        &self,
+        domain: &str,
+        status: FederationPeerStatus,
+    ) -> Result<(), StorageError> {
+        let now = Utc::now();
+        let affected = self
+            .client
+            .execute(
+                "UPDATE federation_peer SET status = $2, updated_at = $3 WHERE domain = $1",
+                &[&domain, &status.as_str(), &now],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
+    }
+
     /// Schedules an encrypted relay envelope for delivery.
     pub async fn enqueue_relay(&self, envelope: &RelayEnvelope) -> Result<(), StorageError> {
         let query =
@@ -351,6 +734,48 @@ impl Storage {
                 expires_at: row.get(4),
             })
             .collect())
+    }
+
+    /// Stores the last delivered envelope reference for an entity/channel pair.
+    pub async fn store_inbox_offset(&self, offset: &InboxOffset) -> Result<(), StorageError> {
+        let query = "INSERT INTO inbox_offset (entity_id, channel_id, last_envelope_id, updated_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (entity_id, channel_id) DO UPDATE SET last_envelope_id = excluded.last_envelope_id, updated_at = excluded.updated_at";
+        self.client
+            .execute(
+                query,
+                &[
+                    &offset.entity_id,
+                    &offset.channel_id,
+                    &offset.last_envelope_id,
+                    &offset.updated_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Reads the stored inbox offset if present.
+    pub async fn read_inbox_offset(
+        &self,
+        entity_id: &str,
+        channel_id: &str,
+    ) -> Result<Option<InboxOffset>, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT entity_id, channel_id, last_envelope_id, updated_at FROM inbox_offset WHERE entity_id = $1 AND channel_id = $2",
+                &[&entity_id, &channel_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(row.map(|row| InboxOffset {
+            entity_id: row.get(0),
+            channel_id: row.get(1),
+            last_envelope_id: row.get(2),
+            updated_at: row.get(3),
+        }))
     }
 
     /// Records an idempotency key for deduplication.
@@ -480,9 +905,133 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use std::str::FromStr;
 
     #[test]
     fn init_sql_exists() {
         assert!(INIT_SQL.contains("CREATE TABLE"));
+    }
+
+    #[test]
+    fn init_sql_declares_new_relations() {
+        assert!(INIT_SQL.contains("device_key_event"));
+        assert!(INIT_SQL.contains("chat_group"));
+        assert!(INIT_SQL.contains("group_member"));
+        assert!(INIT_SQL.contains("federation_peer"));
+        assert!(INIT_SQL.contains("inbox_offset"));
+    }
+
+    #[test]
+    fn group_role_roundtrip() {
+        assert_eq!(GroupRole::Owner.as_str(), "owner");
+        assert_eq!(GroupRole::from_str("admin").unwrap(), GroupRole::Admin);
+        assert!(GroupRole::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn federation_status_roundtrip() {
+        assert_eq!(FederationPeerStatus::Active.as_str(), "active");
+        assert_eq!(
+            FederationPeerStatus::from_str("pending").unwrap(),
+            FederationPeerStatus::Pending
+        );
+        assert!(FederationPeerStatus::from_str("offline").is_err());
+    }
+
+    #[tokio::test]
+    async fn storage_integration_flow() -> Result<(), Box<dyn std::error::Error>> {
+        let pg = match std::env::var("COMMUCAT_TEST_PG_DSN") {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("skipping storage_integration_flow: COMMUCAT_TEST_PG_DSN not set");
+                return Ok(());
+            }
+        };
+        let redis = match std::env::var("COMMUCAT_TEST_REDIS_URL") {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("skipping storage_integration_flow: COMMUCAT_TEST_REDIS_URL not set");
+                return Ok(());
+            }
+        };
+        let storage = connect(&pg, &redis).await?;
+        storage.migrate().await?;
+        let suffix = Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let user_profile = NewUserProfile {
+            user_id: format!("test-user-{}", suffix),
+            handle: format!("tester{}", suffix),
+            display_name: Some("Tester".to_string()),
+            avatar_url: None,
+        };
+        let created = storage.create_user(&user_profile).await?;
+        let device_id = format!("test-device-{}", suffix);
+        let device_record = DeviceRecord {
+            device_id: device_id.clone(),
+            user_id: created.user_id.clone(),
+            public_key: vec![1; 32],
+            status: "active".to_string(),
+            created_at: Utc::now(),
+        };
+        storage.upsert_device(&device_record).await?;
+        let key_event = DeviceKeyEvent {
+            event_id: format!("evt-{}", suffix),
+            device_id: device_id.clone(),
+            public_key: device_record.public_key.clone(),
+            recorded_at: Utc::now(),
+        };
+        storage.record_device_key_event(&key_event).await?;
+        let latest = storage
+            .latest_device_key_event(&device_id)
+            .await?
+            .expect("expected key event");
+        assert_eq!(latest.public_key.len(), 32);
+
+        let group = ChatGroup {
+            group_id: format!("group-{}", suffix),
+            owner_device: device_id.clone(),
+            created_at: Utc::now(),
+        };
+        storage.create_group(&group).await?;
+        let member = GroupMember {
+            group_id: group.group_id.clone(),
+            device_id: format!("peer-device-{}", suffix),
+            role: GroupRole::Member,
+            joined_at: Utc::now(),
+        };
+        storage.add_group_member(&member).await?;
+        let members = storage.list_group_members(&group.group_id).await?;
+        assert!(members.iter().any(|m| m.device_id == device_id));
+        assert!(members.iter().any(|m| m.device_id == member.device_id));
+        let memberships = storage.list_groups_for_device(&member.device_id).await?;
+        assert_eq!(memberships.len(), 1);
+        storage
+            .remove_group_member(&group.group_id, &member.device_id)
+            .await?;
+
+        let peer = FederationPeerRecord {
+            domain: format!("peer{}.example", suffix),
+            endpoint: "https://peer.example/federation".to_string(),
+            public_key: [5u8; 32],
+            status: FederationPeerStatus::Active,
+            updated_at: Utc::now(),
+        };
+        storage.upsert_federation_peer(&peer).await?;
+        let fetched = storage.load_federation_peer(&peer.domain).await?;
+        assert_eq!(fetched.endpoint, peer.endpoint);
+
+        let offset = InboxOffset {
+            entity_id: device_id.clone(),
+            channel_id: format!("inbox:{}", device_id),
+            last_envelope_id: Some(format!("env-{}", suffix)),
+            updated_at: Utc::now(),
+        };
+        storage.store_inbox_offset(&offset).await?;
+        let loaded = storage
+            .read_inbox_offset(&offset.entity_id, &offset.channel_id)
+            .await?
+            .expect("offset present");
+        assert_eq!(loaded.last_envelope_id, offset.last_envelope_id);
+        Ok(())
     }
 }
