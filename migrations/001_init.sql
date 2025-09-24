@@ -1,14 +1,27 @@
 BEGIN;
 
+CREATE TABLE IF NOT EXISTS app_user (
+    user_id TEXT PRIMARY KEY,
+    handle TEXT NOT NULL UNIQUE,
+    display_name TEXT,
+    avatar_url TEXT,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS user_device (
     opaque_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
     pubkey BYTEA NOT NULL,
     status TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS user_device_user_idx ON user_device(user_id);
+
 CREATE TABLE IF NOT EXISTS session (
     opaque_id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES app_user(user_id) ON DELETE CASCADE,
     device_id TEXT NOT NULL REFERENCES user_device(opaque_id) ON DELETE CASCADE,
     tls_fingerprint TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL,
@@ -16,6 +29,7 @@ CREATE TABLE IF NOT EXISTS session (
 );
 
 CREATE INDEX IF NOT EXISTS session_device_idx ON session(device_id);
+CREATE INDEX IF NOT EXISTS session_user_idx ON session(user_id);
 
 CREATE TABLE IF NOT EXISTS device_key_event (
     event_id TEXT PRIMARY KEY,

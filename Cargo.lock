@@ -553,6 +553,7 @@ dependencies = [
 name = "commucat-cli"
 version = "1.0.0"
 dependencies = [
+ "blake3",
  "chrono",
  "commucat-crypto",
  "commucat-ledger",

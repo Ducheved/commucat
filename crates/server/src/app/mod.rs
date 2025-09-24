@@ -13,7 +13,8 @@ use commucat_ledger::{
 };
 use commucat_proto::{ControlEnvelope, Frame, FramePayload, FrameType};
 use commucat_storage::{
-    connect, DeviceRecord, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage, StorageError,
+    connect, DeviceRecord, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
+    StorageError, UserProfile,
 };
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
@@ -109,14 +110,16 @@ pub struct AppState {
 pub struct ConnectionEntry {
     pub sender: mpsc::Sender<Frame>,
     pub session_id: String,
+    pub user_id: String,
     next_sequence: AtomicU64,
 }
 
 impl ConnectionEntry {
-    pub fn new(sender: mpsc::Sender<Frame>, session_id: String) -> Self {
+    pub fn new(sender: mpsc::Sender<Frame>, session_id: String, user_id: String) -> Self {
         ConnectionEntry {
             sender,
             session_id,
+            user_id,
             next_sequence: AtomicU64::new(1),
         }
     }
@@ -147,6 +150,8 @@ struct HandshakeContext {
     stage: HandshakeStage,
     device_id: String,
     session_id: String,
+    user_id: String,
+    user_profile: Option<UserProfile>,
     handshake: Option<NoiseHandshake>,
 }
 
@@ -385,6 +390,8 @@ impl CommuCatApp {
             stage: HandshakeStage::Hello,
             device_id: String::new(),
             session_id: String::new(),
+            user_id: String::new(),
+            user_profile: None,
             handshake: None,
         };
         let mut server_sequence = 1u64;
@@ -457,6 +464,17 @@ impl CommuCatApp {
 
         let device_id = handshake.device_id.clone();
         let session_id = handshake.session_id.clone();
+        let user_id = handshake.user_id.clone();
+        let user_profile = match handshake.user_profile.clone() {
+            Some(profile) => profile,
+            None => match self.state.storage.load_user(&user_id).await {
+                Ok(profile) => profile,
+                Err(err) => {
+                    error!("user profile load failed: {}", err);
+                    return None;
+                }
+            },
+        };
 
         if let Some(addr) = remote_addr.clone() {
             let mut peers = self.state.peer_sessions.write().await;
@@ -474,7 +492,7 @@ impl CommuCatApp {
             let mut connections = self.state.connections.write().await;
             connections.insert(
                 device_id.clone(),
-                ConnectionEntry::new(tx_out.clone(), session_id.clone()),
+                ConnectionEntry::new(tx_out.clone(), session_id.clone(), user_id.clone()),
             );
         }
 
@@ -483,12 +501,17 @@ impl CommuCatApp {
             entity: device_id.clone(),
             state: "online".to_string(),
             expires_at: Utc::now() + Duration::seconds(self.state.presence_ttl),
+            user_id: Some(user_id.clone()),
+            handle: Some(user_profile.handle.clone()),
+            display_name: user_profile.display_name.clone(),
+            avatar_url: user_profile.avatar_url.clone(),
         };
         if let Err(err) = self.state.storage.publish_presence(&presence).await {
             warn!("presence publish failed: {}", err);
         }
         let session_record = SessionRecord {
             session_id: session_id.clone(),
+            user_id: user_id.clone(),
             device_id: device_id.clone(),
             tls_fingerprint: generate_id(&session.request_summary()),
             created_at: Utc::now(),
@@ -506,15 +529,22 @@ impl CommuCatApp {
             warn!("route register failed: {}", err);
         }
 
+        let ack_properties = json!({
+            "handshake": "ok",
+            "session": session_id,
+            "user": {
+                "id": user_profile.user_id.clone(),
+                "handle": user_profile.handle.clone(),
+                "display_name": user_profile.display_name.clone(),
+                "avatar_url": user_profile.avatar_url.clone(),
+            },
+        });
         let ack_frame = Frame {
             channel_id: 0,
             sequence: server_sequence,
             frame_type: FrameType::Ack,
             payload: FramePayload::Control(ControlEnvelope {
-                properties: json!({
-                    "handshake": "ok",
-                    "session": session_id,
-                }),
+                properties: ack_properties,
             }),
         };
         server_sequence += 1;
@@ -531,6 +561,7 @@ impl CommuCatApp {
             recorded_at: Utc::now(),
             metadata: json!({
                 "device": device_id,
+                "user": user_id,
                 "session": session_id,
             }),
         };
@@ -659,19 +690,52 @@ impl CommuCatApp {
                     .ok_or(ServerError::Invalid)?;
                 let client_static =
                     decode_hex32(client_static_hex).map_err(|_| ServerError::Invalid)?;
+                let user_payload = envelope.properties.get("user").and_then(|v| v.as_object());
+                let user_id_hint = user_payload
+                    .and_then(|map| map.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let handle_hint = user_payload
+                    .and_then(|map| map.get("handle"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let display_hint = user_payload
+                    .and_then(|map| map.get("display_name"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
+                let avatar_hint = user_payload
+                    .and_then(|map| map.get("avatar_url"))
+                    .and_then(|v| v.as_str())
+                    .map(|v| v.to_string());
 
                 let mut ledger_action = None;
+                let user_id: String;
+                let mut user_profile: UserProfile;
+
                 match self.state.storage.load_device(&device_id).await {
                     Ok(record) => {
+                        if let Some(provided) = &user_id_hint {
+                            if provided != &record.user_id {
+                                return Err(ServerError::Invalid);
+                            }
+                        }
+                        user_id = record.user_id.clone();
+                        user_profile = self.state.storage.load_user(&user_id).await?;
+                        if let Some(handle) = &handle_hint {
+                            if user_profile.handle != *handle {
+                                return Err(ServerError::Invalid);
+                            }
+                        }
                         if record.public_key != client_static.to_vec() {
                             if !self.state.config.auto_approve_devices {
                                 return Err(ServerError::Invalid);
                             }
                             let update = DeviceRecord {
                                 device_id: device_id.clone(),
+                                user_id: record.user_id.clone(),
                                 public_key: client_static.to_vec(),
-                                status: "active".to_string(),
-                                created_at: Utc::now(),
+                                status: record.status.clone(),
+                                created_at: record.created_at,
                             };
                             self.state.storage.upsert_device(&update).await?;
                             ledger_action = Some("rotate");
@@ -681,23 +745,67 @@ impl CommuCatApp {
                         if !self.state.config.auto_approve_devices {
                             return Err(ServerError::Invalid);
                         }
+                        let (resolved_id, profile) = if let Some(provided) = &user_id_hint {
+                            let profile = self.state.storage.load_user(provided).await?;
+                            if let Some(handle) = &handle_hint {
+                                if profile.handle != *handle {
+                                    return Err(ServerError::Invalid);
+                                }
+                            }
+                            (profile.user_id.clone(), profile)
+                        } else if let Some(handle) = &handle_hint {
+                            let new_profile = NewUserProfile {
+                                user_id: generate_id(handle),
+                                handle: handle.clone(),
+                                display_name: display_hint.clone(),
+                                avatar_url: avatar_hint.clone(),
+                            };
+                            let profile = self.state.storage.create_user(&new_profile).await?;
+                            (profile.user_id.clone(), profile)
+                        } else {
+                            return Err(ServerError::Invalid);
+                        };
                         let insert = DeviceRecord {
                             device_id: device_id.clone(),
+                            user_id: resolved_id.clone(),
                             public_key: client_static.to_vec(),
                             status: "active".to_string(),
                             created_at: Utc::now(),
                         };
                         self.state.storage.upsert_device(&insert).await?;
+                        user_id = resolved_id;
+                        user_profile = profile;
                         ledger_action = Some("register");
                     }
                     Err(err) => return Err(err.into()),
                 }
+
+                let display_update = display_hint.clone();
+                let avatar_update = avatar_hint.clone();
+                if display_hint.is_some() || avatar_hint.is_some() {
+                    self.state
+                        .storage
+                        .update_user_profile(
+                            &user_id,
+                            display_hint.as_deref(),
+                            avatar_hint.as_deref(),
+                        )
+                        .await?;
+                    if let Some(value) = display_update {
+                        user_profile.display_name = Some(value);
+                    }
+                    if let Some(value) = avatar_update {
+                        user_profile.avatar_url = Some(value);
+                    }
+                }
+
                 if let Some(action) = ledger_action {
                     let ledger_entry = LedgerRecord {
                         digest: client_static,
                         recorded_at: Utc::now(),
                         metadata: json!({
                             "device": device_id,
+                            "user": user_id,
                             "action": action,
                             "source": "auto-approve",
                         }),
@@ -706,6 +814,9 @@ impl CommuCatApp {
                         warn!("ledger submission failed: {}", err);
                     }
                 }
+
+                context.user_id = user_id.clone();
+                context.user_profile = Some(user_profile.clone());
 
                 let noise = NoiseConfig {
                     pattern,
@@ -964,10 +1075,24 @@ impl CommuCatApp {
                     .and_then(|v| v.as_str())
                     .unwrap_or("online")
                     .to_string();
+                let profile = match self.state.storage.load_device(device_id).await {
+                    Ok(record) => match self.state.storage.load_user(&record.user_id).await {
+                        Ok(profile) => Some(profile),
+                        Err(err) => {
+                            warn!("user profile load during presence update failed: {}", err);
+                            None
+                        }
+                    },
+                    Err(_) => None,
+                };
                 let snapshot = PresenceSnapshot {
                     entity: device_id.to_string(),
                     state,
                     expires_at: Utc::now() + Duration::seconds(self.state.presence_ttl),
+                    user_id: profile.as_ref().map(|p| p.user_id.clone()),
+                    handle: profile.as_ref().map(|p| p.handle.clone()),
+                    display_name: profile.as_ref().and_then(|p| p.display_name.clone()),
+                    avatar_url: profile.as_ref().and_then(|p| p.avatar_url.clone()),
                 };
                 if let Err(err) = self.state.storage.publish_presence(&snapshot).await {
                     warn!("presence publish failed: {}", err);
@@ -1096,10 +1221,12 @@ impl CommuCatApp {
     }
 
     async fn cleanup_connection(&self, device_id: &str) {
+        let mut detached_user = None;
         {
             let mut connections = self.state.connections.write().await;
             if let Some(entry) = connections.remove(device_id) {
                 info!(device = device_id, session = %entry.session_id, "connection closed");
+                detached_user = Some(entry.user_id);
             }
         }
         {
@@ -1109,10 +1236,34 @@ impl CommuCatApp {
         if let Err(err) = self.state.storage.clear_route(device_id).await {
             warn!("route cleanup failed: {}", err);
         }
+        let profile = if let Some(user_id) = detached_user.clone() {
+            match self.state.storage.load_user(&user_id).await {
+                Ok(profile) => Some(profile),
+                Err(err) => {
+                    warn!("user profile load during cleanup failed: {}", err);
+                    None
+                }
+            }
+        } else {
+            match self.state.storage.load_device(device_id).await {
+                Ok(record) => match self.state.storage.load_user(&record.user_id).await {
+                    Ok(profile) => Some(profile),
+                    Err(err) => {
+                        warn!("user profile load during cleanup failed: {}", err);
+                        None
+                    }
+                },
+                Err(_) => None,
+            }
+        };
         let snapshot = PresenceSnapshot {
             entity: device_id.to_string(),
             state: "offline".to_string(),
             expires_at: Utc::now() + Duration::seconds(self.state.presence_ttl),
+            user_id: profile.as_ref().map(|p| p.user_id.clone()),
+            handle: profile.as_ref().map(|p| p.handle.clone()),
+            display_name: profile.as_ref().and_then(|p| p.display_name.clone()),
+            avatar_url: profile.as_ref().and_then(|p| p.avatar_url.clone()),
         };
         if let Err(err) = self.state.storage.publish_presence(&snapshot).await {
             warn!("presence cleanup failed: {}", err);

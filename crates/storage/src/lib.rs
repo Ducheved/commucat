@@ -37,8 +37,27 @@ pub struct Storage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewUserProfile {
+    pub user_id: String,
+    pub handle: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserProfile {
+    pub user_id: String,
+    pub handle: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRecord {
     pub device_id: String,
+    pub user_id: String,
     pub public_key: Vec<u8>,
     pub status: String,
     pub created_at: DateTime<Utc>,
@@ -47,6 +66,7 @@ pub struct DeviceRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionRecord {
     pub session_id: String,
+    pub user_id: String,
     pub device_id: String,
     pub tls_fingerprint: String,
     pub created_at: DateTime<Utc>,
@@ -74,6 +94,10 @@ pub struct PresenceSnapshot {
     pub entity: String,
     pub state: String,
     pub expires_at: DateTime<Utc>,
+    pub user_id: Option<String>,
+    pub handle: Option<String>,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
 }
 
 /// Establishes connectivity to PostgreSQL and Redis backends.
@@ -123,13 +147,15 @@ impl Storage {
 
     /// Registers or rotates a device key.
     pub async fn upsert_device(&self, record: &DeviceRecord) -> Result<(), StorageError> {
-        let query = "INSERT INTO user_device (opaque_id, pubkey, status, created_at) VALUES ($1, $2, $3, $4)
-            ON CONFLICT (opaque_id) DO UPDATE SET pubkey = excluded.pubkey, status = excluded.status";
+        let query = "INSERT INTO user_device (opaque_id, user_id, pubkey, status, created_at) VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (opaque_id) DO UPDATE SET pubkey = excluded.pubkey, status = excluded.status
+            WHERE user_device.user_id = excluded.user_id";
         self.client
             .execute(
                 query,
                 &[
                     &record.device_id,
+                    &record.user_id,
                     &record.public_key,
                     &record.status,
                     &record.created_at,
@@ -143,13 +169,14 @@ impl Storage {
     /// Creates a session binding a device to a TLS fingerprint.
     pub async fn record_session(&self, session: &SessionRecord) -> Result<(), StorageError> {
         let query =
-            "INSERT INTO session (opaque_id, device_id, tls_fingerprint, created_at, ttl_seconds)
-            VALUES ($1, $2, $3, $4, $5)";
+            "INSERT INTO session (opaque_id, user_id, device_id, tls_fingerprint, created_at, ttl_seconds)
+            VALUES ($1, $2, $3, $4, $5, $6)";
         self.client
             .execute(
                 query,
                 &[
                     &session.session_id,
+                    &session.user_id,
                     &session.device_id,
                     &session.tls_fingerprint,
                     &session.created_at,
@@ -166,7 +193,7 @@ impl Storage {
         let row = self
             .client
             .query_opt(
-                "SELECT opaque_id, pubkey, status, created_at FROM user_device WHERE opaque_id = $1",
+                "SELECT opaque_id, user_id, pubkey, status, created_at FROM user_device WHERE opaque_id = $1",
                 &[&device_id],
             )
             .await
@@ -174,10 +201,104 @@ impl Storage {
         let row = row.ok_or(StorageError::Missing)?;
         Ok(DeviceRecord {
             device_id: row.get(0),
-            public_key: row.get(1),
-            status: row.get(2),
-            created_at: row.get(3),
+            user_id: row.get(1),
+            public_key: row.get(2),
+            status: row.get(3),
+            created_at: row.get(4),
         })
+    }
+
+    /// Creates a new user profile entry.
+    pub async fn create_user(&self, profile: &NewUserProfile) -> Result<UserProfile, StorageError> {
+        let now = Utc::now();
+        let row = self
+            .client
+            .query_one(
+                "INSERT INTO app_user (user_id, handle, display_name, avatar_url, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $5)
+                RETURNING user_id, handle, display_name, avatar_url, created_at, updated_at",
+                &[
+                    &profile.user_id,
+                    &profile.handle,
+                    &profile.display_name,
+                    &profile.avatar_url,
+                    &now,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(UserProfile {
+            user_id: row.get(0),
+            handle: row.get(1),
+            display_name: row.get(2),
+            avatar_url: row.get(3),
+            created_at: row.get(4),
+            updated_at: row.get(5),
+        })
+    }
+
+    /// Loads a user profile by identifier.
+    pub async fn load_user(&self, user_id: &str) -> Result<UserProfile, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT user_id, handle, display_name, avatar_url, created_at, updated_at FROM app_user WHERE user_id = $1",
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let row = row.ok_or(StorageError::Missing)?;
+        Ok(UserProfile {
+            user_id: row.get(0),
+            handle: row.get(1),
+            display_name: row.get(2),
+            avatar_url: row.get(3),
+            created_at: row.get(4),
+            updated_at: row.get(5),
+        })
+    }
+
+    /// Loads a user profile by handle.
+    pub async fn load_user_by_handle(&self, handle: &str) -> Result<UserProfile, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT user_id, handle, display_name, avatar_url, created_at, updated_at FROM app_user WHERE handle = $1",
+                &[&handle],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let row = row.ok_or(StorageError::Missing)?;
+        Ok(UserProfile {
+            user_id: row.get(0),
+            handle: row.get(1),
+            display_name: row.get(2),
+            avatar_url: row.get(3),
+            created_at: row.get(4),
+            updated_at: row.get(5),
+        })
+    }
+
+    /// Applies partial updates to user profile metadata.
+    pub async fn update_user_profile(
+        &self,
+        user_id: &str,
+        display_name: Option<&str>,
+        avatar_url: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let now = Utc::now();
+        let affected = self
+            .client
+            .execute(
+                "UPDATE app_user SET display_name = COALESCE($2, display_name), avatar_url = COALESCE($3, avatar_url), updated_at = $4 WHERE user_id = $1",
+                &[&user_id, &display_name, &avatar_url, &now],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
     }
 
     /// Schedules an encrypted relay envelope for delivery.
@@ -251,6 +372,12 @@ impl Storage {
             "entity": snapshot.entity,
             "state": snapshot.state,
             "expires_at": snapshot.expires_at.to_rfc3339(),
+            "user": snapshot.user_id.as_ref().map(|id| serde_json::json!({
+                "id": id,
+                "handle": snapshot.handle.clone(),
+                "display_name": snapshot.display_name.clone(),
+                "avatar_url": snapshot.avatar_url.clone(),
+            })),
         })
         .to_string();
         redis::cmd("SETEX")
@@ -289,10 +416,31 @@ impl Storage {
             let expires = DateTime::parse_from_rfc3339(expires)
                 .map_err(|_| StorageError::Serialization)?
                 .with_timezone(&Utc);
+            let user_obj = parsed.get("user").and_then(|v| v.as_object());
+            let user_id = user_obj
+                .and_then(|map| map.get("id"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let handle = user_obj
+                .and_then(|map| map.get("handle"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let display_name = user_obj
+                .and_then(|map| map.get("display_name"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
+            let avatar_url = user_obj
+                .and_then(|map| map.get("avatar_url"))
+                .and_then(|v| v.as_str())
+                .map(|v| v.to_string());
             Ok(Some(PresenceSnapshot {
                 entity: entity.to_string(),
                 state,
                 expires_at: expires,
+                user_id,
+                handle,
+                display_name,
+                avatar_url,
             }))
         } else {
             Ok(None)

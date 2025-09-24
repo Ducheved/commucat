@@ -59,6 +59,12 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
      "device_id": "opaque",
      "client_static": "hex(x25519_public_key)",
      "handshake": "hex(noise_message_1)",
+     "user": {
+       "id": "existing-user-id",
+       "handle": "desired-handle",
+       "display_name": "optional nickname",
+       "avatar_url": "https://..."
+     },
      "capabilities": ["noise", "zstd", ...]
    }
    ```
@@ -69,7 +75,13 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
    {
      "session": "opaque_session_id",
      "handshake": "hex(noise_message_2)",
-     "server_static": "hex(server_x25519_public)"
+     "server_static": "hex(server_x25519_public)",
+     "user": {
+       "id": "resolved-user-id",
+       "handle": "effective-handle",
+       "display_name": "optional nickname",
+       "avatar_url": "https://..."
+     }
    }
    ```
 
@@ -78,7 +90,9 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
    { "handshake": "hex(noise_message_3)" }
    ```
 
-After message three the Noise state switches into transport mode. The server never accesses plaintext payloads. A final `ACK` frame with `{ "handshake": "ok" }` confirms tunnel readiness.
+After message three the Noise state switches into transport mode. The server never accesses plaintext payloads. A final `ACK` frame with `{ "handshake": "ok", "user": {...} }` confirms tunnel readiness.
+
+*Profile provisioning*: the `user` object in `HELLO` lets clients attach devices to existing profiles (`id`) or request new profiles (`handle`, plus optional `display_name` and `avatar_url`). When auto-approval is enabled, absent `id` instructs the server to mint a fresh user. The server echoes canonical profile fields in the `AUTH` response and completion `ACK`, ensuring clients persist consistent identifiers.
 
 *Noise parameters*: `Noise_XK_25519_ChaChaPoly_BLAKE2s` or `Noise_IK_25519_ChaChaPoly_BLAKE2s` with empty PSKs and configurable prologue. Clients derive AEAD keys for subsequent ciphertext frames.
 
@@ -135,6 +149,24 @@ Clients should treat receipt of `ERROR` as fatal for the stream.
 ## Offline Delivery
 
 Encrypted frames destined for offline members are persisted in PostgreSQL (`relay_queue`) under key `inbox:{device_id}`. Upon reconnect the server replays stored frames assigning fresh sequence numbers for the recipient.
+
+## Presence Metadata
+
+Redis presence keys capture profile context so peers can render nicknames and avatars:
+
+```
+{
+  "entity": "device-id",
+  "state": "online" | "offline",
+  "expires_at": "RFC3339 timestamp",
+  "user": {
+    "id": "user-id",
+    "handle": "nick",
+    "display_name": "optional",
+    "avatar_url": "optional"
+  }
+}
+```
 
 ## P2P Negotiation
 
