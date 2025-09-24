@@ -34,6 +34,13 @@ payload_bytes = opaque bytes interpreted per frame type
 * Implementations MUST reject frames whose declared `payload_len` exceeds the remaining buffer.
 * Varints longer than 10 bytes or overflowing 64 bits MUST raise a decoding error.
 
+### Version Negotiation
+
+* CCP-1 v1 peers announce support via either `protocol_version` (legacy single value) or `supported_versions` (array of unsigned integers).
+* The server selects the highest common version from the client announcement and its own `supported_versions`, falling back to v1 for clients lacking these fields.
+* When no overlap exists, the server returns an `ERROR` frame with `title` "Protocol Version Mismatch" and closes the stream.
+* Successful handshakes echo the negotiated value in subsequent `AUTH` control frames (`protocol_version`) and advertise the server list as `supported_versions`.
+
 ### Frame Types
 
 | Type | Code | Payload semantics |
@@ -67,6 +74,7 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
      "device_id": "opaque",
      "client_static": "hex(x25519_public_key)",
      "handshake": "hex(noise_message_1)",
+     "supported_versions": [1],
      "user": {
        "id": "existing-user-id",
        "handle": "desired-handle",
@@ -76,7 +84,7 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
      "capabilities": ["noise", "zstd", ...]
    }
    ```
-   The server loads the device metadata, validates the static key, and prepares a Noise responder state using the configured prologue.
+   The server loads the device metadata, validates the static key, negotiates the protocol version, and prepares a Noise responder state using the configured prologue.
 
 2. **Server → Client (`AUTH`)**
    ```jsonc
@@ -84,6 +92,8 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
      "session": "opaque_session_id",
      "handshake": "hex(noise_message_2)",
      "server_static": "hex(server_x25519_public)",
+     "protocol_version": 1,
+     "supported_versions": [1],
      "user": {
        "id": "resolved-user-id",
        "handle": "effective-handle",
@@ -155,6 +165,7 @@ Codec failures surfaced during framing SHOULD be translated into terminal `ERROR
 | Condition | Suggested `title` |
 |-----------|-------------------|
 | Unknown frame type | `Invalid Frame Type` |
+| No mutually supported protocol version | `Protocol Version Mismatch` |
 | Control JSON cannot be parsed | `Invalid Control Payload` |
 | Declared frame length exceeds limits | `Frame Too Large` |
 | Declared payload length exceeds limits | `Payload Too Large` |

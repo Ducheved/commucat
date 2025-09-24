@@ -5,10 +5,33 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 pub const PROTOCOL_VERSION: u16 = 1;
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[u16] = &[PROTOCOL_VERSION];
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 pub const MAX_CONTROL_JSON_LEN: usize = 256 * 1024;
 pub const MAX_CHANNEL_ID: u64 = u32::MAX as u64;
 pub const MAX_SEQUENCE: u64 = u32::MAX as u64;
+
+/// Returns true when the provided protocol version is supported by the current codec.
+pub fn is_supported_protocol_version(version: u16) -> bool {
+    SUPPORTED_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .any(|v| v == version)
+}
+
+/// Picks the highest mutually supported protocol version between peers.
+pub fn negotiate_protocol_version(peer_versions: &[u16]) -> Option<u16> {
+    let mut negotiated = None;
+    for version in peer_versions.iter().copied() {
+        if is_supported_protocol_version(version) {
+            negotiated = match negotiated {
+                Some(current) if current >= version => Some(current),
+                _ => Some(version),
+            };
+        }
+    }
+    negotiated
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -247,6 +270,24 @@ fn decode_varint(buffer: &[u8]) -> Result<(u64, usize), CodecError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negotiate_version_prefers_highest_supported() {
+        let negotiated = negotiate_protocol_version(&[0, PROTOCOL_VERSION, PROTOCOL_VERSION + 1]);
+        assert_eq!(negotiated, Some(PROTOCOL_VERSION));
+    }
+
+    #[test]
+    fn negotiate_version_none_when_disjoint() {
+        let negotiated = negotiate_protocol_version(&[42, 43]);
+        assert_eq!(negotiated, None);
+    }
+
+    #[test]
+    fn supported_version_predicate_matches() {
+        assert!(is_supported_protocol_version(PROTOCOL_VERSION));
+        assert!(!is_supported_protocol_version(PROTOCOL_VERSION + 5));
+    }
 
     #[test]
     fn encode_roundtrip_control_frame() {

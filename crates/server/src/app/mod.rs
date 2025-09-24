@@ -11,7 +11,10 @@ use commucat_ledger::{
     DebugLedgerAdapter, FileLedgerAdapter, LedgerAdapter as LedgerAdapterTrait, LedgerError,
     LedgerRecord, NullLedger,
 };
-use commucat_proto::{ControlEnvelope, Frame, FramePayload, FrameType};
+use commucat_proto::{
+    is_supported_protocol_version, negotiate_protocol_version, ControlEnvelope, Frame,
+    FramePayload, FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+};
 use commucat_storage::{
     connect, DeviceRecord, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
     StorageError, UserProfile,
@@ -23,6 +26,7 @@ use pingora::protocols::http::ServerSession;
 use pingora::server::ShutdownWatch;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
@@ -43,6 +47,7 @@ pub enum ServerError {
     Federation,
     Invalid,
     Io,
+    ProtocolNegotiation(String),
 }
 
 impl Display for ServerError {
@@ -55,6 +60,9 @@ impl Display for ServerError {
             Self::Federation => write!(f, "federation failure"),
             Self::Invalid => write!(f, "invalid request"),
             Self::Io => write!(f, "io failure"),
+            Self::ProtocolNegotiation(reason) => {
+                write!(f, "protocol negotiation failed: {}", reason)
+            }
         }
     }
 }
@@ -153,6 +161,7 @@ struct HandshakeContext {
     user_id: String,
     user_profile: Option<UserProfile>,
     handshake: Option<NoiseHandshake>,
+    protocol_version: u16,
 }
 
 pub struct CommuCatApp {
@@ -393,6 +402,7 @@ impl CommuCatApp {
             user_id: String::new(),
             user_profile: None,
             handshake: None,
+            protocol_version: PROTOCOL_VERSION,
         };
         let mut server_sequence = 1u64;
         let mut shutdown_rx = shutdown.clone();
@@ -660,6 +670,64 @@ impl CommuCatApp {
                     FramePayload::Control(env) => env,
                     _ => return Err(ServerError::Invalid),
                 };
+                let negotiated_version = if let Some(list_value) =
+                    envelope.properties.get("supported_versions")
+                {
+                    let list = list_value.as_array().ok_or_else(|| {
+                        ServerError::ProtocolNegotiation(
+                            "supported_versions must be an array".to_string(),
+                        )
+                    })?;
+                    let mut versions = Vec::with_capacity(list.len());
+                    for entry in list.iter() {
+                        let number = entry.as_u64().ok_or_else(|| {
+                            ServerError::ProtocolNegotiation(
+                                "supported_versions entries must be unsigned integers".to_string(),
+                            )
+                        })?;
+                        let version = u16::try_from(number).map_err(|_| {
+                            ServerError::ProtocolNegotiation(format!(
+                                "protocol version {} out of range",
+                                number
+                            ))
+                        })?;
+                        versions.push(version);
+                    }
+                    if versions.is_empty() {
+                        return Err(ServerError::ProtocolNegotiation(
+                            "supported_versions cannot be empty".to_string(),
+                        ));
+                    }
+                    negotiate_protocol_version(&versions).ok_or_else(|| {
+                        ServerError::ProtocolNegotiation(format!(
+                            "no common protocol version; peer={:?}; supported={:?}",
+                            versions, SUPPORTED_PROTOCOL_VERSIONS
+                        ))
+                    })?
+                } else if let Some(version_value) = envelope.properties.get("protocol_version") {
+                    let number = version_value.as_u64().ok_or_else(|| {
+                        ServerError::ProtocolNegotiation(
+                            "protocol_version must be an unsigned integer".to_string(),
+                        )
+                    })?;
+                    let version = u16::try_from(number).map_err(|_| {
+                        ServerError::ProtocolNegotiation(format!(
+                            "protocol version {} out of range",
+                            number
+                        ))
+                    })?;
+                    if is_supported_protocol_version(version) {
+                        version
+                    } else {
+                        return Err(ServerError::ProtocolNegotiation(format!(
+                            "unsupported protocol version {}; supported={:?}",
+                            version, SUPPORTED_PROTOCOL_VERSIONS
+                        )));
+                    }
+                } else {
+                    PROTOCOL_VERSION
+                };
+                context.protocol_version = negotiated_version;
                 let pattern_value = envelope
                     .properties
                     .get("pattern")
@@ -831,6 +899,7 @@ impl CommuCatApp {
                 let payload = json!({
                     "session": session_id,
                     "domain": self.state.config.domain,
+                    "protocol_version": context.protocol_version,
                 })
                 .to_string()
                 .into_bytes();
@@ -844,6 +913,8 @@ impl CommuCatApp {
                             "session": session_id,
                             "handshake": encode_hex(&response_bytes),
                             "server_static": encode_hex(&self.state.noise_public),
+                            "protocol_version": context.protocol_version,
+                            "supported_versions": SUPPORTED_PROTOCOL_VERSIONS,
                         }),
                     }),
                 };
