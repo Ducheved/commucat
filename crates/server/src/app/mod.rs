@@ -483,6 +483,13 @@ impl CommuCatApp {
             }
             _ => {}
         }
+        if path == "/api/server-info" && method == "GET" {
+            self.state.metrics.mark_ingress();
+            if let Err(err) = self.handle_server_info(&mut session).await {
+                error!("server info response failed: {}", err);
+            }
+            return None;
+        }
         if path == "/api/pair" && method == "POST" {
             self.state.metrics.mark_ingress();
             match self.handle_pair_create(&mut session).await {
@@ -546,6 +553,25 @@ impl CommuCatApp {
             .ok()?;
         session.finish().await.ok()?;
         None
+    }
+
+    async fn handle_server_info(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ServerError> {
+        let payload = json!({
+            "domain": self.state.config.domain,
+            "noise_public": encode_hex(&self.state.noise_public),
+            "supported_patterns": ["XK", "IK"],
+            "supported_versions": SUPPORTED_PROTOCOL_VERSIONS,
+            "pairing": {
+                "auto_approve": self.state.config.auto_approve_devices,
+                "pairing_ttl": self.state.config.pairing_ttl_seconds,
+                "max_auto_devices": self.state.config.max_auto_devices_per_user,
+            }
+        });
+        self.respond_json(session, 200, payload, "application/json")
+            .await
     }
 
     async fn handle_pair_create(
