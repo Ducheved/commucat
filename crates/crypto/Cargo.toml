@@ -1,7 +1,7 @@
 [package]
 name = "commucat-crypto"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 description = "Noise handshake helpers and Ed25519 tooling for CommuCat"
 license = "MPL-2.0"
 homepage = "https://commucat.tech"

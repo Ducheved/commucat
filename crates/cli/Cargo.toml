@@ -1,7 +1,7 @@
 [package]
 name = "commucat-cli"
 version = "1.0.0"
-edition = "2021"
+edition = "2024"
 description = "Operational CLI tools for CommuCat deployments"
 license = "MPL-2.0"
 homepage = "https://commucat.tech"
@@ -14,6 +14,7 @@ chrono = { workspace = true }
 commucat-crypto = { path = "../crypto", version = "1.0" }
 commucat-ledger = { path = "../ledger", version = "1.0" }
 commucat-storage = { path = "../storage", version = "1.0" }
+commucat-media = { path = "../media", version = "1.0", features = ["audio", "audio-io", "pipeline"] }
 dotenvy = "0.15"
 serde_json = { workspace = true }
 tokio = { workspace = true }

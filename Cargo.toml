@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-edition = "2021"
+edition = "2024"
 description = "CommuCat secure routing server and supporting crates"
 license = "MPL-2.0"
 authors = ["Ducheved <me@ducheved.ru>"]
@@ -20,6 +20,7 @@ repository = "https://github.com/ducheved/commucat"
 homepage = "https://commucat.tech"
 readme = "README.md"
 publish = false
+
 
 [workspace.dependencies]
 blake3 = { version = "1.5" }
@@ -43,3 +44,4 @@ kem = { version = "0.3.0-pre.0" }
 ml-dsa = { version = "0.1.0-rc.0", default-features = false, features = ["alloc", "rand_core"] }
 raptorq = { version = "1.7", default-features = false }
 iana-time-zone = { version = "0.1.64", features = ["fallback"] }
+env-libvpx-sys = { version = "5.1.3" }

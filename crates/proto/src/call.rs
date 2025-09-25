@@ -4,17 +4,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::convert::TryFrom;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CallMode {
+    #[default]
     FullDuplex,
     HalfDuplex,
-}
-
-impl Default for CallMode {
-    fn default() -> Self {
-        CallMode::FullDuplex
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,17 +114,12 @@ pub struct TransportCandidate {
     pub protocol: TransportProtocol,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportProtocol {
     Tcp,
+    #[default]
     Udp,
-}
-
-impl Default for TransportProtocol {
-    fn default() -> Self {
-        TransportProtocol::Udp
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -304,7 +294,10 @@ mod tests {
                 video: Some(VideoParameters {
                     codec: VideoCodec::Vp8,
                     max_bitrate: 350_000,
-                    max_resolution: VideoResolution { width: 640, height: 360 },
+                    max_resolution: VideoResolution {
+                        width: 640,
+                        height: 360,
+                    },
                     frame_rate: 20,
                     adaptive: true,
                 }),

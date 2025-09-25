@@ -254,7 +254,7 @@ impl AdaptiveMimicPolicy {
 
     pub fn sample_snapshot<R: Rng + ?Sized>(&self, rng: &mut R) -> ProtocolSnapshot {
         let total: f32 = self.weights.iter().map(|w| w.weight).sum();
-        let mut draw = rng.gen::<f32>() * total;
+        let mut draw = rand::Rng::gen::<f32>(&mut rng) * total;
         let flavor = self
             .weights
             .iter()
@@ -445,7 +445,7 @@ impl QuicHandshakeSnapshot {
 
 impl DnsPacketSnapshot {
     fn random<R: Rng + ?Sized>(rng: &mut R) -> Self {
-        let transaction_id = rng.gen();
+        let transaction_id = rand::Rng::gen(&mut rng);
         let qname = random_domain(rng);
         let qtype_pool = [1u16, 15, 28, 16];
         let qtype = *qtype_pool.choose(rng).unwrap_or(&1);
@@ -541,7 +541,7 @@ impl RealityTicket {
 
 impl WebRtcDataChannelSnapshot {
     fn random<R: Rng + ?Sized>(rng: &mut R) -> Self {
-        let stream_id = rng.gen();
+        let stream_id = rand::Rng::gen(&mut rng);
         let label_length = rng.gen_range(4..=12);
         let label = Alphanumeric.sample_string(rng, label_length);
         let ordered = rng.gen_bool(0.7);
@@ -566,7 +566,7 @@ impl AmnesiaSignature {
         let mut salt = [0u8; 8];
         rng.fill_bytes(&mut salt);
         let jitter_ns = rng.gen_range(50_000..=5_000_000);
-        let packet_mask = rng.gen();
+        let packet_mask = rand::Rng::gen(&mut rng);
         Self {
             salt,
             jitter_ns,

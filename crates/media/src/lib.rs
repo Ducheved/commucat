@@ -2,6 +2,9 @@
 #![deny(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+#[cfg(feature = "video")]
+extern crate env_libvpx_sys;
+
 pub mod audio;
 #[cfg(feature = "audio-io")]
 pub mod capture;
@@ -46,13 +49,17 @@ impl From<env_libvpx_sys::vpx_codec_err_t> for MediaError {
 }
 
 pub mod prelude {
-    pub use crate::{MediaError, MediaResult};
-    pub use crate::audio::{AudioLevel, VoiceDecoder, VoiceDecoderConfig, VoiceEncoder, VoiceEncoderConfig, VoiceFrame};
+    pub use crate::audio::{
+        AudioLevel, VoiceDecoder, VoiceDecoderConfig, VoiceEncoder, VoiceEncoderConfig, VoiceFrame,
+    };
     #[cfg(feature = "audio-io")]
     pub use crate::capture::{AudioCapture, AudioCaptureConfig};
     #[cfg(feature = "pipeline")]
-    pub use crate::pipeline::{CallMediaPipeline, MediaEvent, PipelineConfig};
+    pub use crate::pipeline::{CallMediaPipeline, PipelineConfig};
     #[cfg(feature = "video")]
-    pub use crate::video::{VideoDecoder, VideoDecoderConfig, VideoEncoder, VideoEncoderConfig, VideoFrame};
-    pub use crate::voice::{VoiceMessage, VoiceMessageBuilder};
+    pub use crate::video::{
+        DecodedFrame, I420Borrowed, VideoDecoder, VideoEncoder, VideoEncoderConfig, VideoFrame,
+    };
+    pub use crate::voice::VoiceMessage;
+    pub use crate::{MediaError, MediaResult};
 }

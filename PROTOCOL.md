@@ -58,12 +58,123 @@ payload_bytes = opaque bytes interpreted per frame type
 | `GROUP_INVITE` | `0x0b` | JSON control inviting member to group (role aware) |
 | `GROUP_EVENT` | `0x0c` | Ciphertext or control for group fanout |
 | `ERROR` | `0x0d` | JSON control describing protocol errors |
+| `CALL_OFFER` | `0x0e` | JSON control proposing an audio/video session |
+| `CALL_ANSWER` | `0x0f` | JSON control accepting or rejecting a call offer |
+| `CALL_END` | `0x10` | JSON control terminating a call session |
+| `VOICE_FRAME` | `0x11` | Ciphertext carrying an Opus media frame |
+| `VIDEO_FRAME` | `0x12` | Ciphertext carrying a VP8 media frame or fragment |
+| `CALL_STATS` | `0x13` | JSON control reporting live media quality metrics |
 
 Control payloads are UTF-8 JSON documents carried inside the CCP frame. Ciphertext payloads are arbitrary byte arrays produced by the clients after Noise handshake completion.
 
 ### Varint Encoding
 
 CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`). Implementations must reject integers that overflow 64 bits or consume more than 10 bytes.
+
+## Call Signaling and Media Transport
+
+Real-time calls are negotiated with the trio of `CALL_OFFER`, `CALL_ANSWER`, and `CALL_END` control frames. Media content is transmitted over the existing encrypted tunnel using `VOICE_FRAME` (Opus audio) and `VIDEO_FRAME` (VP8 video) frames. Each media frame inherits the channel membership of the negotiated call and is acknowledged with a regular `ACK` carrying `{"call_id": ...}`.
+
+### Call Offer (`CALL_OFFER`)
+
+```jsonc
+{
+  "call_id": "uuid-v4",
+  "from": "device@domain",
+  "to": ["peer-device@domain"],
+  "media": {
+    "audio": {
+      "codec": "opus",
+      "bitrate": 16000,
+      "sample_rate": 48000,
+      "channels": 1,
+      "fec": true,
+      "dtx": true
+    },
+    "video": {
+      "codec": "vp8",
+      "max_bitrate": 500000,
+      "max_resolution": { "width": 640, "height": 360 },
+      "frame_rate": 24,
+      "adaptive": true
+    },
+    "mode": "full_duplex" // or "half_duplex" for push-to-talk
+  },
+  "transport": {
+    "prefer_relay": true,
+    "udp_candidates": [
+      { "address": "198.51.100.10", "port": 3478, "protocol": "udp" }
+    ],
+    "fingerprints": ["hex(fingerprint)"]
+  },
+  "expires_at": 1700000000,
+  "ephemeral_key": "hex(ephemeral_public)",
+  "metadata": {}
+}
+```
+
+The offer describes the requested codecs and duplex mode. Implementations should fall back to audio-only if the callee cannot satisfy the proposed video profile. `transport` hints are advisory; the initial release always relays through the server.
+
+### Call Answer (`CALL_ANSWER`)
+
+```jsonc
+{
+  "call_id": "uuid-v4",
+  "accept": true,
+  "media": {
+    "audio": { "bitrate": 12000, "codec": "opus", "sample_rate": 48000, "channels": 1, "fec": true, "dtx": true },
+    "video": null,
+    "mode": "full_duplex"
+  },
+  "reason": null,
+  "metadata": {}
+}
+```
+
+Declining a call sets `accept` to `false` and includes a `reason` of `"busy"`, `"decline"`, `"unsupported"`, `"timeout"`, or `"error"`. When both parties accept, media transmission may begin immediately. The server acknowledges each offer and answer with an `ACK` that mirrors `call_id` and the inbound sequence.
+
+### Call Termination (`CALL_END`)
+
+Call teardown frames include the `call_id` and a reason string (`"hangup"`, `"cancel"`, `"failure"`, or `"timeout"`). The server relays termination frames to every participant and releases any state it tracked for the session. Disconnects or unexpected exits also trigger a synthesized `CALL_END` with reason `"failure"` and `metadata.system = true`.
+
+### Media Frames
+
+* `VOICE_FRAME` payloads contain a single Opus packet produced with the negotiated parameters (default: 20 ms, mono, 16 kbps, FEC enabled). Frames inherit the channel identifier of the call and are sequenced just like `MSG` frames to drive jitter buffers.
+* `VIDEO_FRAME` payloads carry either a full VP8 frame or a deterministic fragment. Large frames SHOULD be split into MTU-sized chunks before encryption. The client reconstructs full images using the `frame.sequence` field.
+
+### Quality Reporting (`CALL_STATS`)
+
+Participants may periodically emit quality telemetry to help peers adapt their bitrate:
+
+```jsonc
+{
+  "call_id": "uuid-v4",
+  "direction": "send", // or "receive"
+  "audio": { "bitrate": 16000, "packet_loss": 0.01, "jitter_ms": 8, "rtt_ms": 95 },
+  "video": { "bitrate": 350000, "packet_loss": 0.05, "jitter_ms": 25, "frames_per_second": 15 },
+  "timestamp": 1700000100
+}
+```
+
+Clients respond to stats heuristics at the application layer (e.g., throttling video or switching to push-to-talk) while servers simply relay the telemetry.
+
+### Voice Messages inside `MSG`
+
+Short asynchronous voice clips reuse the existing `MSG` frame. The plaintext payload SHOULD be a JSON envelope:
+
+```jsonc
+{
+  "type": "voice_message",
+  "codec": "opus",
+  "sample_rate": 48000,
+  "channels": 1,
+  "frame_duration_ms": 20,
+  "frames": ["base64(opus packet 1)", "base64(opus packet 2)", "..."] ,
+  "duration_ms": 3200
+}
+```
+
+Recipients decode each Opus packet in order to reconstruct playback. Clients MAY store the message as a contiguous Opus stream when building media caches.
 
 ## Handshake
 

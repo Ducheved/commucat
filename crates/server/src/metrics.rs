@@ -75,11 +75,15 @@ impl Metrics {
     }
 
     pub fn mark_call_ended(&self) {
-        let _ = self.call_sessions_active.fetch_update(
-            Ordering::SeqCst,
-            Ordering::SeqCst,
-            |value| if value == 0 { None } else { Some(value - 1) },
-        );
+        let _ =
+            self.call_sessions_active
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                    if value == 0 {
+                        None
+                    } else {
+                        Some(value - 1)
+                    }
+                });
     }
 
     pub fn mark_call_voice_frame(&self) {

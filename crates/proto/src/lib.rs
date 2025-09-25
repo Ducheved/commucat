@@ -373,14 +373,17 @@ mod tests {
         let encoded = frame.encode().unwrap();
         let (decoded, _read) = Frame::decode(&encoded).unwrap();
         assert_eq!(decoded.frame_type, FrameType::VoiceFrame);
-        assert_eq!(decoded.payload, FramePayload::Opaque(vec![0xaa, 0xbb, 0xcc, 0xdd]));
+        assert_eq!(
+            decoded.payload,
+            FramePayload::Opaque(vec![0xaa, 0xbb, 0xcc, 0xdd])
+        );
     }
 
     #[test]
     fn encode_roundtrip_call_offer_frame() {
-        use crate::call::{CallMode, CallOffer, CallTransport};
+        use crate::call::{AudioParameters, VideoCodec, VideoParameters, VideoResolution};
         use crate::call::{CallMediaProfile, TransportCandidate, TransportProtocol};
-        use crate::call::{AudioParameters, VideoParameters, VideoResolution, VideoCodec};
+        use crate::call::{CallMode, CallOffer, CallTransport};
         use std::convert::TryInto;
 
         let offer = CallOffer {
@@ -392,7 +395,10 @@ mod tests {
                 video: Some(VideoParameters {
                     codec: VideoCodec::Vp8,
                     max_bitrate: 500_000,
-                    max_resolution: VideoResolution { width: 640, height: 360 },
+                    max_resolution: VideoResolution {
+                        width: 640,
+                        height: 360,
+                    },
                     frame_rate: 24,
                     adaptive: true,
                 }),

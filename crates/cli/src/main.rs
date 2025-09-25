@@ -2,6 +2,7 @@ use blake3::Hasher;
 use chrono::{Duration, Utc};
 use commucat_crypto::{DeviceCertificateData, DeviceKeyPair, EventSigner};
 use commucat_ledger::{DebugLedgerAdapter, LedgerAdapter, LedgerRecord};
+use commucat_media::prelude::{CallMediaPipeline, PipelineConfig};
 use commucat_storage::{
     connect, DeviceRecord, NewUserProfile, PresenceSnapshot, SessionRecord, Storage, StorageError,
     UserProfile,
@@ -43,8 +44,50 @@ async fn async_main() -> Result<(), String> {
         "register-user" => command_register_user(args).await,
         "rotate-keys" => command_rotate_keys(args).await,
         "diagnose" => command_diagnose().await,
+        "call-simulate" => command_call_simulate(args).await,
         other => Err(format!("unknown command: {}", other)),
     }
+}
+
+async fn command_call_simulate(args: Vec<String>) -> Result<(), String> {
+    let iterations = if args.is_empty() {
+        64usize
+    } else {
+        args[0]
+            .parse::<usize>()
+            .map_err(|_| "expected <frames> as usize".to_string())?
+    };
+    let config = PipelineConfig::default();
+    let frame_duration = config.voice.frame_duration_ms;
+    let mut pipeline =
+        CallMediaPipeline::new(config).map_err(|err| format!("pipeline init failed: {err}"))?;
+    let mut timestamp_ms = 0u64;
+    let frame_samples = pipeline.frame_samples();
+    let mut pcm = vec![0i16; frame_samples];
+    let mut total_bytes = 0usize;
+    for iter in 0..iterations {
+        for (index, sample) in pcm.iter_mut().enumerate() {
+            let phase = (timestamp_ms as usize + index) as i32;
+            *sample = ((phase * 73) & 0xfff) as i16;
+        }
+        let frame = pipeline
+            .encode_audio(&pcm, timestamp_ms)
+            .map_err(|err| format!("encode failed at frame {iter}: {err}"))?;
+        total_bytes += frame.payload().len();
+        let decoded = pipeline
+            .decode_audio(frame.payload(), false)
+            .map_err(|err| format!("decode failed at frame {iter}: {err}"))?;
+        if decoded.len() != pcm.len() {
+            return Err(format!(
+                "decoded sample count mismatch (expected {}, got {})",
+                pcm.len(),
+                decoded.len()
+            ));
+        }
+        timestamp_ms += u64::from(frame_duration);
+    }
+    println!("simulated_frames={iterations} encoded_bytes={total_bytes}");
+    Ok(())
 }
 
 async fn command_migrate() -> Result<(), String> {

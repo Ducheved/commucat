@@ -69,7 +69,8 @@ jobs:
             crates/crypto/Cargo.toml \
             crates/federation/Cargo.toml \
             crates/storage/Cargo.toml \
-            crates/ledger/Cargo.toml
+            crates/ledger/Cargo.toml \
+            crates/media/Cargo.toml \
           do
             cargo publish --allow-dirty --manifest-path "$manifest"
             # give crates.io a moment to ingest the upload

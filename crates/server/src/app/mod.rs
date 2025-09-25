@@ -19,11 +19,11 @@ use commucat_ledger::{
 use commucat_proto::{
     call::{
         CallAnswer as ProtoCallAnswer, CallEnd as ProtoCallEnd, CallEndReason, CallMediaDirection,
-        CallMode, CallOffer as ProtoCallOffer, CallRejectReason, CallStats as ProtoCallStats,
-        CallMediaProfile,
+        CallMediaProfile, CallMode, CallOffer as ProtoCallOffer, CallRejectReason,
+        CallStats as ProtoCallStats,
     },
-    is_supported_protocol_version, negotiate_protocol_version, ControlEnvelope, Frame, FramePayload,
-    FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    is_supported_protocol_version, negotiate_protocol_version, ControlEnvelope, Frame,
+    FramePayload, FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use commucat_storage::{
     connect, ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
@@ -2116,11 +2116,7 @@ impl CommuCatApp {
         Ok(())
     }
 
-    async fn terminate_call(
-        &self,
-        device_id: &str,
-        end: &ProtoCallEnd,
-    ) -> Result<(), ServerError> {
+    async fn terminate_call(&self, device_id: &str, end: &ProtoCallEnd) -> Result<(), ServerError> {
         let mut sessions = self.state.call_sessions.write().await;
         let Some(session) = sessions.get(&end.call_id) else {
             warn!(call = %end.call_id, "call termination for unknown session");
@@ -2371,7 +2367,8 @@ impl CommuCatApp {
                     FramePayload::Control(ref env) => env,
                     _ => return Err(ServerError::Invalid),
                 };
-                let answer = ProtoCallAnswer::try_from(envelope).map_err(|_| ServerError::Invalid)?;
+                let answer =
+                    ProtoCallAnswer::try_from(envelope).map_err(|_| ServerError::Invalid)?;
                 self.apply_call_answer(device_id, &answer).await?;
                 self.broadcast_frame(device_id, frame.clone()).await?;
                 let mut properties = serde_json::Map::new();
@@ -2744,7 +2741,10 @@ impl CommuCatApp {
             info!(target = %member, relay = relay_mode, "delivered frame");
         }
         if !offline_targets.is_empty() {
-            if matches!(frame.frame_type, FrameType::VoiceFrame | FrameType::VideoFrame) {
+            if matches!(
+                frame.frame_type,
+                FrameType::VoiceFrame | FrameType::VideoFrame
+            ) {
                 debug!(
                     channel = frame.channel_id,
                     targets = offline_targets.len(),
@@ -2777,77 +2777,84 @@ impl CommuCatApp {
                     self.state.storage.store_inbox_offset(&offset).await?;
                     self.state.metrics.mark_relay();
                     if let Some(pos) = target.find('@') {
-                    let domain = &target[pos + 1..];
-                    if domain != self.state.config.domain {
-                        let normalized = domain.to_ascii_lowercase();
-                        let peer = if let Some(peer) = self.state.allowed_peers.get(&normalized) {
-                            Some(peer.clone())
-                        } else {
-                            let cached = {
-                                let peers = self.state.dynamic_peers.read().await;
-                                peers.get(&normalized).cloned()
-                            };
-                            if let Some(peer) = cached {
-                                Some(peer)
+                        let domain = &target[pos + 1..];
+                        if domain != self.state.config.domain {
+                            let normalized = domain.to_ascii_lowercase();
+                            let peer = if let Some(peer) = self.state.allowed_peers.get(&normalized)
+                            {
+                                Some(peer.clone())
                             } else {
-                                match self.state.storage.load_federation_peer(&normalized).await {
-                                    Ok(record)
-                                        if matches!(
-                                            record.status,
-                                            FederationPeerStatus::Active
-                                                | FederationPeerStatus::Pending
-                                        ) =>
+                                let cached = {
+                                    let peers = self.state.dynamic_peers.read().await;
+                                    peers.get(&normalized).cloned()
+                                };
+                                if let Some(peer) = cached {
+                                    Some(peer)
+                                } else {
+                                    match self.state.storage.load_federation_peer(&normalized).await
                                     {
-                                        let peer = PeerConfig {
-                                            domain: record.domain.clone(),
-                                            endpoint: record.endpoint.clone(),
-                                            public_key: record.public_key,
-                                        };
+                                        Ok(record)
+                                            if matches!(
+                                                record.status,
+                                                FederationPeerStatus::Active
+                                                    | FederationPeerStatus::Pending
+                                            ) =>
                                         {
-                                            let mut peers = self.state.dynamic_peers.write().await;
-                                            peers.insert(normalized.clone(), peer.clone());
+                                            let peer = PeerConfig {
+                                                domain: record.domain.clone(),
+                                                endpoint: record.endpoint.clone(),
+                                                public_key: record.public_key,
+                                            };
+                                            {
+                                                let mut peers =
+                                                    self.state.dynamic_peers.write().await;
+                                                peers.insert(normalized.clone(), peer.clone());
+                                            }
+                                            if matches!(
+                                                record.status,
+                                                FederationPeerStatus::Pending
+                                            ) {
+                                                let _ = self
+                                                    .state
+                                                    .storage
+                                                    .set_federation_peer_status(
+                                                        &record.domain,
+                                                        FederationPeerStatus::Active,
+                                                    )
+                                                    .await;
+                                            }
+                                            Some(peer)
                                         }
-                                        if matches!(record.status, FederationPeerStatus::Pending) {
-                                            let _ = self
-                                                .state
-                                                .storage
-                                                .set_federation_peer_status(
-                                                    &record.domain,
-                                                    FederationPeerStatus::Active,
-                                                )
-                                                .await;
-                                        }
-                                        Some(peer)
+                                        _ => None,
                                     }
-                                    _ => None,
                                 }
-                            }
-                        };
-                        if let Some(peer) = peer {
-                            let event = FederationEvent {
-                                event_id: generate_id(target),
-                                origin: self.state.config.domain.clone(),
-                                created_at: now,
-                                payload: json!({
-                                    "channel": frame.channel_id,
-                                    "sequence": frame.sequence,
-                                    "payload": encode_hex(&encoded),
-                                    "sender": sender,
-                                    "target": target,
-                                    "peer_endpoint": peer.endpoint,
-                                    "peer_public_key": encode_hex(&peer.public_key),
-                                }),
-                                scope: domain.to_string(),
                             };
-                            let signed = sign_event(event, &self.state.federation_signer);
-                            info!(
-                                peer = %domain,
-                                endpoint = %peer.endpoint,
-                                event = %signed.event.event_id,
-                                "federation event queued"
-                            );
-                        } else {
-                            warn!(peer = %domain, "federation peer not allowed");
+                            if let Some(peer) = peer {
+                                let event = FederationEvent {
+                                    event_id: generate_id(target),
+                                    origin: self.state.config.domain.clone(),
+                                    created_at: now,
+                                    payload: json!({
+                                        "channel": frame.channel_id,
+                                        "sequence": frame.sequence,
+                                        "payload": encode_hex(&encoded),
+                                        "sender": sender,
+                                        "target": target,
+                                        "peer_endpoint": peer.endpoint,
+                                        "peer_public_key": encode_hex(&peer.public_key),
+                                    }),
+                                    scope: domain.to_string(),
+                                };
+                                let signed = sign_event(event, &self.state.federation_signer);
+                                info!(
+                                    peer = %domain,
+                                    endpoint = %peer.endpoint,
+                                    event = %signed.event.event_id,
+                                    "federation event queued"
+                                );
+                            } else {
+                                warn!(peer = %domain, "federation peer not allowed");
+                            }
                         }
                     }
                 }
@@ -2904,8 +2911,7 @@ impl CommuCatApp {
         if let Err(err) = self.state.storage.publish_presence(&snapshot).await {
             warn!("presence cleanup failed: {}", err);
         }
-        let mut terminated_calls = Vec::new();
-        {
+        let terminated_calls = {
             let mut sessions = self.state.call_sessions.write().await;
             let affected = sessions
                 .values()
@@ -2922,8 +2928,8 @@ impl CommuCatApp {
             for (call_id, _, _, _) in affected.iter() {
                 sessions.remove(call_id);
             }
-            terminated_calls = affected;
-        }
+            affected
+        };
         for (call_id, channel_id, started_at, initiator) in terminated_calls {
             self.state.metrics.mark_call_ended();
             let duration = (Utc::now() - started_at).num_seconds().max(0);
