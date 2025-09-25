@@ -1,4 +1,5 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
+use rand::{rngs::OsRng, RngCore};
 use serde_json::Value;
 use std::convert::TryInto;
 use std::error::Error;
@@ -10,6 +11,10 @@ use tokio::task::JoinHandle;
 use tokio_postgres::{Client, NoTls};
 
 const INIT_SQL: &str = include_str!("../migrations/001_init.sql");
+const PAIRING_SQL: &str = include_str!("../migrations/002_pairing.sql");
+const PAIRING_MAX_ATTEMPTS: i32 = 5;
+const PAIRING_CODE_LENGTH: usize = 8;
+const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 #[derive(Debug)]
 pub enum StorageError {
@@ -17,6 +22,7 @@ pub enum StorageError {
     Redis,
     Serialization,
     Missing,
+    Invalid,
 }
 
 impl Display for StorageError {
@@ -26,6 +32,7 @@ impl Display for StorageError {
             Self::Redis => write!(f, "redis failure"),
             Self::Serialization => write!(f, "serialization failure"),
             Self::Missing => write!(f, "missing record"),
+            Self::Invalid => write!(f, "invalid state"),
         }
     }
 }
@@ -108,6 +115,19 @@ pub struct DeviceKeyEvent {
     pub device_id: String,
     pub public_key: Vec<u8>,
     pub recorded_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingTokenIssued {
+    pub pair_code: String,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairingClaimResult {
+    pub user: UserProfile,
+    pub issuer_device_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +250,10 @@ impl Storage {
         self.client
             .batch_execute(INIT_SQL)
             .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(PAIRING_SQL)
+            .await
             .map_err(|_| StorageError::Postgres)
     }
 
@@ -245,6 +269,43 @@ impl Storage {
             .await
             .map_err(|_| StorageError::Redis)?;
         Ok(())
+    }
+
+    /// Creates a short-lived pairing code bound to an issuer device.
+    pub async fn create_pairing_token(
+        &self,
+        user_id: &str,
+        issuer_device_id: &str,
+        ttl_seconds: i64,
+    ) -> Result<PairingTokenIssued, StorageError> {
+        let issuer = self.load_device(issuer_device_id).await?;
+        if issuer.user_id != user_id || issuer.status != "active" {
+            return Err(StorageError::Invalid);
+        }
+        let ttl = ttl_seconds.clamp(60, 3600);
+        let issued_at = Utc::now();
+        let expires_at = issued_at + Duration::seconds(ttl);
+        for _ in 0..16 {
+            let pair_code = generate_pair_code();
+            let inserted = self
+                .client
+                .execute(
+                    "INSERT INTO device_pairing (pair_code, user_id, issuer_device_id, issued_at, expires_at)
+                    VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (pair_code) DO NOTHING",
+                    &[&pair_code, &user_id, &issuer_device_id, &issued_at, &expires_at],
+                )
+                .await
+                .map_err(|_| StorageError::Postgres)?;
+            if inserted == 1 {
+                return Ok(PairingTokenIssued {
+                    pair_code,
+                    issued_at,
+                    expires_at,
+                });
+            }
+        }
+        Err(StorageError::Postgres)
     }
 
     /// Registers or rotates a device key.
@@ -289,6 +350,116 @@ impl Storage {
         Ok(())
     }
 
+    /// Claims a pairing token and registers a new device for the associated user.
+    pub async fn claim_pairing_token(
+        &self,
+        pair_code: &str,
+        device_id: &str,
+        public_key: &[u8],
+    ) -> Result<PairingClaimResult, StorageError> {
+        let recorded_at = Utc::now();
+        let event_id = format!(
+            "pair:{}:{}",
+            device_id,
+            recorded_at.timestamp_nanos_opt().unwrap_or_default()
+        );
+        let stmt = "WITH selected AS (
+                SELECT user_id, issuer_device_id, expires_at, redeemed_at, attempts
+                FROM device_pairing
+                WHERE pair_code = $1
+                FOR UPDATE
+            ),
+            validated AS (
+                SELECT user_id, issuer_device_id
+                FROM selected
+                WHERE expires_at > now()
+                  AND redeemed_at IS NULL
+                  AND attempts < $6
+            ),
+            updated AS (
+                UPDATE device_pairing
+                SET redeemed_at = $5,
+                    redeemed_device_id = $2,
+                    public_key = $3,
+                    attempts = LEAST(attempts + 1, $6)
+                WHERE pair_code = $1
+                  AND EXISTS (SELECT 1 FROM validated)
+                RETURNING user_id, issuer_device_id
+            ),
+            inserted AS (
+                INSERT INTO user_device (opaque_id, user_id, pubkey, status, created_at)
+                SELECT $2, user_id, $3, 'active', $5 FROM validated
+                RETURNING user_id
+            ),
+            events AS (
+                INSERT INTO device_key_event (event_id, device_id, public_key, recorded_at)
+                SELECT $4, $2, $3, $5 FROM inserted
+            )
+            SELECT user_id, issuer_device_id FROM updated";
+        let result = self
+            .client
+            .query_opt(
+                stmt,
+                &[
+                    &pair_code,
+                    &device_id,
+                    &public_key,
+                    &event_id,
+                    &recorded_at,
+                    &PAIRING_MAX_ATTEMPTS,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let (user_id, issuer_device_id) = match result {
+            Some(row) => {
+                let user_id: String = row.get(0);
+                let issuer_device_id: String = row.get(1);
+                (user_id, issuer_device_id)
+            }
+            None => {
+                let exists = self
+                    .client
+                    .query_opt(
+                        "SELECT 1 FROM device_pairing WHERE pair_code = $1",
+                        &[&pair_code],
+                    )
+                    .await
+                    .map_err(|_| StorageError::Postgres)?;
+                if exists.is_some() {
+                    self
+                        .client
+                        .execute(
+                            "UPDATE device_pairing SET attempts = LEAST(attempts + 1, $2) WHERE pair_code = $1",
+                            &[&pair_code, &PAIRING_MAX_ATTEMPTS],
+                        )
+                        .await
+                        .map_err(|_| StorageError::Postgres)?;
+                    return Err(StorageError::Invalid);
+                }
+                return Err(StorageError::Missing);
+            }
+        };
+        let profile = self.load_user(&user_id).await?;
+        Ok(PairingClaimResult {
+            user: profile,
+            issuer_device_id,
+        })
+    }
+
+    /// Removes expired or exhausted pairing tokens.
+    pub async fn invalidate_expired_pairings(&self) -> Result<u64, StorageError> {
+        let affected = self
+            .client
+            .execute(
+                "DELETE FROM device_pairing WHERE expires_at <= now() OR attempts >= $1 OR (redeemed_at IS NOT NULL AND redeemed_at <= now() - interval '1 day')",
+                &[&PAIRING_MAX_ATTEMPTS],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(affected)
+    }
+
     /// Fetches the newest device key event for a device identifier.
     pub async fn latest_device_key_event(
         &self,
@@ -331,6 +502,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Loads a persisted session by identifier.
+    pub async fn load_session(&self, session_id: &str) -> Result<SessionRecord, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT opaque_id, user_id, device_id, tls_fingerprint, created_at, ttl_seconds FROM session WHERE opaque_id = $1",
+                &[&session_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let row = row.ok_or(StorageError::Missing)?;
+        Ok(SessionRecord {
+            session_id: row.get(0),
+            user_id: row.get(1),
+            device_id: row.get(2),
+            tls_fingerprint: row.get(3),
+            created_at: row.get(4),
+            ttl_seconds: row.get(5),
+        })
+    }
+
     /// Fetches device metadata by identifier.
     pub async fn load_device(&self, device_id: &str) -> Result<DeviceRecord, StorageError> {
         let row = self
@@ -349,6 +541,73 @@ impl Storage {
             status: row.get(3),
             created_at: row.get(4),
         })
+    }
+
+    /// Counts active devices registered for a user.
+    pub async fn count_active_devices(&self, user_id: &str) -> Result<i64, StorageError> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT COUNT(*) FROM user_device WHERE user_id = $1 AND status = 'active'",
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(row.get(0))
+    }
+
+    /// Lists devices associated with a user ordered by creation time.
+    pub async fn list_devices_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<DeviceRecord>, StorageError> {
+        let rows = self
+            .client
+            .query(
+                "SELECT opaque_id, user_id, pubkey, status, created_at FROM user_device WHERE user_id = $1 ORDER BY created_at ASC",
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DeviceRecord {
+                device_id: row.get(0),
+                user_id: row.get(1),
+                public_key: row.get(2),
+                status: row.get(3),
+                created_at: row.get(4),
+            })
+            .collect())
+    }
+
+    /// Marks a device as active.
+    pub async fn activate_device(&self, device_id: &str) -> Result<(), StorageError> {
+        self.update_device_status(device_id, "active").await
+    }
+
+    /// Marks a device as revoked.
+    pub async fn deactivate_device(&self, device_id: &str) -> Result<(), StorageError> {
+        self.update_device_status(device_id, "revoked").await
+    }
+
+    async fn update_device_status(
+        &self,
+        device_id: &str,
+        status: &str,
+    ) -> Result<(), StorageError> {
+        let affected = self
+            .client
+            .execute(
+                "UPDATE user_device SET status = $2 WHERE opaque_id = $1",
+                &[&device_id, &status],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
     }
 
     /// Creates a new user profile entry.
@@ -902,6 +1161,23 @@ impl Storage {
     }
 }
 
+fn generate_pair_code() -> String {
+    let mut seed = [0u8; PAIRING_CODE_LENGTH];
+    OsRng.fill_bytes(&mut seed);
+    let mut output = String::with_capacity(PAIRING_CODE_LENGTH + 1);
+    for (index, byte) in seed.iter().enumerate() {
+        let symbol = PAIRING_ALPHABET[(*byte as usize) % PAIRING_ALPHABET.len()] as char;
+        output.push(symbol);
+        if index == (PAIRING_CODE_LENGTH / 2) - 1 {
+            output.push('-');
+        }
+    }
+    if output.ends_with('-') {
+        output.pop();
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,12 +1190,24 @@ mod tests {
     }
 
     #[test]
+    fn pairing_code_format() {
+        let code = generate_pair_code();
+        assert_eq!(code.len(), PAIRING_CODE_LENGTH + 1);
+        assert!(code.contains('-'));
+    }
+
+    #[test]
     fn init_sql_declares_new_relations() {
         assert!(INIT_SQL.contains("device_key_event"));
         assert!(INIT_SQL.contains("chat_group"));
         assert!(INIT_SQL.contains("group_member"));
         assert!(INIT_SQL.contains("federation_peer"));
         assert!(INIT_SQL.contains("inbox_offset"));
+    }
+
+    #[test]
+    fn pairing_sql_declares_pairing_table() {
+        assert!(PAIRING_SQL.contains("device_pairing"));
     }
 
     #[test]
@@ -1032,6 +1320,27 @@ mod tests {
             .await?
             .expect("offset present");
         assert_eq!(loaded.last_envelope_id, offset.last_envelope_id);
+
+        let ticket = storage
+            .create_pairing_token(&created.user_id, &device_id, 300)
+            .await?;
+        assert_eq!(ticket.pair_code.len(), 9);
+        let paired_device = format!("paired-device-{}", suffix);
+        let claim = storage
+            .claim_pairing_token(&ticket.pair_code, &paired_device, &[7u8; 32])
+            .await?;
+        assert_eq!(claim.user.user_id, created.user_id);
+        assert_eq!(claim.issuer_device_id, device_id);
+        storage
+            .client
+            .execute(
+                "INSERT INTO device_pairing (pair_code, user_id, issuer_device_id, issued_at, expires_at, attempts) VALUES ($1, $2, $3, now(), now() - interval '10 minutes', 0)",
+                &[&format!("expired-{}", suffix), &created.user_id, &device_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let purged = storage.invalidate_expired_pairings().await?;
+        assert!(purged >= 1);
         Ok(())
     }
 }

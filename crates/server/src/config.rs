@@ -66,6 +66,8 @@ pub struct ServerConfig {
     pub ledger: LedgerConfig,
     pub presence_ttl_seconds: i64,
     pub relay_ttl_seconds: i64,
+    pub pairing_ttl_seconds: i64,
+    pub max_auto_devices_per_user: i64,
     pub connection_keepalive: u64,
 }
 
@@ -173,6 +175,13 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         .unwrap_or_else(|| "86400".to_string())
         .parse::<i64>()
         .map_err(|_| ConfigError::Invalid)?;
+    let pairing_ttl = override_env("COMMUCAT_PAIRING_TTL", map.remove("limits.pairing_ttl"))?
+        .unwrap_or_else(|| "300".to_string())
+        .parse::<i64>()
+        .map_err(|_| ConfigError::Invalid)?;
+    if pairing_ttl <= 0 {
+        return Err(ConfigError::Invalid);
+    }
     let keepalive = override_env("COMMUCAT_KEEPALIVE", map.remove("server.keepalive"))?
         .unwrap_or_else(|| "60".to_string())
         .parse::<u64>()
@@ -184,6 +193,16 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
     .unwrap_or_else(|| "false".to_string())
     .parse::<bool>()
     .map_err(|_| ConfigError::Invalid)?;
+    let max_auto_devices = override_env(
+        "COMMUCAT_MAX_AUTO_DEVICES",
+        map.remove("server.max_auto_devices_per_user"),
+    )?
+    .unwrap_or_else(|| "1".to_string())
+    .parse::<i64>()
+    .map_err(|_| ConfigError::Invalid)?;
+    if max_auto_devices < 0 {
+        return Err(ConfigError::Invalid);
+    }
 
     Ok(ServerConfig {
         bind: required(bind)?,
@@ -205,6 +224,8 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         },
         presence_ttl_seconds: presence_ttl,
         relay_ttl_seconds: relay_ttl,
+        pairing_ttl_seconds: pairing_ttl,
+        max_auto_devices_per_user: max_auto_devices,
         connection_keepalive: keepalive,
     })
 }
@@ -265,6 +286,8 @@ mod tests {
         assert_eq!(config.ledger.adapter, LedgerAdapter::Null);
         assert_eq!(config.presence_ttl_seconds, 30);
         assert_eq!(config.relay_ttl_seconds, 86400);
+        assert_eq!(config.pairing_ttl_seconds, 300);
+        assert_eq!(config.max_auto_devices_per_user, 1);
         fs::remove_file(path).unwrap();
     }
 }

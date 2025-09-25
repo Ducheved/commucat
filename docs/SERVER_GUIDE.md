@@ -5,7 +5,7 @@
 ## Архитектура
 
 - **commucat-server**: процесс Pingora, завершающий TLS, выполняющий Noise-хэндшейк и маршрутизацию кадров CCP-1. Держит активные каналы, публикует presence в Redis, пишет агрегаты в ledger.
-- **PostgreSQL**: долговременное хранилище. Основные таблицы: `app_user`, `user_device`, `session`, `relay_queue`, `device_key_event`, `chat_group`, `group_member`, `federation_peer`, `inbox_offset`.
+- **PostgreSQL**: долговременное хранилище. Основные таблицы: `app_user`, `user_device`, `device_pairing`, `session`, `relay_queue`, `device_key_event`, `chat_group`, `group_member`, `federation_peer`, `inbox_offset`.
 - **Redis**: краткоживущие данные (`presence:{device}`, `route:{device}`) и лёгкие TTL-таблицы для прерывания соединений.
 - **Ledger адаптер**: опциональная внешняя система аудита (file/debug/null) для фиксации сессий и изменений ключей.
 
@@ -30,7 +30,8 @@
 - `[storage]`: строки подключения к PostgreSQL и Redis.
 - `[crypto]`: Noise ключи, сид подписи федерации, prologue.
 - `[federation]`: статические доверенные домены. Они объединяются с динамическими записями `federation_peer`.
-- `[limits]`: `presence_ttl`, `relay_ttl`.
+- `[limits]`: `presence_ttl`, `relay_ttl`, `pairing_ttl` (в секундах, TTL выдаваемых pairing-кодов).
+- `[server]`: `max_auto_devices_per_user` ограничивает количество устройств, которые можно автоматически одобрить через Noise-хэндшейк до обязательного pairing.
 - `[admin]`: опциональный bearer-токен для `GET /metrics`.
 
 Бинарь читает окружение `COMMUCAT_*`, которые переопределяют TOML (см. `.env.sample`). Для прогонов тестов добавлены `COMMUCAT_TEST_PG_DSN` и `COMMUCAT_TEST_REDIS_URL` — они позволяют запускать интеграционные тесты слоя хранилища.
@@ -49,6 +50,14 @@
 - `GROUP_INVITE` добавляет участника. Допустимые роли: `member`, `admin`. Запросы на `owner` автоматически понижаются до `admin`, чтобы избежать расщепления полномочий.
 - В `JOIN` клиент может указать `group_id`; сервер сверит его с БД и отклонит участника, отсутствующего в `group_member`.
 - Удаление участника (`remove_group_member`) снимает запись и обновляет кэш маршрутов.
+
+## Pairing-коды и лимиты автоподтверждения
+
+- `device_pairing` хранит одноразовые pairing-коды: `pair_code`, `user_id`, `issuer_device_id`, время выдачи/истечения, логин устройства-получателя и последний публичный ключ.
+- `POST /api/pair` (требует `Authorization: Bearer <session>`): создаёт pairing-код, возвращает `pair_code`, TTL, `expires_at`, seed и `issuer_device_id`. Если `max_auto_devices_per_user` достигнут, даже действующие устройства должны использовать pairing для новых устройств.
+- `POST /api/pair/claim`: принимает `pair_code` и необязательное `device_name`, генерирует новый `device_id` и ключи, возвращает приватный/публичный ключи и профиль пользователя. Неверные или просроченные коды увеличивают счётчик `attempts`, и после 5 попыток код удаляется.
+- `GET /api/devices` и `POST /api/devices/revoke` позволяют просматривать и деактивировать устройства (c Bearer-сессией). Деактивация переводит `user_device.status` в `revoked` и снимает активное соединение.
+- Хэндшейк `/connect` автоматически отклоняет новые устройства, если исчерпан лимит `max_auto_devices_per_user`, выдавая `ERROR` с `title`=`PairingRequired`. После успешного соединения `ACK` включает поле `pairing_required`, чтобы клиент мог подсказать пользователю о необходимости pairing при следующих регистрациях.
 
 ## Аудит ключей устройств
 

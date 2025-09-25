@@ -4,7 +4,8 @@ use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
 use blake3::hash as blake3_hash;
 use chrono::{Duration, Utc};
 use commucat_crypto::{
-    build_handshake, CryptoError, EventSigner, HandshakePattern, NoiseConfig, NoiseHandshake,
+    build_handshake, CryptoError, DeviceKeyPair, EventSigner, HandshakePattern, NoiseConfig,
+    NoiseHandshake,
 };
 use commucat_federation::{sign_event, FederationError, FederationEvent};
 use commucat_ledger::{
@@ -25,6 +26,8 @@ use pingora::http::ResponseHeader;
 use pingora::protocols::http::v2::server::H2Options;
 use pingora::protocols::http::ServerSession;
 use pingora::server::ShutdownWatch;
+use rand::{rngs::OsRng, RngCore};
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
@@ -35,9 +38,11 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration as StdDuration;
 use subtle::ConstantTimeEq;
 use tokio::select;
 use tokio::sync::{mpsc, RwLock};
+use tokio::time::interval;
 use tracing::{error, info, warn};
 
 const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>CommuCat</title>\n<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0b1120;color:#f9fafb;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;}main{max-width:480px;text-align:center;padding:2rem;background:rgba(15,23,42,0.85);border-radius:20px;box-shadow:0 10px 30px rgba(15,23,42,0.4);}h1{font-size:2.25rem;margin-bottom:0.5rem;}p{margin:0.75rem 0;color:#cbd5f5;}a{color:#38bdf8;text-decoration:none;}a:hover{text-decoration:underline;}</style>\n</head>\n<body>\n<main>\n<h1>CommuCat Server</h1>\n<p>Secure Noise + TLS relay for CCP-1 chats.</p>\n<p><a href=\"https://github.com/ducheved/commucat\">Project documentation</a></p>\n<p><a href=\"/healthz\">Health</a> · <a href=\"/readyz\">Readiness</a></p>\n</main>\n</body>\n</html>\n";
@@ -51,6 +56,7 @@ pub enum ServerError {
     Federation,
     Invalid,
     Io,
+    PairingRequired,
     ProtocolNegotiation(String),
 }
 
@@ -64,6 +70,7 @@ impl Display for ServerError {
             Self::Federation => write!(f, "federation failure"),
             Self::Invalid => write!(f, "invalid request"),
             Self::Io => write!(f, "io failure"),
+            Self::PairingRequired => write!(f, "pairing required"),
             Self::ProtocolNegotiation(reason) => {
                 write!(f, "protocol negotiation failed: {}", reason)
             }
@@ -94,8 +101,11 @@ mod tests {
 impl Error for ServerError {}
 
 impl From<StorageError> for ServerError {
-    fn from(_: StorageError) -> Self {
-        ServerError::Storage
+    fn from(err: StorageError) -> Self {
+        match err {
+            StorageError::Invalid | StorageError::Missing => ServerError::Invalid,
+            _ => ServerError::Storage,
+        }
     }
 }
 
@@ -174,6 +184,61 @@ pub struct PeerPresence {
     pub last_seen: chrono::DateTime<Utc>,
 }
 
+#[derive(Deserialize)]
+struct PairCreateRequest {
+    ttl: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct PairClaimRequest {
+    pair_code: String,
+    device_name: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceRevokeRequest {
+    device_id: String,
+}
+
+struct SessionContext {
+    user: UserProfile,
+    device: DeviceRecord,
+}
+
+enum ApiError {
+    Unauthorized,
+    Forbidden,
+    BadRequest(String),
+    NotFound,
+    Conflict(String),
+    Internal,
+}
+
+impl ApiError {
+    fn status(&self) -> u16 {
+        match self {
+            Self::Unauthorized => 401,
+            Self::Forbidden => 403,
+            Self::BadRequest(_) => 400,
+            Self::NotFound => 404,
+            Self::Conflict(_) => 409,
+            Self::Internal => 500,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self {
+            Self::Unauthorized => "Unauthorized",
+            Self::Forbidden => "Forbidden",
+            Self::BadRequest(_) => "BadRequest",
+            Self::NotFound => "NotFound",
+            Self::Conflict(_) => "Conflict",
+            Self::Internal => "InternalError",
+        }
+    }
+
+}
+
 enum HandshakeStage {
     Hello,
     AwaitClient,
@@ -244,7 +309,7 @@ impl CommuCatApp {
             }
         }
         let signer = EventSigner::new(&config.federation_seed);
-        Ok(Arc::new(AppState {
+        let state = Arc::new(AppState {
             storage,
             ledger,
             metrics: Metrics::new(),
@@ -259,7 +324,23 @@ impl CommuCatApp {
             presence_ttl: config.presence_ttl_seconds,
             relay_ttl: config.relay_ttl_seconds,
             config,
-        }))
+        });
+        let cleanup_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let mut ticker = interval(StdDuration::from_secs(60));
+            loop {
+                ticker.tick().await;
+                match cleanup_state.storage.invalidate_expired_pairings().await {
+                    Ok(purged) => {
+                        if purged > 0 {
+                            info!(tokens = purged, "expired pairing tokens purged");
+                        }
+                    }
+                    Err(err) => warn!("pairing cleanup failed: {}", err),
+                }
+            }
+        });
+        Ok(state)
     }
 }
 
@@ -403,6 +484,46 @@ impl CommuCatApp {
             }
             _ => {}
         }
+        if path == "/api/pair" && method == "POST" {
+            self.state.metrics.mark_ingress();
+            match self.handle_pair_create(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        if path == "/api/pair/claim" && method == "POST" {
+            self.state.metrics.mark_ingress();
+            match self.handle_pair_claim(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        if path == "/api/devices" && method == "GET" {
+            self.state.metrics.mark_ingress();
+            match self.handle_devices_list(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        if path == "/api/devices/revoke" && method == "POST" {
+            self.state.metrics.mark_ingress();
+            match self.handle_device_revoke(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
         if path == "/connect" && method == "POST" {
             return self.process_connect(session, shutdown).await;
         }
@@ -426,6 +547,321 @@ impl CommuCatApp {
             .ok()?;
         session.finish().await.ok()?;
         None
+    }
+
+    async fn handle_pair_create(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+        let body = Self::read_body(session).await?;
+        let request = if body.is_empty() {
+            PairCreateRequest { ttl: None }
+        } else {
+            serde_json::from_slice::<PairCreateRequest>(&body)
+                .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?
+        };
+        let mut ttl = request.ttl.unwrap_or(self.state.config.pairing_ttl_seconds);
+        if ttl <= 0 {
+            return Err(ApiError::BadRequest("ttl must be positive".to_string()));
+        }
+        ttl = ttl.min(self.state.config.pairing_ttl_seconds);
+        let issued = self
+            .state
+            .storage
+            .create_pairing_token(&context.user.user_id, &context.device.device_id, ttl)
+            .await
+            .map_err(|err| match err {
+                StorageError::Invalid | StorageError::Missing => ApiError::Forbidden,
+                _ => ApiError::Internal,
+            })?;
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let ttl_secs = issued
+            .expires_at
+            .signed_duration_since(issued.issued_at)
+            .num_seconds();
+        let payload = json!({
+            "pair_code": issued.pair_code,
+            "issued_at": issued.issued_at.to_rfc3339(),
+            "expires_at": issued.expires_at.to_rfc3339(),
+            "ttl": ttl_secs,
+            "device_seed": encode_hex(&seed[..]),
+            "issuer_device_id": context.device.device_id,
+        });
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_pair_claim(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let body = Self::read_body(session).await?;
+        let request = serde_json::from_slice::<PairClaimRequest>(&body)
+            .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?;
+        let code = request.pair_code.trim();
+        if code.is_empty() {
+            return Err(ApiError::BadRequest("pair_code is required".to_string()));
+        }
+        let normalized_code = code.to_uppercase();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let keys = DeviceKeyPair::from_seed(&seed).map_err(|_| ApiError::Internal)?;
+        let device_id = generate_id(&format!(
+            "device:{}:{}",
+            normalized_code,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let claim = self
+            .state
+            .storage
+            .claim_pairing_token(&normalized_code, &device_id, &keys.public[..])
+            .await
+            .map_err(|err| match err {
+                StorageError::Missing => ApiError::NotFound,
+                StorageError::Invalid => {
+                    ApiError::BadRequest("pairing code invalid or expired".to_string())
+                }
+                _ => ApiError::Internal,
+            })?;
+        let mut response = json!({
+            "device_id": device_id,
+            "private_key": encode_hex(&keys.private[..]),
+            "public_key": encode_hex(&keys.public[..]),
+            "seed": encode_hex(&seed[..]),
+            "issuer_device_id": claim.issuer_device_id,
+            "user": {
+                "id": claim.user.user_id,
+                "handle": claim.user.handle,
+                "display_name": claim.user.display_name,
+                "avatar_url": claim.user.avatar_url,
+            },
+        });
+        if let Some(name) = request.device_name {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("device_name".to_string(), json!(name));
+            }
+        }
+        self.respond_json(session, 200, response, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_devices_list(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+        let devices = self
+            .state
+            .storage
+            .list_devices_for_user(&context.user.user_id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let entries = devices
+            .into_iter()
+            .map(|device| {
+                json!({
+                    "device_id": device.device_id,
+                    "status": device.status,
+                    "created_at": device.created_at.to_rfc3339(),
+                    "public_key": encode_hex(device.public_key.as_slice()),
+                    "current": device.device_id == context.device.device_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "devices": entries,
+        });
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_device_revoke(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+        let body = Self::read_body(session).await?;
+        let request = serde_json::from_slice::<DeviceRevokeRequest>(&body)
+            .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?;
+        let target = request.device_id.trim();
+        if target.is_empty() {
+            return Err(ApiError::BadRequest("device_id is required".to_string()));
+        }
+        if target == context.device.device_id {
+            return Err(ApiError::Conflict(
+                "cannot revoke active session device".to_string(),
+            ));
+        }
+        let target_record =
+            self.state
+                .storage
+                .load_device(target)
+                .await
+                .map_err(|err| match err {
+                    StorageError::Missing => ApiError::NotFound,
+                    _ => ApiError::Internal,
+                })?;
+        if target_record.user_id != context.user.user_id {
+            return Err(ApiError::Forbidden);
+        }
+        self.state
+            .storage
+            .deactivate_device(target)
+            .await
+            .map_err(|err| match err {
+                StorageError::Missing => ApiError::NotFound,
+                _ => ApiError::Internal,
+            })?;
+        self.cleanup_connection(target).await;
+        let payload = json!({
+            "device_id": target,
+            "status": "revoked",
+        });
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn authenticate_session(
+        &self,
+        session: &ServerSession,
+    ) -> Result<SessionContext, ApiError> {
+        let header = session
+            .req_header()
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .ok_or(ApiError::Unauthorized)?;
+        let token = header
+            .trim()
+            .strip_prefix("Bearer ")
+            .unwrap_or(header.trim());
+        if token.is_empty() {
+            return Err(ApiError::Unauthorized);
+        }
+        let session_record =
+            self.state
+                .storage
+                .load_session(token)
+                .await
+                .map_err(|err| match err {
+                    StorageError::Missing => ApiError::Unauthorized,
+                    _ => ApiError::Internal,
+                })?;
+        let expiry = session_record.created_at + Duration::seconds(session_record.ttl_seconds);
+        if expiry <= Utc::now() {
+            return Err(ApiError::Unauthorized);
+        }
+        let device = self
+            .state
+            .storage
+            .load_device(&session_record.device_id)
+            .await
+            .map_err(|err| match err {
+                StorageError::Missing => ApiError::Unauthorized,
+                _ => ApiError::Internal,
+            })?;
+        if device.status != "active" {
+            return Err(ApiError::Forbidden);
+        }
+        let user = self
+            .state
+            .storage
+            .load_user(&session_record.user_id)
+            .await
+            .map_err(|err| match err {
+                StorageError::Missing => ApiError::Unauthorized,
+                _ => ApiError::Internal,
+            })?;
+        Ok(SessionContext { user, device })
+    }
+
+    async fn respond_json(
+        &self,
+        session: &mut ServerSession,
+        status: u16,
+        payload: serde_json::Value,
+        content_type: &str,
+    ) -> Result<(), ServerError> {
+        let mut response =
+            ResponseHeader::build_no_case(status, None).map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("content-type", content_type)
+            .map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("cache-control", "no-store")
+            .map_err(|_| ServerError::Invalid)?;
+        session
+            .write_response_header(Box::new(response))
+            .await
+            .map_err(|_| ServerError::Io)?;
+        session
+            .write_response_body(payload.to_string().into_bytes().into(), true)
+            .await
+            .map_err(|_| ServerError::Io)?;
+        self.state.metrics.mark_egress();
+        Ok(())
+    }
+
+    async fn respond_api_error(
+        &self,
+        session: &mut ServerSession,
+        error: ApiError,
+    ) -> Result<(), ServerError> {
+        let status = error.status();
+        let title = error.title();
+        let detail = match &error {
+            ApiError::Unauthorized => Some("authorization required"),
+            ApiError::Forbidden => Some("access denied"),
+            ApiError::NotFound => Some("resource not found"),
+            ApiError::Internal => Some("internal server error"),
+            ApiError::BadRequest(reason) => Some(reason.as_str()),
+            ApiError::Conflict(reason) => Some(reason.as_str()),
+        };
+        let mut body = json!({
+            "type": "about:blank",
+            "title": title,
+            "status": status,
+        });
+        if let Some(message) = detail {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("detail".to_string(), json!(message));
+            }
+        }
+        self.respond_json(session, status, body, "application/problem+json")
+            .await
+    }
+
+    async fn ensure_pairing_limit(&self, user_id: &str) -> Result<(), ServerError> {
+        if !self.state.config.auto_approve_devices {
+            return Err(ServerError::PairingRequired);
+        }
+        let limit = self.state.config.max_auto_devices_per_user;
+        if limit <= 0 {
+            return Ok(());
+        }
+        let count = self.state.storage.count_active_devices(user_id).await?;
+        if count >= limit {
+            return Err(ServerError::PairingRequired);
+        }
+        Ok(())
+    }
+
+    async fn read_body(session: &mut ServerSession) -> Result<Vec<u8>, ApiError> {
+        let mut body = Vec::new();
+        loop {
+            match session.read_request_body().await {
+                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(None) => break,
+                Err(_) => return Err(ApiError::Internal),
+            }
+        }
+        Ok(body)
     }
 
     fn authorize_admin(&self, session: &ServerSession) -> bool {
@@ -501,16 +937,21 @@ impl CommuCatApp {
                             )
                             .await
                         {
+                            let mut properties = json!({
+                                "error": "handshake",
+                                "detail": err.to_string(),
+                            });
+                            if matches!(err, ServerError::PairingRequired) {
+                                if let Some(obj) = properties.as_object_mut() {
+                                    obj.insert("title".to_string(), json!("PairingRequired"));
+                                    obj.insert("pairing_required".to_string(), json!(true));
+                                }
+                            }
                             let error_frame = Frame {
                                 channel_id: 0,
                                 sequence: server_sequence,
                                 frame_type: FrameType::Error,
-                                payload: FramePayload::Control(ControlEnvelope {
-                                    properties: json!({
-                                        "error": "handshake",
-                                        "detail": err.to_string(),
-                                    }),
-                                }),
+                                payload: FramePayload::Control(ControlEnvelope { properties }),
                             };
                             let _ = self.write_frame(&mut session, error_frame).await;
                             session.finish().await.ok()?;
@@ -608,7 +1049,25 @@ impl CommuCatApp {
             warn!("route register failed: {}", err);
         }
 
-        let ack_properties = json!({
+        let pairing_required_flag = if !self.state.config.auto_approve_devices {
+            true
+        } else if self.state.config.max_auto_devices_per_user > 0 {
+            match self
+                .state
+                .storage
+                .count_active_devices(&user_profile.user_id)
+                .await
+            {
+                Ok(count) => count >= self.state.config.max_auto_devices_per_user,
+                Err(err) => {
+                    warn!("pairing requirement probe failed: {}", err);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        let mut ack_properties = json!({
             "handshake": "ok",
             "session": session_id,
             "user": {
@@ -618,6 +1077,9 @@ impl CommuCatApp {
                 "avatar_url": user_profile.avatar_url.clone(),
             },
         });
+        if let Some(obj) = ack_properties.as_object_mut() {
+            obj.insert("pairing_required".to_string(), json!(pairing_required_flag));
+        }
         let ack_frame = Frame {
             channel_id: 0,
             sequence: server_sequence,
@@ -864,6 +1326,9 @@ impl CommuCatApp {
 
                 match self.state.storage.load_device(&device_id).await {
                     Ok(record) => {
+                        if record.status != "active" {
+                            return Err(ServerError::Invalid);
+                        }
                         if let Some(provided) = &user_id_hint {
                             if provided != &record.user_id {
                                 return Err(ServerError::Invalid);
@@ -892,9 +1357,6 @@ impl CommuCatApp {
                         }
                     }
                     Err(StorageError::Missing) => {
-                        if !self.state.config.auto_approve_devices {
-                            return Err(ServerError::Invalid);
-                        }
                         let (resolved_id, profile) = if let Some(provided) = &user_id_hint {
                             let profile = self.state.storage.load_user(provided).await?;
                             if let Some(handle) = &handle_hint {
@@ -922,6 +1384,7 @@ impl CommuCatApp {
                         } else {
                             return Err(ServerError::Invalid);
                         };
+                        self.ensure_pairing_limit(&resolved_id).await?;
                         let insert = DeviceRecord {
                             device_id: device_id.clone(),
                             user_id: resolved_id.clone(),

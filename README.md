@@ -67,12 +67,12 @@ commucat/
 ## ⚙️ Конфигурация (кратко)
 - Все параметры доступны из `commucat.toml` и переменных окружения (см. `.env.sample`).
 - Ключевые блоки конфигурации:
-  - `[server]` — bind адрес, домен, TLS файлы, keepalive.
+  - `[server]` — bind адрес, домен, TLS файлы, keepalive, `auto_approve_devices`, `max_auto_devices_per_user`.
   - `[storage]` — DSN PostgreSQL, URL Redis.
   - `[crypto]` — Noise private/public, federation seed.
   - `[federation]` — список доверенных пиров.
   - `[ledger]` — null / debug / file адаптер.
-  - `[limits]` — TTL presence/relay.
+  - `[limits]` — TTL presence/relay/pairing.
 - Убедитесь, что `server.domain` совпадает с CN/SAN сертификата.
 
 См. подробности в [`docs/SERVER_GUIDE.md`](docs/SERVER_GUIDE.md#конфигурация).

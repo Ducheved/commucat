@@ -99,7 +99,8 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
        "handle": "effective-handle",
        "display_name": "optional nickname",
        "avatar_url": "https://..."
-     }
+     },
+     "pairing_required": false
    }
    ```
 
@@ -108,7 +109,9 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
    { "handshake": "hex(noise_message_3)" }
    ```
 
-After message three the Noise state switches into transport mode. The server never accesses plaintext payloads. A final `ACK` frame with `{ "handshake": "ok", "user": {...} }` confirms tunnel readiness.
+After message three the Noise state switches into transport mode. The server never accesses plaintext payloads. A final `ACK` frame with `{ "handshake": "ok", "pairing_required": false, "user": {...} }` confirms tunnel readiness.
+
+If `max_auto_devices_per_user` is reached or `auto_approve_devices` is disabled, the server immediately returns an `ERROR` frame with `title`=`PairingRequired` and closes the stream. The client should obtain a pairing code over REST and re-register the device via `POST /api/pair/claim`.
 
 *Profile provisioning*: the `user` object in `HELLO` lets clients attach devices to existing profiles (`id`) or request new profiles (`handle`, plus optional `display_name` and `avatar_url`). When auto-approval is enabled, absent `id` instructs the server to mint a fresh user. The server echoes canonical profile fields in the `AUTH` response and completion `ACK`, ensuring clients persist consistent identifiers.
 
@@ -198,6 +201,7 @@ Codec failures surfaced during framing SHOULD be translated into terminal `ERROR
 | Declared payload length exceeds limits | `Payload Too Large` |
 | Control payload exceeds JSON limits | `Control Payload Too Large` |
 | Channel or sequence outside allowed range | `Identifier Out Of Range` |
+| Auto-approval limit reached | `PairingRequired` |
 | Varint exceeds 64-bit width | `Varint Overflow` |
 | Buffer underrun before payload end | `Truncated Frame` |
 

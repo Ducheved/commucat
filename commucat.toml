@@ -4,6 +4,7 @@ tls_cert="certs/server.crt"
 tls_key="certs/server.key"
 domain="localhost"
 auto_approve_devices=true
+max_auto_devices_per_user="1"
 keepalive="60"
 
 [storage]
@@ -25,6 +26,7 @@ mode="null"
 [limits]
 presence_ttl="30"
 relay_ttl="86400"
+pairing_ttl="300"
 
 [admin]
 token="replace-with-secret"

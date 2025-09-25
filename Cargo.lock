@@ -617,6 +617,7 @@ dependencies = [
  "commucat-proto",
  "commucat-storage",
  "pingora",
+ "rand 0.8.5",
  "redis",
  "serde",
  "serde_json",
@@ -632,6 +633,7 @@ name = "commucat-storage"
 version = "1.0.0"
 dependencies = [
  "chrono",
+ "rand 0.8.5",
  "redis",
  "serde",
  "serde_json",

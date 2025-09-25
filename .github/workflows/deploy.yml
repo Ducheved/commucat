@@ -39,24 +39,18 @@ jobs:
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binaries
-        run: cargo build --release -p commucat-server -p commucat-cli
-
-      - name: Package artifact
+      - name: Download release bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           VERSION="${{ steps.meta.outputs.version }}"
-          PACKAGE="commucat-bundle-${VERSION}.tar.gz"
-          mkdir -p dist/bin
-          cp target/release/commucat-server dist/bin/
-          cp target/release/commucat-cli dist/bin/
-          strip dist/bin/commucat-server dist/bin/commucat-cli || true
-          tar -czf "$PACKAGE" -C dist .
+          ASSET="commucat-server-linux-amd64.tar.gz"
+          URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${ASSET}"
+          curl -sSLo "$ASSET" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "$URL"
 
       - name: Prepare remote directories
         uses: appleboy/ssh-action@v1.1.0
@@ -74,7 +68,7 @@ jobs:
           host: ${{ secrets.PROD_SSH_HOST }}
           username: ${{ secrets.PROD_SSH_USER }}
           password: ${{ secrets.PROD_SSH_PASSWORD }}
-          source: commucat-bundle-${{ steps.meta.outputs.version }}.tar.gz
+          source: commucat-server-linux-amd64.tar.gz
           target: /home/${{ secrets.PROD_SSH_USER }}/releases
           overwrite: true
           strip_components: 0
@@ -91,10 +85,10 @@ jobs:
             VERSION="${{ steps.meta.outputs.version }}"
             SUDO_PASSWORD='${{ secrets.PROD_SSH_PASSWORD }}'
             mkdir -p ~/releases ~/bin
-            tar -xzf ~/releases/commucat-bundle-${VERSION}.tar.gz -C ~/releases
+            tar -xzf ~/releases/commucat-server-linux-amd64.tar.gz -C ~/releases
             install -Dm755 ~/releases/bin/commucat-server ~/bin/commucat-server
             install -Dm755 ~/releases/bin/commucat-cli ~/bin/commucat-cli
-            rm -f ~/releases/commucat-bundle-${VERSION}.tar.gz
+            rm -f ~/releases/commucat-server-linux-amd64.tar.gz
             printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' systemctl restart commucat
 
       - name: Summary
