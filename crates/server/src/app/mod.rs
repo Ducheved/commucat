@@ -236,7 +236,6 @@ impl ApiError {
             Self::Internal => "InternalError",
         }
     }
-
 }
 
 enum HandshakeStage {
