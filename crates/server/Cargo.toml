@@ -13,7 +13,7 @@ publish = false
 
 [dependencies]
 chrono = { workspace = true }
-commucat-crypto = { path = "../crypto", version = "1.0" }
+commucat-crypto = { path = "../crypto", version = "1.0", features = ["pq"] }
 commucat-federation = { path = "../federation", version = "1.0" }
 commucat-ledger = { path = "../ledger", version = "1.0" }
 commucat-proto = { path = "../proto", version = "1.0" }
@@ -30,3 +30,5 @@ pingora = { workspace = true }
 rand = { workspace = true }
 subtle = "2.5"
 async-trait = "0.1"
+raptorq = { workspace = true }
+ml-kem = { workspace = true }

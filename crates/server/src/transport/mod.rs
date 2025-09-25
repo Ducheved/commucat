@@ -1,10 +1,15 @@
+mod fec;
+
 use async_trait::async_trait;
+use raptorq::ObjectTransmissionInformation;
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use tokio::io::{self, AsyncRead, AsyncWrite, DuplexStream};
 use tokio::time::{sleep, timeout, Duration};
 use tracing::{debug, info, warn};
+
+pub use fec::{FecProfile, RaptorqDecoder, RaptorqEncoder};
 
 pub trait TransportIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -184,6 +189,127 @@ impl TransportSession {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct MultipathEndpoint {
+    pub id: String,
+    pub endpoint: Endpoint,
+    pub priority: u8,
+}
+
+impl MultipathEndpoint {
+    pub fn new(id: impl Into<String>, endpoint: Endpoint) -> Self {
+        Self {
+            id: id.into(),
+            endpoint,
+            priority: 100,
+        }
+    }
+
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority;
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipathPathInfo {
+    pub id: String,
+    pub transport: TransportType,
+    pub resistance: ResistanceLevel,
+    pub performance: PerformanceProfile,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipathSegment {
+    pub path_id: String,
+    pub payload: Vec<u8>,
+    pub repair: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultipathDispatch {
+    pub oti: ObjectTransmissionInformation,
+    pub segments: Vec<MultipathSegment>,
+}
+
+#[derive(Debug)]
+struct PathSession {
+    descriptor: MultipathEndpoint,
+    session: TransportSession,
+}
+
+#[derive(Debug)]
+pub struct MultipathTunnel {
+    fec: FecProfile,
+    paths: Vec<PathSession>,
+}
+
+impl MultipathTunnel {
+    fn new(fec: FecProfile, paths: Vec<PathSession>) -> Self {
+        Self { fec, paths }
+    }
+
+    pub fn path_count(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn path_info(&self) -> Vec<MultipathPathInfo> {
+        self.paths
+            .iter()
+            .map(|path| MultipathPathInfo {
+                id: path.descriptor.id.clone(),
+                transport: path.session.transport,
+                resistance: path.session.resistance,
+                performance: path.session.profile,
+            })
+            .collect()
+    }
+
+    pub fn encode_frame(&self, payload: &[u8]) -> MultipathDispatch {
+        let encoder = RaptorqEncoder::new(self.fec.clone());
+        let batch = encoder.encode(payload);
+        if self.paths.is_empty() {
+            return MultipathDispatch {
+                oti: batch.oti,
+                segments: Vec::new(),
+            };
+        }
+        let path_count = self.paths.len();
+        let mut segments = Vec::with_capacity(batch.systematic.len() + batch.repair.len());
+        for (idx, packet) in batch.systematic.iter().enumerate() {
+            let target = idx % path_count;
+            segments.push(MultipathSegment {
+                path_id: self.paths[target].descriptor.id.clone(),
+                payload: packet.clone(),
+                repair: false,
+            });
+        }
+        if !batch.repair.is_empty() {
+            let parity_targets = if path_count > 1 { path_count - 1 } else { 1 };
+            for (idx, packet) in batch.repair.iter().enumerate() {
+                let target = if path_count > 1 {
+                    (idx % parity_targets) + 1
+                } else {
+                    0
+                };
+                segments.push(MultipathSegment {
+                    path_id: self.paths[target].descriptor.id.clone(),
+                    payload: packet.clone(),
+                    repair: true,
+                });
+            }
+        }
+        MultipathDispatch {
+            oti: batch.oti,
+            segments,
+        }
+    }
+
+    pub fn primary_path_id(&self) -> Option<&str> {
+        self.paths.first().map(|path| path.descriptor.id.as_str())
+    }
+}
+
 #[async_trait]
 pub trait PluggableTransport: Send + Sync {
     fn kind(&self) -> TransportType;
@@ -348,6 +474,40 @@ impl TransportManager {
             }
         }
         Err(TransportError::Exhausted)
+    }
+
+    pub async fn establish_multipath(
+        &mut self,
+        endpoints: &[MultipathEndpoint],
+        min_paths: usize,
+        fec_profile: FecProfile,
+    ) -> Result<MultipathTunnel, TransportError> {
+        if endpoints.is_empty() {
+            return Err(TransportError::NotSupported);
+        }
+        let mut ordered = endpoints.to_vec();
+        ordered.sort_by_key(|endpoint| endpoint.priority);
+        let required = min_paths.max(1);
+        let mut sessions = Vec::new();
+        let mut last_error = None;
+        for descriptor in ordered.into_iter() {
+            match self.establish_connection(&descriptor.endpoint).await {
+                Ok(session) => {
+                    sessions.push(PathSession {
+                        descriptor,
+                        session,
+                    });
+                }
+                Err(err) => {
+                    warn!(path = %descriptor.id, error = %err, "multipath transport failed");
+                    last_error = Some(err);
+                }
+            }
+        }
+        if sessions.len() < required {
+            return Err(last_error.unwrap_or(TransportError::Exhausted));
+        }
+        Ok(MultipathTunnel::new(fec_profile, sessions))
     }
 
     pub fn list_transports(&self) -> Vec<TransportType> {
@@ -759,7 +919,9 @@ pub fn default_manager(reality: Option<RealityConfig>) -> TransportManager {
 
 #[cfg(test)]
 mod tests {
+    use super::fec::RaptorqDecoder;
     use super::*;
+    use std::collections::HashSet;
     use tokio::runtime::Runtime;
 
     struct TestTransport {
@@ -887,5 +1049,119 @@ mod tests {
         let manager = default_manager(Some(reality));
         let transports = manager.list_transports();
         assert!(transports.contains(&TransportType::Reality));
+    }
+
+    #[test]
+    fn multipath_establishes_and_reports() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let transports: Vec<Arc<dyn PluggableTransport>> = vec![
+                Arc::new(TestTransport {
+                    kind: TransportType::AmnesiaWg,
+                    resistance: ResistanceLevel::Maximum,
+                    profile: PerformanceProfile::new(
+                        PerformanceTier::Medium,
+                        PerformanceTier::Medium,
+                    ),
+                    fail: false,
+                }),
+                Arc::new(TestTransport {
+                    kind: TransportType::QuicMasque,
+                    resistance: ResistanceLevel::Enhanced,
+                    profile: PerformanceProfile::new(PerformanceTier::High, PerformanceTier::High),
+                    fail: false,
+                }),
+            ];
+            let mut manager = TransportManager::new(transports);
+            let base_endpoint = Endpoint {
+                address: "primary.commucat".to_string(),
+                port: 443,
+                server_name: Some("primary.commucat".to_string()),
+                reality: None,
+            };
+            let multipath = vec![
+                MultipathEndpoint::new("primary", base_endpoint.clone()).with_priority(0),
+                MultipathEndpoint::new(
+                    "backup",
+                    Endpoint {
+                        address: "backup.commucat".to_string(),
+                        ..base_endpoint.clone()
+                    },
+                )
+                .with_priority(1),
+            ];
+            let tunnel = manager
+                .establish_multipath(&multipath, 2, FecProfile::new(900, 0.3))
+                .await
+                .unwrap();
+            assert_eq!(tunnel.path_count(), 2);
+            let info = tunnel.path_info();
+            assert_eq!(info.len(), 2);
+            assert_eq!(tunnel.primary_path_id(), Some("primary"));
+        });
+    }
+
+    #[test]
+    fn multipath_dispatch_roundtrip() {
+        let rt = Runtime::new().unwrap();
+        rt.block_on(async {
+            let transports: Vec<Arc<dyn PluggableTransport>> = vec![
+                Arc::new(TestTransport {
+                    kind: TransportType::Reality,
+                    resistance: ResistanceLevel::Maximum,
+                    profile: PerformanceProfile::new(PerformanceTier::High, PerformanceTier::High),
+                    fail: false,
+                }),
+                Arc::new(TestTransport {
+                    kind: TransportType::Shadowsocks,
+                    resistance: ResistanceLevel::Enhanced,
+                    profile: PerformanceProfile::new(
+                        PerformanceTier::Medium,
+                        PerformanceTier::Medium,
+                    ),
+                    fail: false,
+                }),
+            ];
+            let mut manager = TransportManager::new(transports);
+            let base_endpoint = Endpoint {
+                address: "p2p.commucat".to_string(),
+                port: 8443,
+                server_name: Some("p2p.commucat".to_string()),
+                reality: None,
+            };
+            let multipath = vec![
+                MultipathEndpoint::new("edge-a", base_endpoint.clone()).with_priority(0),
+                MultipathEndpoint::new(
+                    "edge-b",
+                    Endpoint {
+                        address: "alt.commucat".to_string(),
+                        ..base_endpoint.clone()
+                    },
+                )
+                .with_priority(1),
+            ];
+            let tunnel = manager
+                .establish_multipath(&multipath, 2, FecProfile::new(800, 0.5))
+                .await
+                .unwrap();
+            let payload = b"secure multipath payload".repeat(32);
+            let dispatch = tunnel.encode_frame(&payload);
+            assert!(!dispatch.segments.is_empty());
+            let mut decoder = RaptorqDecoder::new(dispatch.oti);
+            let mut restored = None;
+            for segment in dispatch.segments.iter() {
+                restored = decoder.absorb(&segment.payload);
+                if restored.is_some() {
+                    break;
+                }
+            }
+            assert_eq!(restored.unwrap(), payload);
+            let unique_paths: HashSet<_> = dispatch
+                .segments
+                .iter()
+                .map(|segment| segment.path_id.as_str())
+                .collect();
+            assert!(unique_paths.len() >= 2);
+        });
     }
 }

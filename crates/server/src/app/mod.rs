@@ -1,3 +1,5 @@
+mod p2p;
+
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
 use crate::transport::{default_manager, Endpoint, RealityConfig, TransportManager};
@@ -587,6 +589,79 @@ impl CommuCatApp {
                 Ok(()) => {}
                 Err(err) => {
                     let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        if path == "/api/p2p/assist" && method == "POST" {
+            self.state.metrics.mark_ingress();
+            let body = match Self::read_body(&mut session).await {
+                Ok(payload) => payload,
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                    return None;
+                }
+            };
+            let request = if body.is_empty() {
+                p2p::P2pAssistRequest {
+                    peer_hint: None,
+                    paths: Vec::new(),
+                    prefer_reality: true,
+                    fec: None,
+                    min_paths: None,
+                }
+            } else {
+                match serde_json::from_slice::<p2p::P2pAssistRequest>(&body) {
+                    Ok(req) => req,
+                    Err(_) => {
+                        let _ = self
+                            .respond_api_error(
+                                &mut session,
+                                ApiError::BadRequest("invalid JSON payload".to_string()),
+                            )
+                            .await;
+                        return None;
+                    }
+                }
+            };
+            match p2p::handle_assist(&self.state, request).await {
+                Ok(response) => match serde_json::to_value(response) {
+                    Ok(payload) => {
+                        if let Err(err) = self
+                            .respond_json(&mut session, 200, payload, "application/json")
+                            .await
+                        {
+                            error!("p2p assistance response failed: {}", err);
+                        }
+                    }
+                    Err(_) => {
+                        let _ = self
+                            .respond_api_error(&mut session, ApiError::Internal)
+                            .await;
+                    }
+                },
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        if path == "/api/security-stats" && method == "GET" {
+            self.state.metrics.mark_ingress();
+            let snapshot = self.state.metrics.security_snapshot();
+            match serde_json::to_value(snapshot) {
+                Ok(payload) => {
+                    if let Err(err) = self
+                        .respond_json(&mut session, 200, payload, "application/json")
+                        .await
+                    {
+                        error!("security stats response failed: {}", err);
+                    }
+                }
+                Err(_) => {
+                    let _ = self
+                        .respond_api_error(&mut session, ApiError::Internal)
+                        .await;
                 }
             }
             return None;

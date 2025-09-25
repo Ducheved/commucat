@@ -634,8 +634,10 @@ dependencies = [
  "commucat-ledger",
  "commucat-proto",
  "commucat-storage",
+ "ml-kem",
  "pingora",
  "rand 0.8.5",
+ "raptorq",
  "redis",
  "serde",
  "serde_json",
@@ -2433,6 +2435,12 @@ checksum = "99d9a13982dcf210057a8a78572b2217b667c3beacbf3a0d8b454f6f82837d38"
 dependencies = [
  "getrandom 0.3.3",
 ]
+
+[[package]]
+name = "raptorq"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7cc8cd0bcb2d520fff368264b5a6295e064c60955349517d09b14473afae4856"
 
 [[package]]
 name = "redis"

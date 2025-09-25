@@ -159,6 +159,71 @@ When both sides negotiate `pq-hybrid`, the Noise transport keys are immediately 
    ```
 3. **Client confirmation** – the client executes `decapsulate_hybrid()` with its ML-KEM secret, derives the same 96 B of material (`root_key`, `sending_chain`, `receiving_chain`), and acknowledges by signing the negotiated transcript with ML-DSA-65. The signature is placed in the first encrypted `ACK` frame.
 
+## Forward Error Correction & Multipath Delivery
+
+CommuCat tunnels shard payloads across concurrent transports to raise resistance against active interference and link degradation.
+
+* **Codec**: each plaintext frame is segmented by a RaptorQ encoder (`mtu` defaults to 1,152 bytes) and produces both systematic symbols and repair packets. The repair overhead can be advertised by the assisting endpoint and defaults to 35% of the source symbols.
+* **Dispatch**: systematic symbols are striped across every active path in round-robin order. Repair symbols are biased towards non-primary paths so that censored primaries still recover with high probability.
+* **Recovery**: receivers reconstruct frames by feeding any combination of systematic/repair packets into a RaptorQ decoder until the original payload surfaces. Packet metadata (`ObjectTransmissionInformation`) is attached to the envelope so every path can decode independently.
+* **Telemetry**: the server increments `commucat_security_fec_packets` for every generated segment and records the average number of paths used during a session.
+
+## Multipath P2P Assistance
+
+`POST /api/p2p/assist` returns transport recommendations and ephemeral cryptographic material that two peers can use to bootstrap a direct tunnel:
+
+```jsonc
+{
+  "noise": {
+    "pattern": "Xk",
+    "prologue_hex": "636f6d6d75636174",
+    "device_seed_hex": "...",
+    "static_public_hex": "..."
+  },
+  "pq": {
+    "identity_public_hex": "...",
+    "signed_prekey_public_hex": "...",
+    "kem_public_hex": "...",
+    "signature_public_hex": "..."
+  },
+  "transports": [
+    { "path_id": "primary", "transport": "Reality", "resistance": "Maximum", "latency": "High", "throughput": "High" },
+    { "path_id": "backup", "transport": "Shadowsocks", "resistance": "Enhanced", "latency": "Medium", "throughput": "Medium" }
+  ],
+  "multipath": {
+    "fec_mtu": 1152,
+    "fec_overhead": 0.35,
+    "primary_path": "primary",
+    "sample_segments": {
+      "primary": { "total": 4, "repair": 1 },
+      "backup": { "total": 3, "repair": 2 }
+    }
+  },
+  "obfuscation": {
+    "reality_fingerprint_hex": "...",
+    "domain_fronting": true,
+    "protocol_mimicry": true,
+    "tor_bridge": false
+  },
+  "security": {
+    "noise_handshakes": 17,
+    "pq_handshakes": 12,
+    "fec_packets": 384,
+    "multipath_sessions": 9,
+    "average_paths": 2.6,
+    "censorship_deflections": 5
+  }
+}
+```
+
+The request body may specify alternative path candidates, a `peer_hint` domain for direct rendezvous, and FEC parameters; an empty payload defaults to the server's canonical egress endpoints. Returned Noise seeds are ephemeral and should be used immediately to derive both classical and PQ keys; long-term storage is discouraged.
+
+## Security Telemetry
+
+* `GET /api/security-stats` exposes the live `SecuritySnapshot` counters in JSON form, mirroring the Prometheus metrics.
+* The `/metrics` endpoint now emits `commucat_security_*` counters for Noise/PQ handshakes, RaptorQ packet production, multipath utilisation and censorship deflection attempts.
+* Clients SHOULD incorporate these gauges in their health heuristics and alarm when counters stop progressing (potential DoS) or grow abnormally fast (possible active attack).
+
 The derived values feed a post-quantum hardened double ratchet (`HybridRatchet`). Re-key events use fresh one-time ML-KEM keys from the announced bundle, ensuring every ratchet step retains ML-KEM entropy in addition to classical X25519 material. Implementations MUST zeroise `HybridKeyMaterial` once the ratchet is advanced.
 
 ### Adaptive Protocol Polymorphism (`adaptive-obf`)
