@@ -21,8 +21,8 @@ use commucat_proto::{
 };
 use commucat_storage::{
     connect, ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
-    InboxOffset, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage, StorageError,
-    UserProfile,
+    InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
+    StorageError, UserProfile,
 };
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
@@ -51,6 +51,7 @@ use tracing::{error, info, warn};
 const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>CommuCat</title>\n<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0b1120;color:#f9fafb;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;}main{max-width:480px;text-align:center;padding:2rem;background:rgba(15,23,42,0.85);border-radius:20px;box-shadow:0 10px 30px rgba(15,23,42,0.4);}h1{font-size:2.25rem;margin-bottom:0.5rem;}p{margin:0.75rem 0;color:#cbd5f5;}a{color:#38bdf8;text-decoration:none;}a:hover{text-decoration:underline;}</style>\n</head>\n<body>\n<main>\n<h1>CommuCat Server</h1>\n<p>Secure Noise + TLS relay for CCP-1 chats.</p>\n<p><a href=\"https://github.com/ducheved/commucat\">Project documentation</a></p>\n<p><a href=\"/healthz\">Health</a> · <a href=\"/readyz\">Readiness</a></p>\n</main>\n</body>\n</html>\n";
 const FRIENDS_BLOB_KEY: &str = "friends";
 const DEVICE_CERT_MAX_SKEW: i64 = 300;
+const DEVICE_CERT_VALIDITY_SECS: i64 = 30 * 24 * 60 * 60;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -273,7 +274,7 @@ struct HandshakeContext {
     user_profile: Option<UserProfile>,
     handshake: Option<NoiseHandshake>,
     protocol_version: u16,
-    certificate: Option<DeviceCertificateData>,
+    certificate: Option<DeviceCertificate>,
 }
 
 pub struct CommuCatApp {
@@ -723,6 +724,7 @@ impl CommuCatApp {
         let payload = json!({
             "domain": self.state.config.domain,
             "noise_public": encode_hex(&self.state.noise_public),
+            "device_ca_public": encode_hex(&self.state.device_ca_public),
             "supported_patterns": ["XK", "IK"],
             "supported_versions": SUPPORTED_PROTOCOL_VERSIONS,
             "pairing": {
@@ -821,6 +823,7 @@ impl CommuCatApp {
             "ttl": ttl_secs,
             "device_seed": encode_hex(&seed[..]),
             "issuer_device_id": context.device.device_id,
+            "device_ca_public": encode_hex(&self.state.device_ca_public),
         });
         self.respond_json(session, 200, payload, "application/json")
             .await
@@ -859,6 +862,41 @@ impl CommuCatApp {
                 }
                 _ => ApiError::Internal,
             })?;
+        let certificate = self
+            .issue_device_certificate(&claim.user.user_id, &device_id, &keys.public)
+            .map_err(|_| ApiError::Internal)?;
+        let recorded_at = Utc::now();
+        let event = DeviceKeyEvent {
+            event_id: generate_id(&format!(
+                "dke:{}:{}",
+                device_id,
+                recorded_at.timestamp_nanos_opt().unwrap_or_default()
+            )),
+            device_id: device_id.clone(),
+            public_key: keys.public.to_vec(),
+            recorded_at,
+        };
+        self.state
+            .storage
+            .record_device_key_event(&event)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let ledger_entry = LedgerRecord {
+            digest: keys.public,
+            recorded_at,
+            metadata: json!({
+                "device": device_id,
+                "user": claim.user.user_id,
+                "action": "certificate",
+                "source": "pair-claim",
+                "certificate_serial": certificate.data.serial,
+                "certificate_issued_at": certificate.data.issued_at,
+                "certificate_expires_at": certificate.data.expires_at,
+            }),
+        };
+        if let Err(err) = self.state.ledger.submit(&ledger_entry) {
+            warn!("ledger submission failed: {}", err);
+        }
         let mut response = json!({
             "device_id": device_id,
             "private_key": encode_hex(&keys.private[..]),
@@ -872,6 +910,16 @@ impl CommuCatApp {
                 "avatar_url": claim.user.avatar_url,
             },
         });
+        if let Some(obj) = response.as_object_mut() {
+            obj.insert(
+                "device_certificate".to_string(),
+                serde_json::to_value(&certificate).map_err(|_| ApiError::Internal)?,
+            );
+            obj.insert(
+                "device_ca_public".to_string(),
+                json!(encode_hex(&self.state.device_ca_public)),
+            );
+        }
         if let Some(name) = request.device_name {
             if let Some(obj) = response.as_object_mut() {
                 obj.insert("device_name".to_string(), json!(name));
@@ -1083,6 +1131,30 @@ impl CommuCatApp {
             return Err(ServerError::PairingRequired);
         }
         Ok(())
+    }
+
+    fn issue_device_certificate(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        public_key: &[u8; 32],
+    ) -> Result<DeviceCertificate, ServerError> {
+        let mut rng = OsRng;
+        let serial = rng.next_u64();
+        let issued_at = Utc::now().timestamp();
+        let expires_at = issued_at + DEVICE_CERT_VALIDITY_SECS;
+        let mut key = [0u8; 32];
+        key.copy_from_slice(public_key);
+        let data = DeviceCertificateData::new(
+            serial,
+            user_id,
+            device_id,
+            key,
+            self.state.device_ca_public,
+            issued_at,
+            expires_at,
+        );
+        Ok(self.state.federation_signer.sign_certificate(&data))
     }
 
     async fn read_body(session: &mut ServerSession) -> Result<Vec<u8>, ApiError> {
@@ -1313,15 +1385,22 @@ impl CommuCatApp {
         });
         if let Some(obj) = ack_properties.as_object_mut() {
             obj.insert("pairing_required".to_string(), json!(pairing_required_flag));
+            obj.insert(
+                "device_ca_public".to_string(),
+                json!(encode_hex(&self.state.device_ca_public)),
+            );
             if let Some(cert) = handshake.certificate.as_ref() {
                 obj.insert(
                     "certificate".to_string(),
                     json!({
-                        "serial": cert.serial,
-                        "issued_at": cert.issued_at,
-                        "expires_at": cert.expires_at,
+                        "serial": cert.data.serial,
+                        "issued_at": cert.data.issued_at,
+                        "expires_at": cert.data.expires_at,
                     }),
                 );
+                if let Ok(value) = serde_json::to_value(cert) {
+                    obj.insert("device_certificate".to_string(), value);
+                }
             }
         }
         let ack_frame = Frame {
@@ -1564,84 +1643,128 @@ impl CommuCatApp {
                     .and_then(|v| v.as_str())
                     .map(|v| v.to_string());
 
-                let certificate_value = envelope
-                    .properties
-                    .get("certificate")
-                    .cloned()
-                    .ok_or(ServerError::Invalid)?;
-                let certificate: DeviceCertificate =
-                    serde_json::from_value(certificate_value).map_err(|_| ServerError::Invalid)?;
-                certificate
-                    .verify(&self.state.device_ca_public)
-                    .map_err(ServerError::from)?;
-                let certificate_data = certificate.data.clone();
-                if certificate_data.device_id != device_id {
-                    return Err(ServerError::Invalid);
-                }
-                if certificate_data.public_key != client_static {
-                    return Err(ServerError::Invalid);
-                }
-                if certificate_data.issued_at >= certificate_data.expires_at {
-                    return Err(ServerError::Invalid);
-                }
-                let now_ts = Utc::now().timestamp();
-                if certificate_data.expires_at <= now_ts {
-                    return Err(ServerError::Invalid);
-                }
-                if certificate_data.issued_at > now_ts + DEVICE_CERT_MAX_SKEW {
-                    return Err(ServerError::Invalid);
-                }
-                if let Some(provided) = &user_id_hint {
-                    if provided != &certificate_data.user_id {
-                        return Err(ServerError::Invalid);
-                    }
-                }
+                let certificate_value = envelope.properties.get("certificate").cloned();
+                let mut certificate = match certificate_value {
+                    Some(value) => Some(
+                        serde_json::from_value::<DeviceCertificate>(value)
+                            .map_err(|_| ServerError::Invalid)?,
+                    ),
+                    None => None,
+                };
 
-                let user_id = certificate_data.user_id.clone();
-                let mut user_profile = self.state.storage.load_user(&user_id).await?;
-                if let Some(handle) = &handle_hint {
-                    if user_profile.handle != *handle {
-                        return Err(ServerError::Invalid);
-                    }
-                }
-
-                let public_key_vec = certificate_data.public_key.to_vec();
                 let mut ledger_action: Option<&'static str> = None;
+                let public_key_vec = client_static.to_vec();
 
-                match self.state.storage.load_device(&device_id).await {
-                    Ok(record) => {
-                        if record.status != "active" {
-                            return Err(ServerError::Invalid);
+                let (user_id, mut user_profile, device_was_known) =
+                    match self.state.storage.load_device(&device_id).await {
+                        Ok(record) => {
+                            if record.status != "active" {
+                                return Err(ServerError::Invalid);
+                            }
+                            if let Some(provided) = &user_id_hint {
+                                if provided != &record.user_id {
+                                    return Err(ServerError::Invalid);
+                                }
+                            }
+                            let profile = self.state.storage.load_user(&record.user_id).await?;
+                            if let Some(handle) = &handle_hint {
+                                if profile.handle != *handle {
+                                    return Err(ServerError::Invalid);
+                                }
+                            }
+                            if record.public_key != public_key_vec {
+                                let update = DeviceRecord {
+                                    device_id: record.device_id.clone(),
+                                    user_id: record.user_id.clone(),
+                                    public_key: public_key_vec.clone(),
+                                    status: record.status.clone(),
+                                    created_at: record.created_at,
+                                };
+                                self.state.storage.upsert_device(&update).await?;
+                                ledger_action = Some("rotate");
+                            }
+                            (record.user_id.clone(), profile, true)
                         }
-                        if record.user_id != user_id {
-                            return Err(ServerError::Invalid);
-                        }
-                        if record.public_key != public_key_vec {
-                            let update = DeviceRecord {
-                                device_id: record.device_id.clone(),
-                                user_id: record.user_id.clone(),
-                                public_key: public_key_vec.clone(),
-                                status: record.status.clone(),
-                                created_at: record.created_at,
+                        Err(StorageError::Missing) => {
+                            let (resolved_id, profile) = if let Some(cert) = certificate.as_ref() {
+                                let profile =
+                                    self.state.storage.load_user(&cert.data.user_id).await?;
+                                (cert.data.user_id.clone(), profile)
+                            } else if let Some(provided) = &user_id_hint {
+                                let profile = self.state.storage.load_user(provided).await?;
+                                (profile.user_id.clone(), profile)
+                            } else if let Some(handle) = &handle_hint {
+                                match self.state.storage.load_user_by_handle(handle).await {
+                                    Ok(profile) => (profile.user_id.clone(), profile),
+                                    Err(StorageError::Missing) => {
+                                        let new_profile = NewUserProfile {
+                                            user_id: generate_id(handle),
+                                            handle: handle.clone(),
+                                            display_name: display_hint.clone(),
+                                            avatar_url: avatar_hint.clone(),
+                                        };
+                                        let profile =
+                                            self.state.storage.create_user(&new_profile).await?;
+                                        (profile.user_id.clone(), profile)
+                                    }
+                                    Err(err) => return Err(err.into()),
+                                }
+                            } else {
+                                return Err(ServerError::Invalid);
                             };
-                            self.state.storage.upsert_device(&update).await?;
-                            ledger_action = Some("rotate");
+                            self.ensure_pairing_limit(&resolved_id).await?;
+                            let insert = DeviceRecord {
+                                device_id: device_id.clone(),
+                                user_id: resolved_id.clone(),
+                                public_key: public_key_vec.clone(),
+                                status: "active".to_string(),
+                                created_at: Utc::now(),
+                            };
+                            self.state.storage.upsert_device(&insert).await?;
+                            ledger_action = Some("register");
+                            (resolved_id, profile, false)
                         }
+                        Err(err) => return Err(err.into()),
+                    };
+
+                if let Some(cert) = certificate.as_ref() {
+                    cert.verify(&self.state.device_ca_public)
+                        .map_err(ServerError::from)?;
+                    if cert.data.device_id != device_id {
+                        return Err(ServerError::Invalid);
                     }
-                    Err(StorageError::Missing) => {
-                        self.ensure_pairing_limit(&user_id).await?;
-                        let insert = DeviceRecord {
-                            device_id: device_id.clone(),
-                            user_id: user_id.clone(),
-                            public_key: public_key_vec.clone(),
-                            status: "active".to_string(),
-                            created_at: Utc::now(),
-                        };
-                        self.state.storage.upsert_device(&insert).await?;
-                        ledger_action = Some("register");
+                    if cert.data.user_id != user_id {
+                        return Err(ServerError::Invalid);
                     }
-                    Err(err) => return Err(err.into()),
+                    if cert.data.public_key != client_static {
+                        return Err(ServerError::Invalid);
+                    }
+                    if cert.data.issued_at >= cert.data.expires_at {
+                        return Err(ServerError::Invalid);
+                    }
+                    let now_ts = Utc::now().timestamp();
+                    if cert.data.expires_at <= now_ts {
+                        return Err(ServerError::Invalid);
+                    }
+                    if cert.data.issued_at > now_ts + DEVICE_CERT_MAX_SKEW {
+                        return Err(ServerError::Invalid);
+                    }
                 }
+
+                if certificate.is_none() {
+                    let issued =
+                        self.issue_device_certificate(&user_id, &device_id, &client_static)?;
+                    certificate = Some(issued);
+                    if ledger_action.is_none() {
+                        ledger_action = Some(if device_was_known {
+                            "certificate"
+                        } else {
+                            "register"
+                        });
+                    }
+                }
+
+                let certificate = certificate.ok_or(ServerError::Invalid)?;
 
                 let display_update = display_hint.clone();
                 let avatar_update = avatar_hint.clone();
@@ -1676,16 +1799,16 @@ impl CommuCatApp {
                     };
                     self.state.storage.record_device_key_event(&event).await?;
                     let ledger_entry = LedgerRecord {
-                        digest: client_static,
+                        digest: certificate.data.public_key,
                         recorded_at,
                         metadata: json!({
                             "device": device_id,
                             "user": user_id,
                             "action": action,
                             "source": "certificate",
-                            "certificate_serial": certificate_data.serial,
-                            "certificate_issued_at": certificate_data.issued_at,
-                            "certificate_expires_at": certificate_data.expires_at,
+                            "certificate_serial": certificate.data.serial,
+                            "certificate_issued_at": certificate.data.issued_at,
+                            "certificate_expires_at": certificate.data.expires_at,
                         }),
                     };
                     if let Err(err) = self.state.ledger.submit(&ledger_entry) {
@@ -1695,7 +1818,7 @@ impl CommuCatApp {
 
                 context.user_id = user_id.clone();
                 context.user_profile = Some(user_profile.clone());
-                context.certificate = Some(certificate_data);
+                context.certificate = Some(certificate.clone());
 
                 let noise = NoiseConfig {
                     pattern,

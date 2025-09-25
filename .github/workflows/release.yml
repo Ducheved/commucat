@@ -11,6 +11,8 @@ env:
 
 jobs:
   publish:
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
     if: ${{ github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' }}
     runs-on: ubuntu-latest
     permissions:
@@ -103,3 +105,50 @@ jobs:
           echo "Published crates at version ${{ steps.meta.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "Release tarball: commucat-server-linux-amd64.tar.gz" >> $GITHUB_STEP_SUMMARY
           echo "Bundle includes server, cli, sample config, and systemd unit" >> $GITHUB_STEP_SUMMARY
+
+  windows-build:
+    needs: publish
+    if: ${{ needs.publish.outputs.version != '' }}
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (Windows)
+        run: cargo build --release -p commucat-server -p commucat-cli
+
+      - name: Package windows bundle
+        shell: pwsh
+        run: |
+          $Version = "${{ needs.publish.outputs.version }}"
+          $Package = "commucat-server-windows-amd64.zip"
+          New-Item -ItemType Directory -Force -Path dist\bin | Out-Null
+          New-Item -ItemType Directory -Force -Path dist\systemd | Out-Null
+          Copy-Item target\release\commucat-server.exe dist\bin\
+          Copy-Item target\release\commucat-cli.exe dist\bin\
+          Copy-Item README.md dist\README.md
+          Copy-Item commucat.toml dist\commucat.toml
+          # service file still copied for consistency, though mainly for Linux
+          if (Test-Path docs\systemd\commucat.service) { Copy-Item docs\systemd\commucat.service dist\systemd\commucat.service }
+          Compress-Archive -Path dist\* -DestinationPath $Package -Force
+          Write-Host "Created $Package for version $Version"
+
+      - name: Upload Windows asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: commucat-server-windows-amd64.zip
+          tag_name: v${{ needs.publish.outputs.version }}
+          append_body: true
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "Windows bundle uploaded: commucat-server-windows-amd64.zip for version ${{ needs.publish.outputs.version }}"
