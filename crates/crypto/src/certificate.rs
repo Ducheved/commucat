@@ -2,7 +2,6 @@ use crate::{CryptoError, EventSigner};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
-use std::fmt::Write as FmtWrite;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceCertificateData {
@@ -78,44 +77,8 @@ impl DeviceCertificate {
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(&mut output, "{:02x}", byte);
-    }
-    output
-}
-
-fn decode_hex_array<const N: usize>(value: &str) -> Result<[u8; N], String> {
-    let expected_len = N * 2;
-    if value.len() != expected_len {
-        return Err(format!(
-            "invalid hex length {}; expected {}",
-            value.len(),
-            expected_len
-        ));
-    }
-    let mut output = [0u8; N];
-    let bytes = value.as_bytes();
-    for idx in 0..N {
-        let hi = parse_nibble(bytes[idx * 2])?;
-        let lo = parse_nibble(bytes[idx * 2 + 1])?;
-        output[idx] = (hi << 4) | lo;
-    }
-    Ok(output)
-}
-
-fn parse_nibble(value: u8) -> Result<u8, String> {
-    match value {
-        b'0'..=b'9' => Ok(value - b'0'),
-        b'a'..=b'f' => Ok(value - b'a' + 10),
-        b'A'..=b'F' => Ok(value - b'A' + 10),
-        _ => Err(format!("invalid hex digit: {}", value as char)),
-    }
-}
-
 mod serde_hex32 {
-    use super::{decode_hex_array, encode_hex};
+    use crate::hex::{decode_hex_array, encode_hex};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
@@ -135,7 +98,7 @@ mod serde_hex32 {
 }
 
 mod serde_hex64 {
-    use super::{decode_hex_array, encode_hex};
+    use crate::hex::{decode_hex_array, encode_hex};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>

@@ -8,6 +8,8 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 mod certificate;
+mod hex;
+pub mod zkp;
 
 #[cfg(feature = "pq")]
 mod pq;
@@ -31,6 +33,7 @@ pub enum CryptoError {
     PostQuantumSignature,
     PostQuantumEncapsulation,
     PostQuantumDecapsulation,
+    ZeroKnowledgeProof,
 }
 
 impl Display for CryptoError {
@@ -44,6 +47,7 @@ impl Display for CryptoError {
             Self::PostQuantumSignature => write!(f, "ml-dsa signature failure"),
             Self::PostQuantumEncapsulation => write!(f, "ml-kem encapsulation failure"),
             Self::PostQuantumDecapsulation => write!(f, "ml-kem decapsulation failure"),
+            Self::ZeroKnowledgeProof => write!(f, "zero-knowledge proof verification failed"),
         }
     }
 }

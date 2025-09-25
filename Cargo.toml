@@ -34,6 +34,7 @@ tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+curve25519-dalek = { version = "4.1", features = ["alloc"] }
 hkdf = { version = "0.12" }
 sha3 = { version = "0.10" }
 ml-kem = { version = "0.3.0-pre" }

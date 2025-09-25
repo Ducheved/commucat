@@ -6,6 +6,7 @@ use crate::transport::{default_manager, Endpoint, RealityConfig, TransportManage
 use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
 use blake3::hash as blake3_hash;
 use chrono::{Duration, Utc};
+use commucat_crypto::zkp::{self, KnowledgeProof};
 use commucat_crypto::{
     build_handshake, CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair,
     EventSigner, HandshakePattern, NoiseConfig, NoiseHandshake,
@@ -269,6 +270,7 @@ enum HandshakeStage {
 struct HandshakeContext {
     stage: HandshakeStage,
     device_id: String,
+    device_public: [u8; 32],
     session_id: String,
     user_id: String,
     user_profile: Option<UserProfile>,
@@ -1208,6 +1210,7 @@ impl CommuCatApp {
         let mut handshake = HandshakeContext {
             stage: HandshakeStage::Hello,
             device_id: String::new(),
+            device_public: [0u8; 32],
             session_id: String::new(),
             user_id: String::new(),
             user_profile: None,
@@ -1625,6 +1628,29 @@ impl CommuCatApp {
                     .ok_or(ServerError::Invalid)?;
                 let client_static =
                     decode_hex32(client_static_hex).map_err(|_| ServerError::Invalid)?;
+                let device_public_hex = envelope
+                    .properties
+                    .get("device_public")
+                    .and_then(|v| v.as_str())
+                    .ok_or(ServerError::Invalid)?;
+                let device_public =
+                    decode_hex32(device_public_hex).map_err(|_| ServerError::Invalid)?;
+                let proof_value = envelope
+                    .properties
+                    .get("zkp")
+                    .ok_or(ServerError::Invalid)?
+                    .clone();
+                let proof: KnowledgeProof =
+                    serde_json::from_value(proof_value).map_err(|_| ServerError::Invalid)?;
+                let proof_context = zkp::derive_handshake_context(
+                    &self.state.config.domain,
+                    &device_id,
+                    &device_public,
+                    &client_static,
+                );
+                zkp::verify_handshake(&device_public, &proof_context, &proof)
+                    .map_err(|_| ServerError::Invalid)?;
+                context.device_public = device_public;
                 let user_payload = envelope.properties.get("user").and_then(|v| v.as_object());
                 let user_id_hint = user_payload
                     .and_then(|map| map.get("id"))
@@ -1653,7 +1679,7 @@ impl CommuCatApp {
                 };
 
                 let mut ledger_action: Option<&'static str> = None;
-                let public_key_vec = client_static.to_vec();
+                let public_key_vec = device_public.to_vec();
 
                 let (user_id, mut user_profile, device_was_known) =
                     match self.state.storage.load_device(&device_id).await {
@@ -1727,33 +1753,45 @@ impl CommuCatApp {
                         Err(err) => return Err(err.into()),
                     };
 
-                if let Some(cert) = certificate.as_ref() {
-                    cert.verify(&self.state.device_ca_public)
+                if let Some(existing) = certificate.clone() {
+                    let mut current = existing;
+                    current
+                        .verify(&self.state.device_ca_public)
                         .map_err(ServerError::from)?;
-                    if cert.data.device_id != device_id {
+                    if current.data.device_id != device_id {
                         return Err(ServerError::Invalid);
                     }
-                    if cert.data.user_id != user_id {
+                    if current.data.user_id != user_id {
                         return Err(ServerError::Invalid);
                     }
-                    if cert.data.public_key != client_static {
-                        return Err(ServerError::Invalid);
+                    if current.data.public_key != device_public {
+                        if current.data.public_key == client_static {
+                            current = self.issue_device_certificate(
+                                &user_id,
+                                &device_id,
+                                &device_public,
+                            )?;
+                            ledger_action.get_or_insert("certificate");
+                            certificate = Some(current.clone());
+                        } else {
+                            return Err(ServerError::Invalid);
+                        }
                     }
-                    if cert.data.issued_at >= cert.data.expires_at {
+                    if current.data.issued_at >= current.data.expires_at {
                         return Err(ServerError::Invalid);
                     }
                     let now_ts = Utc::now().timestamp();
-                    if cert.data.expires_at <= now_ts {
+                    if current.data.expires_at <= now_ts {
                         return Err(ServerError::Invalid);
                     }
-                    if cert.data.issued_at > now_ts + DEVICE_CERT_MAX_SKEW {
+                    if current.data.issued_at > now_ts + DEVICE_CERT_MAX_SKEW {
                         return Err(ServerError::Invalid);
                     }
                 }
 
                 if certificate.is_none() {
                     let issued =
-                        self.issue_device_certificate(&user_id, &device_id, &client_static)?;
+                        self.issue_device_certificate(&user_id, &device_id, &device_public)?;
                     certificate = Some(issued);
                     if ledger_action.is_none() {
                         ledger_action = Some(if device_was_known {
