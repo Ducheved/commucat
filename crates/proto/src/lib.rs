@@ -4,6 +4,8 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+pub mod call;
+
 #[cfg(feature = "obfuscation")]
 mod obfuscation;
 
@@ -60,6 +62,12 @@ pub enum FrameType {
     GroupInvite = 0x0b,
     GroupEvent = 0x0c,
     Error = 0x0d,
+    CallOffer = 0x0e,
+    CallAnswer = 0x0f,
+    CallEnd = 0x10,
+    VoiceFrame = 0x11,
+    VideoFrame = 0x12,
+    CallStats = 0x13,
 }
 
 impl FrameType {
@@ -78,6 +86,12 @@ impl FrameType {
             0x0b => Some(Self::GroupInvite),
             0x0c => Some(Self::GroupEvent),
             0x0d => Some(Self::Error),
+            0x0e => Some(Self::CallOffer),
+            0x0f => Some(Self::CallAnswer),
+            0x10 => Some(Self::CallEnd),
+            0x11 => Some(Self::VoiceFrame),
+            0x12 => Some(Self::VideoFrame),
+            0x13 => Some(Self::CallStats),
             _ => None,
         }
     }
@@ -143,7 +157,10 @@ impl FramePayload {
 
     fn from_bytes(frame_type: FrameType, data: &[u8]) -> Result<Self, CodecError> {
         match frame_type {
-            FrameType::Msg | FrameType::KeyUpdate => Ok(FramePayload::Opaque(data.to_vec())),
+            FrameType::Msg
+            | FrameType::KeyUpdate
+            | FrameType::VoiceFrame
+            | FrameType::VideoFrame => Ok(FramePayload::Opaque(data.to_vec())),
             FrameType::Hello
             | FrameType::Auth
             | FrameType::Join
@@ -154,7 +171,11 @@ impl FramePayload {
             | FrameType::GroupCreate
             | FrameType::GroupInvite
             | FrameType::GroupEvent
-            | FrameType::Error => {
+            | FrameType::Error
+            | FrameType::CallOffer
+            | FrameType::CallAnswer
+            | FrameType::CallEnd
+            | FrameType::CallStats => {
                 if data.len() > MAX_CONTROL_JSON_LEN {
                     return Err(CodecError::ControlTooLarge);
                 }
@@ -339,6 +360,75 @@ mod tests {
         let encoded = frame.encode().unwrap();
         let (decoded, _read) = Frame::decode(&encoded).unwrap();
         assert_eq!(decoded.payload, FramePayload::Opaque(vec![1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn encode_roundtrip_voice_frame() {
+        let frame = Frame {
+            channel_id: 42,
+            sequence: 5,
+            frame_type: FrameType::VoiceFrame,
+            payload: FramePayload::Opaque(vec![0xaa, 0xbb, 0xcc, 0xdd]),
+        };
+        let encoded = frame.encode().unwrap();
+        let (decoded, _read) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.frame_type, FrameType::VoiceFrame);
+        assert_eq!(decoded.payload, FramePayload::Opaque(vec![0xaa, 0xbb, 0xcc, 0xdd]));
+    }
+
+    #[test]
+    fn encode_roundtrip_call_offer_frame() {
+        use crate::call::{CallMode, CallOffer, CallTransport};
+        use crate::call::{CallMediaProfile, TransportCandidate, TransportProtocol};
+        use crate::call::{AudioParameters, VideoParameters, VideoResolution, VideoCodec};
+        use std::convert::TryInto;
+
+        let offer = CallOffer {
+            call_id: "call-xyz".to_string(),
+            from: "alice:device".to_string(),
+            to: vec!["bob:device".to_string()],
+            media: CallMediaProfile {
+                audio: AudioParameters::default(),
+                video: Some(VideoParameters {
+                    codec: VideoCodec::Vp8,
+                    max_bitrate: 500_000,
+                    max_resolution: VideoResolution { width: 640, height: 360 },
+                    frame_rate: 24,
+                    adaptive: true,
+                }),
+                mode: CallMode::FullDuplex,
+            },
+            metadata: serde_json::json!({"mode": "voice"}),
+            transport: Some(CallTransport {
+                prefer_relay: false,
+                udp_candidates: vec![TransportCandidate {
+                    address: "198.51.100.12".to_string(),
+                    port: 60000,
+                    protocol: TransportProtocol::Udp,
+                }],
+                fingerprints: vec!["deadbeef".to_string()],
+            }),
+            expires_at: Some(1_690_000_000),
+            ephemeral_key: None,
+        };
+        let envelope: ControlEnvelope = (&offer).try_into().unwrap();
+        let frame = Frame {
+            channel_id: 7,
+            sequence: 9,
+            frame_type: FrameType::CallOffer,
+            payload: FramePayload::Control(envelope.clone()),
+        };
+        let encoded = frame.encode().unwrap();
+        let (decoded, _) = Frame::decode(&encoded).unwrap();
+        assert_eq!(decoded.frame_type, FrameType::CallOffer);
+        match decoded.payload {
+            FramePayload::Control(ctrl) => {
+                let decoded_offer = CallOffer::try_from(&ctrl).unwrap();
+                assert_eq!(decoded_offer.call_id, offer.call_id);
+                assert_eq!(decoded_offer.media.mode, CallMode::FullDuplex);
+            }
+            _ => panic!("expected control payload"),
+        }
     }
 
     #[test]

@@ -17,8 +17,13 @@ use commucat_ledger::{
     LedgerRecord, NullLedger,
 };
 use commucat_proto::{
-    is_supported_protocol_version, negotiate_protocol_version, ControlEnvelope, Frame,
-    FramePayload, FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    call::{
+        CallAnswer as ProtoCallAnswer, CallEnd as ProtoCallEnd, CallEndReason, CallMediaDirection,
+        CallMode, CallOffer as ProtoCallOffer, CallRejectReason, CallStats as ProtoCallStats,
+        CallMediaProfile,
+    },
+    is_supported_protocol_version, negotiate_protocol_version, ControlEnvelope, Frame, FramePayload,
+    FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
 };
 use commucat_storage::{
     connect, ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
@@ -47,7 +52,7 @@ use subtle::ConstantTimeEq;
 use tokio::select;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::interval;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>CommuCat</title>\n<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0b1120;color:#f9fafb;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;}main{max-width:480px;text-align:center;padding:2rem;background:rgba(15,23,42,0.85);border-radius:20px;box-shadow:0 10px 30px rgba(15,23,42,0.4);}h1{font-size:2.25rem;margin-bottom:0.5rem;}p{margin:0.75rem 0;color:#cbd5f5;}a{color:#38bdf8;text-decoration:none;}a:hover{text-decoration:underline;}</style>\n</head>\n<body>\n<main>\n<h1>CommuCat Server</h1>\n<p>Secure Noise + TLS relay for CCP-1 chats.</p>\n<p><a href=\"https://github.com/ducheved/commucat\">Project documentation</a></p>\n<p><a href=\"/healthz\">Health</a> · <a href=\"/readyz\">Readiness</a></p>\n</main>\n</body>\n</html>\n";
 const FRIENDS_BLOB_KEY: &str = "friends";
@@ -147,6 +152,7 @@ pub struct AppState {
     pub metrics: Metrics,
     pub connections: RwLock<HashMap<String, ConnectionEntry>>,
     pub channel_routes: RwLock<HashMap<u64, ChannelRoute>>,
+    pub call_sessions: RwLock<HashMap<String, CallSession>>,
     pub peer_sessions: RwLock<HashMap<String, PeerPresence>>,
     pub allowed_peers: HashMap<String, PeerConfig>,
     pub dynamic_peers: RwLock<HashMap<String, PeerConfig>>,
@@ -186,6 +192,19 @@ pub struct ChannelRoute {
     pub members: HashSet<String>,
     pub relay: bool,
     pub group_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct CallSession {
+    pub call_id: String,
+    pub channel_id: u64,
+    pub initiator: String,
+    pub started_at: chrono::DateTime<Utc>,
+    pub last_update: chrono::DateTime<Utc>,
+    pub media: CallMediaProfile,
+    pub accepted: HashSet<String>,
+    pub participants: HashSet<String>,
+    pub stats: HashMap<String, ProtoCallStats>,
 }
 
 pub struct PeerPresence {
@@ -349,6 +368,7 @@ impl CommuCatApp {
             metrics: Metrics::new(),
             connections: RwLock::new(HashMap::new()),
             channel_routes: RwLock::new(HashMap::new()),
+            call_sessions: RwLock::new(HashMap::new()),
             peer_sessions: RwLock::new(HashMap::new()),
             allowed_peers,
             dynamic_peers: RwLock::new(dynamic_seed),
@@ -1945,6 +1965,206 @@ impl CommuCatApp {
         Ok(())
     }
 
+    fn emit_call_event(&self, call_id: &str, event: &str, extra: serde_json::Value) {
+        let hash = blake3_hash(call_id.as_bytes());
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(hash.as_bytes());
+        let metadata = json!({
+            "scope": "call",
+            "event": event,
+            "call_id": call_id,
+            "data": extra,
+        });
+        let record = LedgerRecord {
+            digest,
+            recorded_at: Utc::now(),
+            metadata,
+        };
+        if let Err(err) = self.state.ledger.submit(&record) {
+            warn!("call ledger submission failed: {}", err);
+        }
+    }
+
+    fn call_mode_label(mode: CallMode) -> &'static str {
+        match mode {
+            CallMode::FullDuplex => "full_duplex",
+            CallMode::HalfDuplex => "half_duplex",
+        }
+    }
+
+    fn call_reject_reason_label(reason: CallRejectReason) -> &'static str {
+        match reason {
+            CallRejectReason::Busy => "busy",
+            CallRejectReason::Decline => "decline",
+            CallRejectReason::Unsupported => "unsupported",
+            CallRejectReason::Timeout => "timeout",
+            CallRejectReason::Error => "error",
+        }
+    }
+
+    fn call_end_reason_label(reason: CallEndReason) -> &'static str {
+        match reason {
+            CallEndReason::Hangup => "hangup",
+            CallEndReason::Cancel => "cancel",
+            CallEndReason::Failure => "failure",
+            CallEndReason::Timeout => "timeout",
+        }
+    }
+
+    async fn register_call_offer(
+        &self,
+        device_id: &str,
+        channel_id: u64,
+        offer: &ProtoCallOffer,
+    ) -> Result<(), ServerError> {
+        if offer.call_id.is_empty() {
+            return Err(ServerError::Invalid);
+        }
+        let participants = {
+            let routes = self.state.channel_routes.read().await;
+            let route = routes.get(&channel_id).ok_or(ServerError::Invalid)?;
+            if !route.members.contains(device_id) {
+                return Err(ServerError::Invalid);
+            }
+            route.members.clone()
+        };
+        let mut sessions = self.state.call_sessions.write().await;
+        if sessions.contains_key(&offer.call_id) {
+            return Err(ServerError::Invalid);
+        }
+        let started = Utc::now();
+        let mut accepted = HashSet::new();
+        accepted.insert(device_id.to_string());
+        let session = CallSession {
+            call_id: offer.call_id.clone(),
+            channel_id,
+            initiator: device_id.to_string(),
+            started_at: started,
+            last_update: started,
+            media: offer.media.clone(),
+            accepted,
+            participants: participants.clone(),
+            stats: HashMap::new(),
+        };
+        sessions.insert(offer.call_id.clone(), session);
+        drop(sessions);
+        self.state.metrics.mark_call_started();
+        let participant_list: Vec<String> = participants.iter().cloned().collect();
+        self.emit_call_event(
+            &offer.call_id,
+            "offer",
+            json!({
+                "channel_id": channel_id,
+                "initiator": device_id,
+                "participants": participant_list,
+                "mode": Self::call_mode_label(offer.media.mode),
+                "video": offer.media.video.is_some(),
+            }),
+        );
+        Ok(())
+    }
+
+    async fn apply_call_answer(
+        &self,
+        device_id: &str,
+        answer: &ProtoCallAnswer,
+    ) -> Result<(), ServerError> {
+        let call_id = answer.call_id.clone();
+        let mut sessions = self.state.call_sessions.write().await;
+        let Some(session) = sessions.get_mut(&call_id) else {
+            return Err(ServerError::Invalid);
+        };
+        if !session.participants.contains(device_id) {
+            return Err(ServerError::Invalid);
+        }
+        session.last_update = Utc::now();
+        if !answer.accept {
+            sessions.remove(&call_id);
+            drop(sessions);
+            self.state.metrics.mark_call_ended();
+            let reason = answer.reason.map(Self::call_reject_reason_label);
+            self.emit_call_event(
+                &call_id,
+                "answer",
+                json!({
+                    "device": device_id,
+                    "accept": false,
+                    "reason": reason,
+                }),
+            );
+            return Ok(());
+        }
+        session.accepted.insert(device_id.to_string());
+        if let Some(profile) = &answer.media {
+            session.media = profile.clone();
+        }
+        let mode = session.media.mode;
+        let video = session.media.video.is_some();
+        let accepted = session.accepted.len();
+        drop(sessions);
+        self.emit_call_event(
+            &call_id,
+            "answer",
+            json!({
+                "device": device_id,
+                "accept": true,
+                "mode": Self::call_mode_label(mode),
+                "video": video,
+                "accepted": accepted,
+            }),
+        );
+        Ok(())
+    }
+
+    async fn terminate_call(
+        &self,
+        device_id: &str,
+        end: &ProtoCallEnd,
+    ) -> Result<(), ServerError> {
+        let mut sessions = self.state.call_sessions.write().await;
+        let Some(session) = sessions.get(&end.call_id) else {
+            warn!(call = %end.call_id, "call termination for unknown session");
+            return Ok(());
+        };
+        if !session.participants.contains(device_id) {
+            return Err(ServerError::Invalid);
+        }
+        let started = session.started_at;
+        let initiator = session.initiator.clone();
+        sessions.remove(&end.call_id);
+        drop(sessions);
+        self.state.metrics.mark_call_ended();
+        let duration = (Utc::now() - started).num_seconds().max(0);
+        self.emit_call_event(
+            &end.call_id,
+            "end",
+            json!({
+                "device": device_id,
+                "initiator": initiator,
+                "reason": Self::call_end_reason_label(end.reason),
+                "duration_secs": duration,
+            }),
+        );
+        Ok(())
+    }
+
+    async fn update_call_stats(
+        &self,
+        device_id: &str,
+        stats: &ProtoCallStats,
+    ) -> Result<(), ServerError> {
+        let mut sessions = self.state.call_sessions.write().await;
+        let Some(session) = sessions.get_mut(&stats.call_id) else {
+            return Err(ServerError::Invalid);
+        };
+        if !session.participants.contains(device_id) {
+            return Err(ServerError::Invalid);
+        }
+        session.last_update = Utc::now();
+        session.stats.insert(device_id.to_string(), stats.clone());
+        Ok(())
+    }
+
     async fn consume_established_frames(
         &self,
         session: &mut ServerSession,
@@ -2122,8 +2342,129 @@ impl CommuCatApp {
                 let _ = tx_out.send(ack).await;
                 Ok(())
             }
-            FrameType::Msg | FrameType::Typing | FrameType::KeyUpdate | FrameType::GroupEvent => {
+            FrameType::CallOffer => {
+                let envelope = match frame.payload {
+                    FramePayload::Control(ref env) => env,
+                    _ => return Err(ServerError::Invalid),
+                };
+                let offer = ProtoCallOffer::try_from(envelope).map_err(|_| ServerError::Invalid)?;
+                self.register_call_offer(device_id, frame.channel_id, &offer)
+                    .await?;
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let mut properties = serde_json::Map::new();
+                properties.insert("ack".to_string(), json!(frame.sequence));
+                properties.insert("call_id".to_string(), json!(offer.call_id.clone()));
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: serde_json::Value::Object(properties),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::CallAnswer => {
+                let envelope = match frame.payload {
+                    FramePayload::Control(ref env) => env,
+                    _ => return Err(ServerError::Invalid),
+                };
+                let answer = ProtoCallAnswer::try_from(envelope).map_err(|_| ServerError::Invalid)?;
+                self.apply_call_answer(device_id, &answer).await?;
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let mut properties = serde_json::Map::new();
+                properties.insert("ack".to_string(), json!(frame.sequence));
+                properties.insert("call_id".to_string(), json!(answer.call_id.clone()));
+                properties.insert("accept".to_string(), json!(answer.accept));
+                if let Some(reason) = answer.reason {
+                    properties.insert(
+                        "reason".to_string(),
+                        json!(Self::call_reject_reason_label(reason)),
+                    );
+                }
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: serde_json::Value::Object(properties),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::CallEnd => {
+                let envelope = match frame.payload {
+                    FramePayload::Control(ref env) => env,
+                    _ => return Err(ServerError::Invalid),
+                };
+                let end = ProtoCallEnd::try_from(envelope).map_err(|_| ServerError::Invalid)?;
+                self.terminate_call(device_id, &end).await?;
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let mut properties = serde_json::Map::new();
+                properties.insert("ack".to_string(), json!(frame.sequence));
+                properties.insert("call_id".to_string(), json!(end.call_id.clone()));
+                properties.insert(
+                    "reason".to_string(),
+                    json!(Self::call_end_reason_label(end.reason)),
+                );
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: serde_json::Value::Object(properties),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::CallStats => {
+                let envelope = match frame.payload {
+                    FramePayload::Control(ref env) => env,
+                    _ => return Err(ServerError::Invalid),
+                };
+                let stats = ProtoCallStats::try_from(envelope).map_err(|_| ServerError::Invalid)?;
+                self.update_call_stats(device_id, &stats).await?;
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let mut properties = serde_json::Map::new();
+                properties.insert("ack".to_string(), json!(frame.sequence));
+                properties.insert("call_id".to_string(), json!(stats.call_id.clone()));
+                properties.insert(
+                    "direction".to_string(),
+                    json!(match stats.direction {
+                        CallMediaDirection::Send => "send",
+                        CallMediaDirection::Receive => "receive",
+                    }),
+                );
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: serde_json::Value::Object(properties),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::Msg
+            | FrameType::Typing
+            | FrameType::KeyUpdate
+            | FrameType::GroupEvent
+            | FrameType::VoiceFrame
+            | FrameType::VideoFrame => {
                 let inbound_sequence = frame.sequence;
+                if matches!(frame.frame_type, FrameType::VoiceFrame) {
+                    self.state.metrics.mark_call_voice_frame();
+                } else if matches!(frame.frame_type, FrameType::VideoFrame) {
+                    self.state.metrics.mark_call_video_frame();
+                }
                 self.broadcast_frame(device_id, frame.clone()).await?;
                 let ack = Frame {
                     channel_id: frame.channel_id,
@@ -2403,32 +2744,39 @@ impl CommuCatApp {
             info!(target = %member, relay = relay_mode, "delivered frame");
         }
         if !offline_targets.is_empty() {
-            let encoded = frame.encode()?;
-            for target in offline_targets.iter() {
-                let now = Utc::now();
-                let inbox_key = format!("inbox:{}", target);
-                let envelope = RelayEnvelope {
-                    envelope_id: generate_id(&format!(
-                        "{}:{}:{}",
-                        sender,
-                        target,
-                        now.timestamp_nanos_opt().unwrap_or_default()
-                    )),
-                    channel_id: inbox_key.clone(),
-                    payload: encoded.clone(),
-                    deliver_after: now,
-                    expires_at: now + Duration::seconds(self.state.relay_ttl),
-                };
-                self.state.storage.enqueue_relay(&envelope).await?;
-                let offset = InboxOffset {
-                    entity_id: target.clone(),
-                    channel_id: inbox_key,
-                    last_envelope_id: Some(envelope.envelope_id.clone()),
-                    updated_at: now,
-                };
-                self.state.storage.store_inbox_offset(&offset).await?;
-                self.state.metrics.mark_relay();
-                if let Some(pos) = target.find('@') {
+            if matches!(frame.frame_type, FrameType::VoiceFrame | FrameType::VideoFrame) {
+                debug!(
+                    channel = frame.channel_id,
+                    targets = offline_targets.len(),
+                    "skipping offline relay for realtime media frame"
+                );
+            } else {
+                let encoded = frame.encode()?;
+                for target in offline_targets.iter() {
+                    let now = Utc::now();
+                    let inbox_key = format!("inbox:{}", target);
+                    let envelope = RelayEnvelope {
+                        envelope_id: generate_id(&format!(
+                            "{}:{}:{}",
+                            sender,
+                            target,
+                            now.timestamp_nanos_opt().unwrap_or_default()
+                        )),
+                        channel_id: inbox_key.clone(),
+                        payload: encoded.clone(),
+                        deliver_after: now,
+                        expires_at: now + Duration::seconds(self.state.relay_ttl),
+                    };
+                    self.state.storage.enqueue_relay(&envelope).await?;
+                    let offset = InboxOffset {
+                        entity_id: target.clone(),
+                        channel_id: inbox_key,
+                        last_envelope_id: Some(envelope.envelope_id.clone()),
+                        updated_at: now,
+                    };
+                    self.state.storage.store_inbox_offset(&offset).await?;
+                    self.state.metrics.mark_relay();
+                    if let Some(pos) = target.find('@') {
                     let domain = &target[pos + 1..];
                     if domain != self.state.config.domain {
                         let normalized = domain.to_ascii_lowercase();
@@ -2555,6 +2903,65 @@ impl CommuCatApp {
         };
         if let Err(err) = self.state.storage.publish_presence(&snapshot).await {
             warn!("presence cleanup failed: {}", err);
+        }
+        let mut terminated_calls = Vec::new();
+        {
+            let mut sessions = self.state.call_sessions.write().await;
+            let affected = sessions
+                .values()
+                .filter(|session| session.participants.contains(device_id))
+                .map(|session| {
+                    (
+                        session.call_id.clone(),
+                        session.channel_id,
+                        session.started_at,
+                        session.initiator.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (call_id, _, _, _) in affected.iter() {
+                sessions.remove(call_id);
+            }
+            terminated_calls = affected;
+        }
+        for (call_id, channel_id, started_at, initiator) in terminated_calls {
+            self.state.metrics.mark_call_ended();
+            let duration = (Utc::now() - started_at).num_seconds().max(0);
+            self.emit_call_event(
+                &call_id,
+                "end",
+                json!({
+                    "device": device_id,
+                    "initiator": initiator,
+                    "reason": "disconnect",
+                    "duration_secs": duration,
+                }),
+            );
+            let call_end = ProtoCallEnd {
+                call_id: call_id.clone(),
+                reason: CallEndReason::Failure,
+                metadata: json!({
+                    "system": true,
+                    "cause": "disconnect",
+                    "device": device_id,
+                }),
+            };
+            match ControlEnvelope::try_from(&call_end) {
+                Ok(envelope) => {
+                    let frame = Frame {
+                        channel_id,
+                        sequence: 0,
+                        frame_type: FrameType::CallEnd,
+                        payload: FramePayload::Control(envelope),
+                    };
+                    if let Err(err) = self.broadcast_frame(device_id, frame).await {
+                        warn!(call = %call_id, "failed to broadcast disconnect CallEnd: {}", err);
+                    }
+                }
+                Err(err) => {
+                    warn!(call = %call_id, "failed to encode disconnect CallEnd: {}", err);
+                }
+            }
         }
         self.state.metrics.decr_connections();
     }

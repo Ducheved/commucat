@@ -6,7 +6,8 @@ members = [
     "crates/storage",
     "crates/federation",
     "crates/ledger",
-    "crates/cli"
+    "crates/cli",
+    "crates/media"
 ]
 resolver = "2"
 

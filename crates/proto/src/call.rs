@@ -1,0 +1,368 @@
+use crate::{CodecError, ControlEnvelope};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::convert::TryFrom;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallMode {
+    FullDuplex,
+    HalfDuplex,
+}
+
+impl Default for CallMode {
+    fn default() -> Self {
+        CallMode::FullDuplex
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCodec {
+    Opus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoCodec {
+    Vp8,
+    Vp9,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoResolution {
+    pub width: u16,
+    pub height: u16,
+}
+
+impl Default for VideoResolution {
+    fn default() -> Self {
+        VideoResolution {
+            width: 640,
+            height: 360,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioParameters {
+    pub codec: AudioCodec,
+    pub bitrate: u32,
+    pub sample_rate: u32,
+    pub channels: u8,
+    #[serde(default)]
+    pub fec: bool,
+    #[serde(default)]
+    pub dtx: bool,
+}
+
+impl Default for AudioParameters {
+    fn default() -> Self {
+        AudioParameters {
+            codec: AudioCodec::Opus,
+            bitrate: 16_000,
+            sample_rate: 48_000,
+            channels: 1,
+            fec: true,
+            dtx: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VideoParameters {
+    pub codec: VideoCodec,
+    pub max_bitrate: u32,
+    pub max_resolution: VideoResolution,
+    pub frame_rate: u8,
+    #[serde(default)]
+    pub adaptive: bool,
+}
+
+impl Default for VideoParameters {
+    fn default() -> Self {
+        VideoParameters {
+            codec: VideoCodec::Vp8,
+            max_bitrate: 750_000,
+            max_resolution: VideoResolution::default(),
+            frame_rate: 24,
+            adaptive: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallMediaProfile {
+    pub audio: AudioParameters,
+    #[serde(default)]
+    pub video: Option<VideoParameters>,
+    #[serde(default)]
+    pub mode: CallMode,
+}
+
+impl Default for CallMediaProfile {
+    fn default() -> Self {
+        CallMediaProfile {
+            audio: AudioParameters::default(),
+            video: None,
+            mode: CallMode::FullDuplex,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportCandidate {
+    pub address: String,
+    pub port: u16,
+    #[serde(default)]
+    pub protocol: TransportProtocol,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportProtocol {
+    Tcp,
+    Udp,
+}
+
+impl Default for TransportProtocol {
+    fn default() -> Self {
+        TransportProtocol::Udp
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct CallTransport {
+    #[serde(default)]
+    pub prefer_relay: bool,
+    #[serde(default)]
+    pub udp_candidates: Vec<TransportCandidate>,
+    #[serde(default)]
+    pub fingerprints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallOffer {
+    pub call_id: String,
+    pub from: String,
+    pub to: Vec<String>,
+    #[serde(default)]
+    pub media: CallMediaProfile,
+    #[serde(default = "default_metadata")]
+    pub metadata: Value,
+    #[serde(default)]
+    pub transport: Option<CallTransport>,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+    #[serde(default)]
+    pub ephemeral_key: Option<String>,
+}
+
+fn default_metadata() -> Value {
+    Value::Null
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallAnswer {
+    pub call_id: String,
+    pub accept: bool,
+    #[serde(default)]
+    pub media: Option<CallMediaProfile>,
+    #[serde(default)]
+    pub transport: Option<CallTransport>,
+    #[serde(default)]
+    pub reason: Option<CallRejectReason>,
+    #[serde(default = "default_metadata")]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallRejectReason {
+    Busy,
+    Decline,
+    Unsupported,
+    Timeout,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallEnd {
+    pub call_id: String,
+    pub reason: CallEndReason,
+    #[serde(default = "default_metadata")]
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallEndReason {
+    Hangup,
+    Cancel,
+    Failure,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CallMediaDirection {
+    Send,
+    Receive,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaStreamStats {
+    pub bitrate: u32,
+    #[serde(default)]
+    pub packet_loss: f32,
+    #[serde(default)]
+    pub jitter_ms: u32,
+    #[serde(default)]
+    pub rtt_ms: Option<u32>,
+    #[serde(default)]
+    pub frames_per_second: Option<u8>,
+    #[serde(default)]
+    pub key_frames: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallStats {
+    pub call_id: String,
+    pub direction: CallMediaDirection,
+    #[serde(default)]
+    pub audio: Option<MediaStreamStats>,
+    #[serde(default)]
+    pub video: Option<MediaStreamStats>,
+    #[serde(default)]
+    pub timestamp: Option<u64>,
+}
+
+fn encode_control<T: Serialize>(value: T) -> Result<ControlEnvelope, CodecError> {
+    serde_json::to_value(value)
+        .map(|properties| ControlEnvelope { properties })
+        .map_err(|_| CodecError::InvalidControlJson)
+}
+
+fn decode_control<T: DeserializeOwned>(envelope: &ControlEnvelope) -> Result<T, CodecError> {
+    serde_json::from_value(envelope.properties.clone()).map_err(|_| CodecError::InvalidControlJson)
+}
+
+macro_rules! impl_control_codec {
+    ($ty:ty) => {
+        impl TryFrom<$ty> for ControlEnvelope {
+            type Error = CodecError;
+
+            fn try_from(value: $ty) -> Result<Self, Self::Error> {
+                encode_control(value)
+            }
+        }
+
+        impl TryFrom<&$ty> for ControlEnvelope {
+            type Error = CodecError;
+
+            fn try_from(value: &$ty) -> Result<Self, Self::Error> {
+                encode_control(value)
+            }
+        }
+
+        impl TryFrom<&ControlEnvelope> for $ty {
+            type Error = CodecError;
+
+            fn try_from(envelope: &ControlEnvelope) -> Result<Self, Self::Error> {
+                decode_control::<$ty>(envelope)
+            }
+        }
+    };
+}
+
+impl_control_codec!(CallOffer);
+impl_control_codec!(CallAnswer);
+impl_control_codec!(CallEnd);
+impl_control_codec!(CallStats);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ControlEnvelope;
+
+    #[test]
+    fn offer_roundtrip() {
+        let offer = CallOffer {
+            call_id: "call-123".to_string(),
+            from: "alice:device".to_string(),
+            to: vec!["bob:device".to_string()],
+            media: CallMediaProfile {
+                audio: AudioParameters {
+                    codec: AudioCodec::Opus,
+                    bitrate: 24_000,
+                    sample_rate: 48_000,
+                    channels: 1,
+                    fec: true,
+                    dtx: false,
+                },
+                video: Some(VideoParameters {
+                    codec: VideoCodec::Vp8,
+                    max_bitrate: 350_000,
+                    max_resolution: VideoResolution { width: 640, height: 360 },
+                    frame_rate: 20,
+                    adaptive: true,
+                }),
+                mode: CallMode::FullDuplex,
+            },
+            metadata: serde_json::json!({"mode": "voice"}),
+            transport: Some(CallTransport {
+                prefer_relay: false,
+                udp_candidates: vec![TransportCandidate {
+                    address: "203.0.113.10".to_string(),
+                    port: 3478,
+                    protocol: TransportProtocol::Udp,
+                }],
+                fingerprints: vec!["abc123".to_string()],
+            }),
+            expires_at: Some(1_700_000_000),
+            ephemeral_key: Some("feedface".to_string()),
+        };
+        let envelope: ControlEnvelope = (&offer).try_into().expect("encode");
+        let decoded = CallOffer::try_from(&envelope).expect("decode");
+        assert_eq!(decoded.call_id, offer.call_id);
+        assert_eq!(decoded.transport.as_ref().unwrap().udp_candidates.len(), 1);
+    }
+
+    #[test]
+    fn answer_reject_roundtrip() {
+        let answer = CallAnswer {
+            call_id: "call-999".to_string(),
+            accept: false,
+            media: None,
+            transport: None,
+            reason: Some(CallRejectReason::Busy),
+            metadata: Value::Null,
+        };
+        let envelope: ControlEnvelope = (&answer).try_into().expect("encode");
+        let decoded = CallAnswer::try_from(&envelope).expect("decode");
+        assert!(!decoded.accept);
+        assert_eq!(decoded.reason, Some(CallRejectReason::Busy));
+    }
+
+    #[test]
+    fn stats_roundtrip() {
+        let stats = CallStats {
+            call_id: "call-1".to_string(),
+            direction: CallMediaDirection::Send,
+            audio: Some(MediaStreamStats {
+                bitrate: 18_000,
+                packet_loss: 0.012,
+                jitter_ms: 8,
+                rtt_ms: Some(90),
+                frames_per_second: None,
+                key_frames: None,
+            }),
+            video: None,
+            timestamp: Some(1_690_000_000),
+        };
+        let envelope: ControlEnvelope = (&stats).try_into().expect("encode");
+        let decoded = CallStats::try_from(&envelope).expect("decode");
+        assert_eq!(decoded.audio.unwrap().bitrate, 18_000);
+    }
+}

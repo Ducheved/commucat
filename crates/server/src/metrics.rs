@@ -13,6 +13,10 @@ pub struct Metrics {
     multipath_sessions: AtomicU64,
     multipath_paths_total: AtomicU64,
     censorship_deflections: AtomicU64,
+    call_sessions_active: AtomicU64,
+    call_sessions_total: AtomicU64,
+    call_voice_frames: AtomicU64,
+    call_video_frames: AtomicU64,
 }
 
 impl Metrics {
@@ -65,6 +69,27 @@ impl Metrics {
         self.censorship_deflections.fetch_add(1, Ordering::SeqCst);
     }
 
+    pub fn mark_call_started(&self) {
+        self.call_sessions_total.fetch_add(1, Ordering::SeqCst);
+        self.call_sessions_active.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn mark_call_ended(&self) {
+        let _ = self.call_sessions_active.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |value| if value == 0 { None } else { Some(value - 1) },
+        );
+    }
+
+    pub fn mark_call_voice_frame(&self) {
+        self.call_voice_frames.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn mark_call_video_frame(&self) {
+        self.call_video_frames.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn security_snapshot(&self) -> SecuritySnapshot {
         let sessions = self.multipath_sessions.load(Ordering::SeqCst);
         let paths_total = self.multipath_paths_total.load(Ordering::SeqCst);
@@ -84,7 +109,7 @@ impl Metrics {
 
     pub fn encode_prometheus(&self) -> String {
         format!(
-            "# TYPE commucat_connections_active gauge\ncommucat_connections_active {}\n# TYPE commucat_frames_ingress counter\ncommucat_frames_ingress {}\n# TYPE commucat_frames_egress counter\ncommucat_frames_egress {}\n# TYPE commucat_relay_enqueued counter\ncommucat_relay_enqueued {}\n# TYPE commucat_security_noise counter\ncommucat_security_noise {}\n# TYPE commucat_security_pq counter\ncommucat_security_pq {}\n# TYPE commucat_security_fec counter\ncommucat_security_fec_packets {}\n# TYPE commucat_multipath_sessions counter\ncommucat_multipath_sessions {}\n# TYPE commucat_multipath_paths gauge\ncommucat_multipath_paths {}\n# TYPE commucat_censorship_deflections counter\ncommucat_censorship_deflections {}\n",
+            "# TYPE commucat_connections_active gauge\ncommucat_connections_active {}\n# TYPE commucat_frames_ingress counter\ncommucat_frames_ingress {}\n# TYPE commucat_frames_egress counter\ncommucat_frames_egress {}\n# TYPE commucat_relay_enqueued counter\ncommucat_relay_enqueued {}\n# TYPE commucat_security_noise counter\ncommucat_security_noise {}\n# TYPE commucat_security_pq counter\ncommucat_security_pq {}\n# TYPE commucat_security_fec counter\ncommucat_security_fec_packets {}\n# TYPE commucat_multipath_sessions counter\ncommucat_multipath_sessions {}\n# TYPE commucat_multipath_paths gauge\ncommucat_multipath_paths {}\n# TYPE commucat_censorship_deflections counter\ncommucat_censorship_deflections {}\n# TYPE commucat_calls_active gauge\ncommucat_calls_active {}\n# TYPE commucat_calls_total counter\ncommucat_calls_total {}\n# TYPE commucat_call_voice_frames counter\ncommucat_call_voice_frames {}\n# TYPE commucat_call_video_frames counter\ncommucat_call_video_frames {}\n",
             self.connections_active.load(Ordering::SeqCst),
             self.frames_ingress.load(Ordering::SeqCst),
             self.frames_egress.load(Ordering::SeqCst),
@@ -94,7 +119,11 @@ impl Metrics {
             self.fec_packets.load(Ordering::SeqCst),
             self.multipath_sessions.load(Ordering::SeqCst),
             self.multipath_paths_total.load(Ordering::SeqCst),
-            self.censorship_deflections.load(Ordering::SeqCst)
+            self.censorship_deflections.load(Ordering::SeqCst),
+            self.call_sessions_active.load(Ordering::SeqCst),
+            self.call_sessions_total.load(Ordering::SeqCst),
+            self.call_voice_frames.load(Ordering::SeqCst),
+            self.call_video_frames.load(Ordering::SeqCst)
         )
     }
 }
