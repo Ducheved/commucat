@@ -188,6 +188,7 @@ Recipients decode each Opus packet in order to reconstruct playback. Clients MAY
      "supported_versions": [1],
      "user": {
        "id": "existing-user-id",
+       "user_id": "existing-user-id",
        "handle": "desired-handle",
        "display_name": "optional nickname",
        "avatar_url": "https://..."
@@ -207,6 +208,7 @@ Recipients decode each Opus packet in order to reconstruct playback. Clients MAY
      "supported_versions": [1],
      "user": {
        "id": "resolved-user-id",
+       "user_id": "resolved-user-id",
        "handle": "effective-handle",
        "display_name": "optional nickname",
        "avatar_url": "https://..."
@@ -224,7 +226,7 @@ After message three the Noise state switches into transport mode. The server nev
 
 If `max_auto_devices_per_user` is reached or `auto_approve_devices` is disabled, the server immediately returns an `ERROR` frame with `title`=`PairingRequired` and closes the stream. The client should obtain a pairing code over REST and re-register the device via `POST /api/pair/claim`.
 
-*Profile provisioning*: the `user` object in `HELLO` lets clients attach devices to existing profiles (`id`) or request new profiles (`handle`, plus optional `display_name` and `avatar_url`). When auto-approval is enabled, absent `id` instructs the server to mint a fresh user. The server echoes canonical profile fields in the `AUTH` response and completion `ACK`, ensuring clients persist consistent identifiers.
+*Profile provisioning*: the `user` object in `HELLO` lets clients attach devices to existing profiles (`id`, alias `user_id`) or request new profiles (`handle`, plus optional `display_name` and `avatar_url`). When auto-approval is enabled, absent `id` instructs the server to mint a fresh user. The server echoes canonical profile fields (including both `id` and `user_id`) in the `AUTH` response and completion `ACK`, ensuring clients persist consistent identifiers.
 
 *Noise parameters*: `Noise_XK_25519_ChaChaPoly_BLAKE2s` or `Noise_IK_25519_ChaChaPoly_BLAKE2s` with empty PSKs and configurable prologue. Clients derive AEAD keys for subsequent ciphertext frames.
 

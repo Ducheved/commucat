@@ -108,6 +108,23 @@ mod tests {
         assert_eq!(cloned.group_id.as_deref(), Some("grp-1"));
         assert!(route.relay);
     }
+
+    #[test]
+    fn user_snapshot_includes_alias() {
+        let now = Utc::now();
+        let profile = UserProfile {
+            user_id: "user-123".to_string(),
+            handle: "alice".to_string(),
+            display_name: Some("Alice".to_string()),
+            avatar_url: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let payload = user_snapshot(&profile);
+        assert_eq!(payload["id"], json!("user-123"));
+        assert_eq!(payload["user_id"], json!("user-123"));
+        assert_eq!(payload["handle"], json!("alice"));
+    }
 }
 
 impl Error for ServerError {}
@@ -143,6 +160,17 @@ impl From<FederationError> for ServerError {
     fn from(_: FederationError) -> Self {
         ServerError::Federation
     }
+}
+
+fn user_snapshot(profile: &UserProfile) -> serde_json::Value {
+    let user_id = profile.user_id.clone();
+    json!({
+        "id": user_id.clone(),
+        "user_id": user_id,
+        "handle": profile.handle.clone(),
+        "display_name": profile.display_name.clone(),
+        "avatar_url": profile.avatar_url.clone(),
+    })
 }
 
 pub struct AppState {
@@ -924,13 +952,9 @@ impl CommuCatApp {
             "private_key": encode_hex(&keys.private[..]),
             "public_key": encode_hex(&keys.public[..]),
             "seed": encode_hex(&seed[..]),
-            "issuer_device_id": claim.issuer_device_id,
-            "user": {
-                "id": claim.user.user_id,
-                "handle": claim.user.handle,
-                "display_name": claim.user.display_name,
-                "avatar_url": claim.user.avatar_url,
-            },
+            "issuer_device_id": claim.issuer_device_id.clone(),
+            "user_id": claim.user.user_id.clone(),
+            "user": user_snapshot(&claim.user),
         });
         if let Some(obj) = response.as_object_mut() {
             obj.insert(
@@ -1398,13 +1422,9 @@ impl CommuCatApp {
         };
         let mut ack_properties = json!({
             "handshake": "ok",
-            "session": session_id,
-            "user": {
-                "id": user_profile.user_id.clone(),
-                "handle": user_profile.handle.clone(),
-                "display_name": user_profile.display_name.clone(),
-                "avatar_url": user_profile.avatar_url.clone(),
-            },
+            "session": session_id.clone(),
+            "user_id": user_profile.user_id.clone(),
+            "user": user_snapshot(&user_profile),
         });
         if let Some(obj) = ack_properties.as_object_mut() {
             obj.insert("pairing_required".to_string(), json!(pairing_required_flag));
@@ -1673,7 +1693,7 @@ impl CommuCatApp {
                 context.device_public = device_public;
                 let user_payload = envelope.properties.get("user").and_then(|v| v.as_object());
                 let user_id_hint = user_payload
-                    .and_then(|map| map.get("id"))
+                    .and_then(|map| map.get("id").or_else(|| map.get("user_id")))
                     .and_then(|v| v.as_str())
                     .map(|v| v.to_string());
                 let handle_hint = user_payload
@@ -1888,16 +1908,12 @@ impl CommuCatApp {
                 let mut handshake_state = build_handshake(&noise, false)?;
                 let _ = handshake_state.read_message(&handshake_bytes)?;
                 let session_id = generate_id(&device_id);
-                let user_payload = json!({
-                    "id": user_id.clone(),
-                    "handle": user_profile.handle.clone(),
-                    "display_name": user_profile.display_name.clone(),
-                    "avatar_url": user_profile.avatar_url.clone(),
-                });
+                let user_payload = user_snapshot(&user_profile);
                 let payload = json!({
-                    "session": session_id,
-                    "domain": self.state.config.domain,
+                    "session": session_id.clone(),
+                    "domain": self.state.config.domain.clone(),
                     "protocol_version": context.protocol_version,
+                    "user_id": user_profile.user_id.clone(),
                     "user": user_payload,
                 })
                 .to_string()

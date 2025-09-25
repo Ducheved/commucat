@@ -110,6 +110,47 @@ pub struct PresenceSnapshot {
     pub avatar_url: Option<String>,
 }
 
+fn presence_user_payload(snapshot: &PresenceSnapshot) -> Option<serde_json::Value> {
+    snapshot.user_id.as_ref().map(|id| {
+        let user_id = id.clone();
+        serde_json::json!({
+            "id": user_id.clone(),
+            "user_id": user_id,
+            "handle": snapshot.handle.clone(),
+            "display_name": snapshot.display_name.clone(),
+            "avatar_url": snapshot.avatar_url.clone(),
+        })
+    })
+}
+
+fn presence_user_fields(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
+    let user_id = map
+        .get("user_id")
+        .or_else(|| map.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let handle = map
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let display_name = map
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let avatar_url = map
+        .get("avatar_url")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    (user_id, handle, display_name, avatar_url)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceKeyEvent {
     pub event_id: String,
@@ -1094,15 +1135,10 @@ impl Storage {
         let mut conn = self.redis.lock().await;
         let ttl = (snapshot.expires_at.timestamp() - Utc::now().timestamp()).max(1) as usize;
         let payload = serde_json::json!({
-            "entity": snapshot.entity,
-            "state": snapshot.state,
+            "entity": snapshot.entity.clone(),
+            "state": snapshot.state.clone(),
             "expires_at": snapshot.expires_at.to_rfc3339(),
-            "user": snapshot.user_id.as_ref().map(|id| serde_json::json!({
-                "id": id,
-                "handle": snapshot.handle.clone(),
-                "display_name": snapshot.display_name.clone(),
-                "avatar_url": snapshot.avatar_url.clone(),
-            })),
+            "user": presence_user_payload(snapshot),
         })
         .to_string();
         redis::cmd("SETEX")
@@ -1142,22 +1178,11 @@ impl Storage {
                 .map_err(|_| StorageError::Serialization)?
                 .with_timezone(&Utc);
             let user_obj = parsed.get("user").and_then(|v| v.as_object());
-            let user_id = user_obj
-                .and_then(|map| map.get("id"))
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string());
-            let handle = user_obj
-                .and_then(|map| map.get("handle"))
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string());
-            let display_name = user_obj
-                .and_then(|map| map.get("display_name"))
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string());
-            let avatar_url = user_obj
-                .and_then(|map| map.get("avatar_url"))
-                .and_then(|v| v.as_str())
-                .map(|v| v.to_string());
+            let (user_id, handle, display_name, avatar_url) = if let Some(map) = user_obj {
+                presence_user_fields(map)
+            } else {
+                (None, None, None, None)
+            };
             Ok(Some(PresenceSnapshot {
                 entity: entity.to_string(),
                 state,
@@ -1222,7 +1247,7 @@ fn generate_pair_code() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{Duration, Utc};
     use std::str::FromStr;
 
     #[test]
@@ -1266,6 +1291,36 @@ mod tests {
             FederationPeerStatus::Pending
         );
         assert!(FederationPeerStatus::from_str("offline").is_err());
+    }
+
+    #[test]
+    fn presence_user_payload_emits_aliases() {
+        let now = Utc::now();
+        let snapshot = PresenceSnapshot {
+            entity: "dev-1".to_string(),
+            state: "online".to_string(),
+            expires_at: now + Duration::seconds(30),
+            user_id: Some("user-1".to_string()),
+            handle: Some("alice".to_string()),
+            display_name: Some("Alice".to_string()),
+            avatar_url: None,
+        };
+        let payload = presence_user_payload(&snapshot).expect("payload");
+        assert_eq!(payload["id"], serde_json::json!("user-1"));
+        assert_eq!(payload["user_id"], serde_json::json!("user-1"));
+        assert_eq!(payload["handle"], serde_json::json!("alice"));
+    }
+
+    #[test]
+    fn presence_user_fields_accepts_user_id_alias() {
+        let mut map = serde_json::Map::new();
+        map.insert("user_id".to_string(), serde_json::json!("user-99"));
+        map.insert("handle".to_string(), serde_json::json!("eve"));
+        let (user_id, handle, display_name, avatar_url) = presence_user_fields(&map);
+        assert_eq!(user_id.as_deref(), Some("user-99"));
+        assert_eq!(handle.as_deref(), Some("eve"));
+        assert!(display_name.is_none());
+        assert!(avatar_url.is_none());
     }
 
     #[tokio::test]
