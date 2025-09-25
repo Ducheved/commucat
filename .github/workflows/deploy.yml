@@ -45,16 +45,18 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
 
-      - name: Build server binary
-        run: cargo build --release -p commucat-server
+      - name: Build release binaries
+        run: cargo build --release -p commucat-server -p commucat-cli
 
       - name: Package artifact
         run: |
           VERSION="${{ steps.meta.outputs.version }}"
-          mkdir -p dist
-          cp target/release/commucat-server dist/
-          strip dist/commucat-server || true
-          tar -czf commucat-server-${VERSION}.tar.gz -C dist commucat-server
+          PACKAGE="commucat-bundle-${VERSION}.tar.gz"
+          mkdir -p dist/bin
+          cp target/release/commucat-server dist/bin/
+          cp target/release/commucat-cli dist/bin/
+          strip dist/bin/commucat-server dist/bin/commucat-cli || true
+          tar -czf "$PACKAGE" -C dist .
 
       - name: Upload bundle to host
         uses: appleboy/scp-action@v0.1.7
@@ -62,7 +64,7 @@ jobs:
           host: ${{ secrets.PROD_SSH_HOST }}
           username: ${{ secrets.PROD_SSH_USER }}
           password: ${{ secrets.PROD_SSH_PASSWORD }}
-          source: commucat-server-${{ steps.meta.outputs.version }}.tar.gz
+          source: commucat-bundle-${{ steps.meta.outputs.version }}.tar.gz
           target: /home/${{ secrets.PROD_SSH_USER }}/releases
           overwrite: true
           strip_components: 0
@@ -79,9 +81,10 @@ jobs:
             VERSION="${{ steps.meta.outputs.version }}"
             SUDO_PASSWORD='${{ secrets.PROD_SSH_PASSWORD }}'
             mkdir -p ~/releases ~/bin
-            tar -xzf ~/releases/commucat-server-${VERSION}.tar.gz -C ~/releases
-            install -Dm755 ~/releases/commucat-server ~/bin/commucat-server
-            rm -f ~/releases/commucat-server-${VERSION}.tar.gz
+            tar -xzf ~/releases/commucat-bundle-${VERSION}.tar.gz -C ~/releases
+            install -Dm755 ~/releases/bin/commucat-server ~/bin/commucat-server
+            install -Dm755 ~/releases/bin/commucat-cli ~/bin/commucat-cli
+            rm -f ~/releases/commucat-bundle-${VERSION}.tar.gz
             printf '%s\n' "$SUDO_PASSWORD" | sudo -S -p '' systemctl restart commucat
 
       - name: Summary

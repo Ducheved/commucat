@@ -990,10 +990,17 @@ impl CommuCatApp {
                 let mut handshake_state = build_handshake(&noise, false)?;
                 let _ = handshake_state.read_message(&handshake_bytes)?;
                 let session_id = generate_id(&device_id);
+                let user_payload = json!({
+                    "id": user_id.clone(),
+                    "handle": user_profile.handle.clone(),
+                    "display_name": user_profile.display_name.clone(),
+                    "avatar_url": user_profile.avatar_url.clone(),
+                });
                 let payload = json!({
                     "session": session_id,
                     "domain": self.state.config.domain,
                     "protocol_version": context.protocol_version,
+                    "user": user_payload,
                 })
                 .to_string()
                 .into_bytes();
@@ -1005,6 +1012,7 @@ impl CommuCatApp {
                     payload: FramePayload::Control(ControlEnvelope {
                         properties: json!({
                             "session": session_id,
+                            "device_id": device_id.clone(),
                             "handshake": encode_hex(&response_bytes),
                             "server_static": encode_hex(&self.state.noise_public),
                             "protocol_version": context.protocol_version,
