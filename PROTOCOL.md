@@ -134,6 +134,17 @@ Servers echo the subset they accept inside the second `AUTH` message (`accepted_
 
 When both sides negotiate `pq-hybrid`, the Noise transport keys are immediately augmented with an ML-KEM-768 exchange and a deterministic ML-DSA signature bundle. The flow is layered on top of Noise:
 
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Server
+    Client->>Server: HELLO (Noise msg1, pq_bundle, capabilities)
+    Server->>Client: AUTH (Noise msg2, pq_ciphertext, accepted_capabilities)
+    Client->>Server: AUTH (Noise msg3, ML-DSA signature)
+    Note right of Server: Switch to Noise transport mode
+    Server-->>Client: ACK (optional, confirms session)
+```
+
 1. **Credential announcement** – the client appends a `pq_bundle` object to the first `HELLO` payload:
    ```jsonc
    {
@@ -242,6 +253,12 @@ prefix_s1 || snapshot || frame_bytes || suffix_s2 || MAC16
 Peers manage mimic selection through the `AdaptiveObfuscator` trait implementation. The default strategy weighs HTTPS/REALITY and QUIC during benign operation, pivots to DNS + SIP when DPI interference is detected, and boosts WebRTC when latency probes suggest consumer-grade NATs. MAC verification happens before decoding the inner frame; tampering yields a terminal `ERROR` frame with `title="IntegrityCheckFailed"`.
 
 Feature-flag builds keep the new machinery completely opt-in. Disabling `obfuscation` or `pq` reverts the handshake and transport pipeline back to the minimal CCP-1 flow described earlier.
+
+### Compliance & Known Limitations
+- REST API не содержит встроенного rate-limiting; рекомендуется внешний firewall или reverse-proxy throttling.
+- Zero-knowledge proofs упоминаются в дорожной карте, но пока не реализованы.
+- Обфускация и PQ опциональны и должны быть согласованно включены на обеих сторонах.
+- Управление долговременными секретами (Noise static, federation seed) выполняется вручную (`commucat-cli rotate-keys`) и внешними secret stores; автоматической ротации нет.
 
 ### Pluggable Transports (Phase 2)
 

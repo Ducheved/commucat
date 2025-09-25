@@ -1,32 +1,58 @@
+# CommuCat configuration template — all supported keys
+
 [server]
-bind="0.0.0.0:8443"
-tls_cert="certs/server.crt"
-tls_key="certs/server.key"
-domain="localhost"
-auto_approve_devices=true
-max_auto_devices_per_user="1"
-keepalive="60"
+# TLS listener (HTTP/2 upgrade endpoint)
+bind = "0.0.0.0:8443"
+# X.509 certificate / key (PEM)
+tls_cert = "certs/server.crt"
+tls_key = "certs/server.key"
+# Public domain (CN/SAN must match)
+domain = "example.org"
+# Auto-approve newly seen devices (Noise static key in database)
+auto_approve_devices = true
+# Max devices per user when auto-approval is enabled (0 disables auto-approval)
+max_auto_devices_per_user = 5
+# TCP keep-alive interval in seconds
+keepalive = 60
 
 [storage]
-postgres_dsn="postgres://commucat:commucat@localhost:5432/commucat"
-redis_url="redis://127.0.0.1:6379"
+# PostgreSQL connection string
+postgres_dsn = "postgres://commucat:commucat@localhost:5432/commucat"
+# Redis for presence + rendezvous cache
+redis_url = "redis://127.0.0.1:6379"
 
 [crypto]
-noise_private="000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f"
-noise_public="101112131415161718191a1b1c1d1e1f101112131415161718191a1b1c1d1e1f"
-federation_seed="202122232425262728292a2b2c2d2e2f202122232425262728292a2b2c2d2e2f"
-prologue="commucat"
+# Noise static key pair (hex)
+noise_private = "000102030405060708090a0b0c0d0e0f000102030405060708090a0b0c0d0e0f"
+noise_public  = "101112131415161718191a1b1c1d1e1f101112131415161718191a1b1c1d1e1f"
+# Federation signing seed (ed25519) — 32 bytes hex
+federation_seed = "202122232425262728292a2b2c2d2e2f202122232425262728292a2b2c2d2e2f"
+# Optional Noise prologue (bytes)
+prologue = "commucat"
 
 [federation]
-peers="remote.example,https://remote.example/federation,303132333435363738393a3b3c3d3e3f303132333435363738393a3b3c3d3e3f"
+# Semicolon-separated list of domain,endpoint,public_key(32 B hex)
+peers = "remote.example,https://remote.example/federation,303132333435363738393a3b3c3d3e3f303132333435363738393a3b3c3d3e3f;another.example,https://another.example/fed,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 [ledger]
-mode="null"
+# null|debug|file — debug prints to stdout; file appends JSON lines
+mode = "file"
+# Optional path for file adapter (ignored for null/debug)
+target = "var/log/commucat-ledger.jsonl"
 
 [limits]
-presence_ttl="30"
-relay_ttl="86400"
-pairing_ttl="300"
+# Seconds before presence records expire
+presence_ttl = 30
+# Seconds before queued relay messages expire
+relay_ttl = 86400
+# Pairing token lifetime (seconds)
+pairing_ttl = 300
 
 [admin]
-token="replace-with-secret"
+# Optional bearer token for /api/security-stats and /metrics
+token = "replace-with-secret"
+
+[transport]
+# REALITY / XRay transport material (optional)
+reality_cert = "certs/reality.pem"
+reality_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
