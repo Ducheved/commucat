@@ -26,7 +26,7 @@ publish = false
 blake3 = { version = "1.5" }
 ed25519-dalek = { version = "2.1", features = ["std"] }
 pingora = { version = "0.6.0", features = ["rustls"] }
-redis = { version = "0.24", features = ["aio", "tokio-comp"] }
+redis = { version = "0.27", features = ["aio", "tokio-comp"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0" }
 snow = { version = "0.10" }
@@ -44,4 +44,5 @@ kem = { version = "0.3.0-pre.0" }
 ml-dsa = { version = "0.1.0-rc.0", default-features = false, features = ["alloc", "rand_core"] }
 raptorq = { version = "1.7", default-features = false }
 iana-time-zone = { version = "0.1.64", features = ["fallback"] }
-env-libvpx-sys = { version = "5.1.3" }
+
+

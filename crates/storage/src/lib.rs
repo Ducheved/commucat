@@ -270,7 +270,7 @@ impl Storage {
             .map_err(|_| StorageError::Postgres)?;
         let mut conn = self.redis.lock().await;
         let _: String = redis::cmd("PING")
-            .query_async::<_, String>(&mut *conn)
+            .query_async::<String>(&mut *conn)
             .await
             .map_err(|_| StorageError::Redis)?;
         Ok(())
@@ -1109,7 +1109,7 @@ impl Storage {
             .arg(format!("presence:{}", snapshot.entity))
             .arg(ttl)
             .arg(payload)
-            .query_async::<_, ()>(&mut *conn)
+            .query_async::<()>(&mut *conn)
             .await
             .map_err(|_| StorageError::Redis)?;
         Ok(())
@@ -1123,7 +1123,7 @@ impl Storage {
         let mut conn = self.redis.lock().await;
         let value: Option<String> = redis::cmd("GET")
             .arg(format!("presence:{}", entity))
-            .query_async::<_, Option<String>>(&mut *conn)
+            .query_async::<Option<String>>(&mut *conn)
             .await
             .map_err(|_| StorageError::Redis)?;
         if let Some(json) = value {
@@ -1184,7 +1184,7 @@ impl Storage {
             .arg(format!("route:{}", entity))
             .arg(ttl_seconds.max(1) as usize)
             .arg(session_id)
-            .query_async::<_, ()>(&mut *conn)
+            .query_async::<()>(&mut *conn)
             .await
             .map_err(|_| StorageError::Redis)?;
         Ok(())
@@ -1195,7 +1195,7 @@ impl Storage {
         let mut conn = self.redis.lock().await;
         let _: () = redis::cmd("DEL")
             .arg(format!("route:{}", entity))
-            .query_async::<_, ()>(&mut *conn)
+            .query_async::<()>(&mut *conn)
             .await
             .map_err(|_| StorageError::Redis)?;
         Ok(())

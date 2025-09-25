@@ -3,8 +3,10 @@
 
 use crate::{MediaError, MediaResult};
 use env_libvpx_sys as vpx;
+use std::convert::TryFrom;
+use std::fmt;
 use std::mem::MaybeUninit;
-use std::os::raw::c_int;
+use std::os::raw::{c_int, c_long, c_ulong};
 use std::ptr;
 use std::slice;
 
@@ -35,7 +37,6 @@ impl Default for VideoEncoderConfig {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct VideoEncoder {
     ctx: vpx::vpx_codec_ctx_t,
     cfg: vpx::vpx_codec_enc_cfg_t,
@@ -56,6 +57,18 @@ pub struct I420Borrowed<'a> {
     pub stride_y: usize,
     pub stride_u: usize,
     pub stride_v: usize,
+}
+
+impl fmt::Debug for VideoEncoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoEncoder")
+            .field("width", &self.cfg.g_w)
+            .field("height", &self.cfg.g_h)
+            .field("bitrate", &self.cfg.rc_target_bitrate)
+            .field("threads", &self.cfg.g_threads)
+            .field("pts", &self.pts)
+            .finish()
+    }
 }
 
 impl VideoEncoder {
@@ -85,10 +98,10 @@ impl VideoEncoder {
             cfg.g_h = config.height;
             cfg.g_timebase.num = config.timebase_num as c_int;
             cfg.g_timebase.den = config.timebase_den as c_int;
-            cfg.rc_target_bitrate = config.bitrate as c_int;
-            cfg.rc_min_quantizer = config.min_quantizer as c_int;
-            cfg.rc_max_quantizer = config.max_quantizer as c_int;
-            cfg.g_threads = config.threads as c_int;
+            cfg.rc_target_bitrate = config.bitrate;
+            cfg.rc_min_quantizer = config.min_quantizer;
+            cfg.rc_max_quantizer = config.max_quantizer;
+            cfg.g_threads = u32::from(config.threads);
             cfg.g_lag_in_frames = 0;
             cfg.g_pass = vpx::vpx_enc_pass::VPX_RC_ONE_PASS;
             cfg.rc_end_usage = vpx::vpx_rc_mode::VPX_VBR;
@@ -172,18 +185,21 @@ impl VideoEncoder {
                 uv_height,
             );
 
-            let flags = if force_keyframe {
-                vpx::VPX_EFLAG_FORCE_KF as u64
+            let pts = i64::try_from(timestamp)
+                .map_err(|_| MediaError::InvalidConfig("timestamp exceeds encoder range"))?;
+            let duration: c_ulong = 1;
+            let flags: c_long = if force_keyframe {
+                vpx::VPX_EFLAG_FORCE_KF as c_long
             } else {
                 0
             };
             let res = vpx::vpx_codec_encode(
                 &mut self.ctx,
                 img,
-                timestamp,
-                1,
+                pts,
+                duration,
                 flags,
-                vpx::VPX_DL_REALTIME as u64,
+                vpx::VPX_DL_REALTIME as c_ulong,
             );
             vpx::vpx_img_free(image);
             if res != vpx::vpx_codec_err_t::VPX_CODEC_OK {
@@ -226,9 +242,14 @@ impl Drop for VideoEncoder {
     }
 }
 
-#[derive(Debug, Clone)]
 pub struct VideoDecoder {
     ctx: vpx::vpx_codec_ctx_t,
+}
+
+impl fmt::Debug for VideoDecoder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VideoDecoder").finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -348,11 +369,7 @@ unsafe fn copy_plane(
         let src_offset = row * src_stride;
         let dst_offset = row * dst_stride;
         unsafe {
-            ptr::copy_nonoverlapping(
-                src.as_ptr().add(src_offset),
-                dst_ptr.add(dst_offset),
-                width,
-            );
+            ptr::copy_nonoverlapping(src.as_ptr().add(src_offset), dst_ptr.add(dst_offset), width);
         }
     }
 }

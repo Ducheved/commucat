@@ -2,9 +2,6 @@
 #![deny(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
-#[cfg(feature = "video")]
-extern crate env_libvpx_sys;
-
 pub mod audio;
 #[cfg(feature = "audio-io")]
 pub mod capture;
@@ -44,7 +41,7 @@ impl From<audiopus::Error> for MediaError {
 #[cfg(feature = "video")]
 impl From<env_libvpx_sys::vpx_codec_err_t> for MediaError {
     fn from(err: env_libvpx_sys::vpx_codec_err_t) -> Self {
-        MediaError::Codec(format!("libvpx error code {err}"))
+        MediaError::Codec(format!("libvpx error code {err:?}"))
     }
 }
 

@@ -12,15 +12,17 @@ publish = false
 default = ["audio", "pipeline"]
 audio = ["dep:audiopus"]
 audio-io = ["audio", "dep:cpal"]
-video = ["env-libvpx-sys"]
+video = ["dep:env_libvpx_sys"]
 pipeline = ["dep:tokio"]
 
 [dependencies]
 audiopus = { version = "0.3.0-rc.0", optional = true }
 cpal = { version = "0.15", optional = true }
-env-libvpx-sys = { workspace = true, optional = true, features = ["generate"] }
+env_libvpx_sys = { package = "env-libvpx-sys", version = "5.1.3", optional = true, features = ["generate"] }
 thiserror = "1.0"
 tokio = { workspace = true, optional = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
 serde_json = { workspace = true, optional = true }
+
+
