@@ -58,6 +58,16 @@ jobs:
           strip dist/bin/commucat-server dist/bin/commucat-cli || true
           tar -czf "$PACKAGE" -C dist .
 
+      - name: Prepare remote directories
+        uses: appleboy/ssh-action@v1.1.0
+        with:
+          host: ${{ secrets.PROD_SSH_HOST }}
+          username: ${{ secrets.PROD_SSH_USER }}
+          password: ${{ secrets.PROD_SSH_PASSWORD }}
+          script: |
+            set -euo pipefail
+            mkdir -p /home/${{ secrets.PROD_SSH_USER }}/releases
+
       - name: Upload bundle to host
         uses: appleboy/scp-action@v0.1.7
         with:

@@ -904,14 +904,21 @@ impl CommuCatApp {
                             }
                             (profile.user_id.clone(), profile)
                         } else if let Some(handle) = &handle_hint {
-                            let new_profile = NewUserProfile {
-                                user_id: generate_id(handle),
-                                handle: handle.clone(),
-                                display_name: display_hint.clone(),
-                                avatar_url: avatar_hint.clone(),
-                            };
-                            let profile = self.state.storage.create_user(&new_profile).await?;
-                            (profile.user_id.clone(), profile)
+                            match self.state.storage.load_user_by_handle(handle).await {
+                                Ok(profile) => (profile.user_id.clone(), profile),
+                                Err(StorageError::Missing) => {
+                                    let new_profile = NewUserProfile {
+                                        user_id: generate_id(handle),
+                                        handle: handle.clone(),
+                                        display_name: display_hint.clone(),
+                                        avatar_url: avatar_hint.clone(),
+                                    };
+                                    let profile =
+                                        self.state.storage.create_user(&new_profile).await?;
+                                    (profile.user_id.clone(), profile)
+                                }
+                                Err(err) => return Err(err.into()),
+                            }
                         } else {
                             return Err(ServerError::Invalid);
                         };
