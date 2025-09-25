@@ -69,14 +69,15 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
         run: |
           set -euo pipefail
-          for manifest in \
-            crates/proto/Cargo.toml \
-            crates/crypto/Cargo.toml \
-            crates/federation/Cargo.toml \
-            crates/storage/Cargo.toml \
-            crates/ledger/Cargo.toml \
-            crates/media/Cargo.toml \
-          do
+          manifests=(
+            "crates/proto/Cargo.toml"
+            "crates/crypto/Cargo.toml"
+            "crates/federation/Cargo.toml"
+            "crates/storage/Cargo.toml"
+            "crates/ledger/Cargo.toml"
+            "crates/media/Cargo.toml"
+          )
+          for manifest in "${manifests[@]}"; do
             cargo publish --allow-dirty --manifest-path "$manifest"
             # give crates.io a moment to ingest the upload
             sleep 20
