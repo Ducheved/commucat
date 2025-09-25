@@ -7,12 +7,26 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+#[cfg(feature = "pq")]
+mod pq;
+
+#[cfg(feature = "pq")]
+pub use pq::{
+    decapsulate_hybrid, encapsulate_hybrid, HybridInitiatorResult, HybridKeyMaterial,
+    HybridRatchet, HybridResponderResult, HybridSettings, PqKemKeyPair, PqSignatureKeyPair,
+    PqSignaturePublicKey, PqxdhBundle, SessionKeys, SessionRole,
+};
+
 #[derive(Debug)]
 pub enum CryptoError {
     NoiseConfig,
     NoiseFailure,
     InvalidKey,
     Signature,
+    KeyDerivation,
+    PostQuantumSignature,
+    PostQuantumEncapsulation,
+    PostQuantumDecapsulation,
 }
 
 impl Display for CryptoError {
@@ -22,6 +36,10 @@ impl Display for CryptoError {
             Self::NoiseFailure => write!(f, "noise handshake failure"),
             Self::InvalidKey => write!(f, "invalid key material"),
             Self::Signature => write!(f, "signature error"),
+            Self::KeyDerivation => write!(f, "key derivation failure"),
+            Self::PostQuantumSignature => write!(f, "ml-dsa signature failure"),
+            Self::PostQuantumEncapsulation => write!(f, "ml-kem encapsulation failure"),
+            Self::PostQuantumDecapsulation => write!(f, "ml-kem decapsulation failure"),
         }
     }
 }

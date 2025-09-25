@@ -29,3 +29,4 @@ tracing-subscriber = { workspace = true }
 pingora = { workspace = true }
 rand = { workspace = true }
 subtle = "2.5"
+async-trait = "0.1"

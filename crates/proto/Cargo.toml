@@ -10,6 +10,15 @@ readme = "README.md"
 keywords = ["commucat", "ccp", "protocol"]
 categories = ["network-programming", "encoding"]
 
+[features]
+default = []
+obfuscation = [
+    "dep:rand",
+    "dep:blake3",
+]
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+rand = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }

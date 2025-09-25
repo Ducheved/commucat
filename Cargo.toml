@@ -34,3 +34,9 @@ tracing = { version = "0.1" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+hkdf = { version = "0.12" }
+sha3 = { version = "0.10" }
+ml-kem = { version = "0.3.0-pre" }
+kem = { version = "0.3.0-pre.0" }
+ml-dsa = { version = "0.1.0-rc.0", default-features = false, features = ["alloc", "rand_core"] }
+iana-time-zone = { version = "0.1.64", features = ["fallback"] }

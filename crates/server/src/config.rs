@@ -48,6 +48,17 @@ pub enum LedgerAdapter {
     Debug,
 }
 
+#[derive(Clone, Default)]
+pub struct TransportConfig {
+    pub reality: Option<RealitySettings>,
+}
+
+#[derive(Clone)]
+pub struct RealitySettings {
+    pub certificate_pem: String,
+    pub fingerprint: [u8; 32],
+}
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub bind: String,
@@ -69,6 +80,7 @@ pub struct ServerConfig {
     pub pairing_ttl_seconds: i64,
     pub max_auto_devices_per_user: i64,
     pub connection_keepalive: u64,
+    pub transport: TransportConfig,
 }
 
 /// Loads CommuCat server configuration from filesystem and environment overrides.
@@ -203,6 +215,27 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
     if max_auto_devices < 0 {
         return Err(ConfigError::Invalid);
     }
+    let reality_cert_path = override_env(
+        "COMMUCAT_REALITY_CERT",
+        map.remove("transport.reality_cert"),
+    )?;
+    let reality_fp_hex = override_env(
+        "COMMUCAT_REALITY_FINGERPRINT",
+        map.remove("transport.reality_fingerprint"),
+    )?;
+    let reality = match (reality_cert_path, reality_fp_hex) {
+        (Some(cert_path), Some(fp_hex)) => {
+            let certificate_pem = fs::read_to_string(&cert_path).map_err(|_| ConfigError::Io)?;
+            let fingerprint = decode_hex32(fp_hex.trim()).map_err(|_| ConfigError::Invalid)?;
+            Some(RealitySettings {
+                certificate_pem,
+                fingerprint,
+            })
+        }
+        (None, None) => None,
+        _ => return Err(ConfigError::Invalid),
+    };
+    let transport = TransportConfig { reality };
 
     Ok(ServerConfig {
         bind: required(bind)?,
@@ -227,6 +260,7 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         pairing_ttl_seconds: pairing_ttl,
         max_auto_devices_per_user: max_auto_devices,
         connection_keepalive: keepalive,
+        transport,
     })
 }
 
@@ -288,6 +322,7 @@ mod tests {
         assert_eq!(config.relay_ttl_seconds, 86400);
         assert_eq!(config.pairing_ttl_seconds, 300);
         assert_eq!(config.max_auto_devices_per_user, 1);
+        assert!(config.transport.reality.is_none());
         fs::remove_file(path).unwrap();
     }
 }

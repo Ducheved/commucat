@@ -1,5 +1,6 @@
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
+use crate::transport::{default_manager, Endpoint, RealityConfig, TransportManager};
 use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
 use blake3::hash as blake3_hash;
 use chrono::{Duration, Utc};
@@ -149,6 +150,7 @@ pub struct AppState {
     pub noise_public: [u8; 32],
     pub presence_ttl: i64,
     pub relay_ttl: i64,
+    pub transports: RwLock<TransportManager>,
 }
 
 pub struct ConnectionEntry {
@@ -323,6 +325,15 @@ impl CommuCatApp {
             }
         }
         let signer = EventSigner::new(&config.federation_seed);
+        let reality_cfg = config
+            .transport
+            .reality
+            .as_ref()
+            .map(|settings| RealityConfig {
+                certificate_pem: Arc::new(settings.certificate_pem.clone()),
+                fingerprint: settings.fingerprint,
+            });
+        let transports = default_manager(reality_cfg);
         let state = Arc::new(AppState {
             storage,
             ledger,
@@ -337,7 +348,42 @@ impl CommuCatApp {
             noise_public: config.noise_public,
             presence_ttl: config.presence_ttl_seconds,
             relay_ttl: config.relay_ttl_seconds,
+            transports: RwLock::new(transports),
             config,
+        });
+        let transport_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let cfg = &transport_state.config;
+            let (address, port) = cfg
+                .bind
+                .rsplit_once(':')
+                .and_then(|(host, port)| port.parse::<u16>().ok().map(|p| (host.to_string(), p)))
+                .unwrap_or_else(|| (cfg.bind.clone(), 443));
+            let reality = cfg
+                .transport
+                .reality
+                .as_ref()
+                .map(|settings| RealityConfig {
+                    certificate_pem: Arc::new(settings.certificate_pem.clone()),
+                    fingerprint: settings.fingerprint,
+                });
+            let endpoint = Endpoint {
+                address,
+                port,
+                server_name: Some(cfg.domain.clone()),
+                reality,
+            };
+            let mut manager = transport_state.transports.write().await;
+            let available = manager.list_transports();
+            info!(transports = ?available, "transport candidates prepared");
+            match manager.establish_connection(&endpoint).await {
+                Ok(session) => {
+                    info!(transport = ?session.transport, "transport bootstrap established");
+                }
+                Err(err) => {
+                    warn!(error = %err, "transport bootstrap failed");
+                }
+            }
         });
         let cleanup_state = Arc::clone(&state);
         tokio::spawn(async move {

@@ -119,6 +119,89 @@ If `max_auto_devices_per_user` is reached or `auto_approve_devices` is disabled,
 
 *Device key audit*: whenever a device is auto-approved or rotates a static key, the server records a row in `device_key_event` (event id, device id, public key, timestamp). Registrations that fail to persist this audit trail are rejected to prevent unauthenticated devices from joining silently.
 
+### Feature Flags and Capability Negotiation
+
+The wire format remains stable; advanced behaviour is gated behind Cargo features and runtime capability negotiation. Implementations advertise optional components through the `HELLO.capabilities` array. The initial set of extensions introduced in CCP-1.1 is:
+
+| Capability string | Compile-time feature | Purpose |
+|-------------------|----------------------|---------|
+| `pq-hybrid`       | `commucat-crypto/pq` | Activates post-quantum hybrid key establishment based on ML-KEM-768 and ML-DSA-65 |
+| `adaptive-obf`    | `commucat-proto/obfuscation` | Enables adaptive protocol polymorphism and DAITA/REALITY-style traffic shaping |
+
+Servers echo the subset they accept inside the second `AUTH` message (`accepted_capabilities`). If a peer advertises a capability that is not echoed back it MUST NOT be used on that connection.
+
+### Hybrid Key Establishment (`pq`)
+
+When both sides negotiate `pq-hybrid`, the Noise transport keys are immediately augmented with an ML-KEM-768 exchange and a deterministic ML-DSA signature bundle. The flow is layered on top of Noise:
+
+1. **Credential announcement** – the client appends a `pq_bundle` object to the first `HELLO` payload:
+   ```jsonc
+   {
+     "pq_bundle": {
+       "kem_public": "base64(mlkem768_public)",
+       "kem_ciphertext": null,
+       "signature_public": "base64(mldsa65_public)",
+       "one_time_keys": ["base64(mlkem768_public)"]
+     }
+   }
+   ```
+   The server caches the presented `kem_public` and Dilithium verifying key alongside classical Signed PreKey material.
+2. **Responder encapsulation** – when completing the Noise handshake, the server performs `encapsulate_hybrid()` using the advertised ML-KEM key and mixes the ML-KEM shared secret together with the classical X3DH result via `HKDF(Sha3-512)`. The ciphertext is delivered inside the `AUTH` payload:
+   ```jsonc
+   {
+     "pq_ciphertext": "base64(mlkem768_ciphertext)",
+     "pq_context": {
+       "kdf": "hkdf-sha3-512",
+       "salt": "base64(previous_root_key)",
+       "label": "commucat.hybrid.session.v1"
+     }
+   }
+   ```
+3. **Client confirmation** – the client executes `decapsulate_hybrid()` with its ML-KEM secret, derives the same 96 B of material (`root_key`, `sending_chain`, `receiving_chain`), and acknowledges by signing the negotiated transcript with ML-DSA-65. The signature is placed in the first encrypted `ACK` frame.
+
+The derived values feed a post-quantum hardened double ratchet (`HybridRatchet`). Re-key events use fresh one-time ML-KEM keys from the announced bundle, ensuring every ratchet step retains ML-KEM entropy in addition to classical X25519 material. Implementations MUST zeroise `HybridKeyMaterial` once the ratchet is advanced.
+
+### Adaptive Protocol Polymorphism (`adaptive-obf`)
+
+When `adaptive-obf` is negotiated, peers wrap every CCP frame in an `ObfuscatedPacket` prior to transport-mode encryption. The structure is intentionally protocol-agnostic:
+
+```text
+prefix_s1 || snapshot || frame_bytes || suffix_s2 || MAC16
+```
+
+* `prefix_s1` / `suffix_s2` – 0–64 B of pseudorandom padding sampled per packet. The length ranges are adjusted in real time by the policy engine to mimic burstiness or silence.
+* `snapshot` – a JSON-serialised [`ProtocolSnapshot`](crates/proto/src/obfuscation.rs) describing the decoy protocol (QUIC Initial, DNS Query, SIP INVITE, TLS 1.3 ClientHello/REALITY, or WebRTC data channel). Each snapshot embeds an AmnesiaWG signature salt and a DAITA v2 automaton state so that packet timing and byte distributions evolve probabilistically.
+* `frame_bytes` – the original CCP frame as produced by `Frame::encode()`.
+* `MAC16` – the first 16 bytes of `BLAKE3(key, prefix || snapshot || header || payload || suffix)`. The MAC key is derived via `ObfuscationKey::derive("commucat.obf", hkdf_root)` and rotates whenever the hybrid ratchet advances.
+
+Peers manage mimic selection through the `AdaptiveObfuscator` trait implementation. The default strategy weighs HTTPS/REALITY and QUIC during benign operation, pivots to DNS + SIP when DPI interference is detected, and boosts WebRTC when latency probes suggest consumer-grade NATs. MAC verification happens before decoding the inner frame; tampering yields a terminal `ERROR` frame with `title="IntegrityCheckFailed"`.
+
+Feature-flag builds keep the new machinery completely opt-in. Disabling `obfuscation` or `pq` reverts the handshake and transport pipeline back to the minimal CCP-1 flow described earlier.
+
+### Pluggable Transports (Phase 2)
+
+CommuCat nodes negotiate the outer transport independently from CCP-1. The server provisions a `TransportManager` that ranks transports based on historical success, assessed network quality, and detected censorship pressure. Each transport implements the `PluggableTransport` trait and publishes:
+
+* `handshake()` – establishes or simulates the outer tunnel and returns a `TransportSession` bound to the selected `TransportType`.
+* `detect_censorship()` – performs light-weight probes to update the current `CensorshipStatus`.
+* Static descriptors for `ResistanceLevel` and `PerformanceProfile` so the scheduler can reason about trade-offs.
+
+Default ranking favours REALITY/XRay (TLS mimicry with true certificates) and AmnesiaWG when the network is healthy, sliding toward QUIC MASQUE, WebSocket, and DNS tunnelling as conditions deteriorate. Tor onion routing remains the terminal fallback for hostile environments.
+
+#### REALITY provisioning
+
+Operators may supply REALITY material via the configuration file or environment:
+
+```toml
+[transport]
+reality_cert = "certs/reality.pem"
+reality_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+```
+
+The certificate is loaded verbatim and cached in-memory; the BLAKE3 fingerprint gates runtime presentation. When both values are set, the REALITY transport becomes available to clients advertising `adaptive-obf`. Missing or mismatched fingerprints disable REALITY while leaving the rest of the fallback chain intact.
+
+Runtime telemetry records the chosen transport per session so operators can spot throttling patterns and pre-emptively adjust the fallback chain if necessary.
+
 ## Routing Semantics
 
 * `channel_id` identifies the virtual channel. Clients must send a `JOIN` control frame before routing ciphertext on a new channel.

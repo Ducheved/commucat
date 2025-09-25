@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod metrics;
+mod transport;
 mod util;
 
 use app::CommuCatApp;

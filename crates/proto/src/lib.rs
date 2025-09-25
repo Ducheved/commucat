@@ -4,6 +4,17 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+#[cfg(feature = "obfuscation")]
+mod obfuscation;
+
+#[cfg(feature = "obfuscation")]
+pub use obfuscation::{
+    AdaptiveMimicPolicy, AdaptiveObfuscator, AmnesiaSignature, CensorshipSignal, DaitaProfile,
+    DnsPacketSnapshot, ObfuscatedPacket, ObfuscationError, ObfuscationKey, ProtocolFlavor,
+    ProtocolMimicry, ProtocolSnapshot, QuicHandshakeSnapshot, RealityTicket, SipMessageSnapshot,
+    SipMethod, TlsHandshakeSnapshot, WebRtcDataChannelSnapshot,
+};
+
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[u16] = &[PROTOCOL_VERSION];
 pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
