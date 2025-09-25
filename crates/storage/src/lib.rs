@@ -12,6 +12,7 @@ use tokio_postgres::{Client, NoTls};
 
 const INIT_SQL: &str = include_str!("../migrations/001_init.sql");
 const PAIRING_SQL: &str = include_str!("../migrations/002_pairing.sql");
+const USER_BLOB_SQL: &str = include_str!("../migrations/003_user_blob.sql");
 const PAIRING_MAX_ATTEMPTS: i32 = 5;
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -254,6 +255,10 @@ impl Storage {
         self.client
             .batch_execute(PAIRING_SQL)
             .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(USER_BLOB_SQL)
+            .await
             .map_err(|_| StorageError::Postgres)
     }
 
@@ -268,6 +273,42 @@ impl Storage {
             .query_async::<_, String>(&mut *conn)
             .await
             .map_err(|_| StorageError::Redis)?;
+        Ok(())
+    }
+
+    /// Reads a user-scoped blob entry.
+    pub async fn read_user_blob(
+        &self,
+        user_id: &str,
+        key: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT payload FROM user_blob WHERE user_id = $1 AND key = $2",
+                &[&user_id, &key],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(row.map(|row| row.get(0)))
+    }
+
+    /// Upserts a user-scoped blob entry.
+    pub async fn write_user_blob(
+        &self,
+        user_id: &str,
+        key: &str,
+        payload: &str,
+    ) -> Result<(), StorageError> {
+        let now = Utc::now();
+        self.client
+            .execute(
+                "INSERT INTO user_blob (user_id, key, payload, updated_at) VALUES ($1, $2, $3, $4)
+                ON CONFLICT (user_id, key) DO UPDATE SET payload = excluded.payload, updated_at = excluded.updated_at",
+                &[&user_id, &key, &payload, &now],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
         Ok(())
     }
 
@@ -1341,6 +1382,11 @@ mod tests {
             .map_err(|_| StorageError::Postgres)?;
         let purged = storage.invalidate_expired_pairings().await?;
         assert!(purged >= 1);
+        storage
+            .write_user_blob(&created.user_id, "friends", "[]")
+            .await?;
+        let blob = storage.read_user_blob(&created.user_id, "friends").await?;
+        assert_eq!(blob.as_deref(), Some("[]"));
         Ok(())
     }
 }

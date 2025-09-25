@@ -27,7 +27,7 @@ use pingora::protocols::http::v2::server::H2Options;
 use pingora::protocols::http::ServerSession;
 use pingora::server::ShutdownWatch;
 use rand::{rngs::OsRng, RngCore};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
@@ -46,6 +46,7 @@ use tokio::time::interval;
 use tracing::{error, info, warn};
 
 const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>CommuCat</title>\n<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0b1120;color:#f9fafb;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;}main{max-width:480px;text-align:center;padding:2rem;background:rgba(15,23,42,0.85);border-radius:20px;box-shadow:0 10px 30px rgba(15,23,42,0.4);}h1{font-size:2.25rem;margin-bottom:0.5rem;}p{margin:0.75rem 0;color:#cbd5f5;}a{color:#38bdf8;text-decoration:none;}a:hover{text-decoration:underline;}</style>\n</head>\n<body>\n<main>\n<h1>CommuCat Server</h1>\n<p>Secure Noise + TLS relay for CCP-1 chats.</p>\n<p><a href=\"https://github.com/ducheved/commucat\">Project documentation</a></p>\n<p><a href=\"/healthz\">Health</a> · <a href=\"/readyz\">Readiness</a></p>\n</main>\n</body>\n</html>\n";
+const FRIENDS_BLOB_KEY: &str = "friends";
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -182,6 +183,20 @@ pub struct ChannelRoute {
 pub struct PeerPresence {
     pub address: Option<String>,
     pub last_seen: chrono::DateTime<Utc>,
+}
+
+#[derive(Deserialize, Serialize, Clone)]
+struct FriendEntryPayload {
+    user_id: String,
+    #[serde(default)]
+    handle: Option<String>,
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct FriendsUpdateRequest {
+    friends: Vec<FriendEntryPayload>,
 }
 
 #[derive(Deserialize)]
@@ -490,6 +505,26 @@ impl CommuCatApp {
             }
             return None;
         }
+        if path == "/api/friends" && method == "GET" {
+            self.state.metrics.mark_ingress();
+            match self.handle_friends_get(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        if path == "/api/friends" && method == "PUT" {
+            self.state.metrics.mark_ingress();
+            match self.handle_friends_put(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
         if path == "/api/pair" && method == "POST" {
             self.state.metrics.mark_ingress();
             match self.handle_pair_create(&mut session).await {
@@ -572,6 +607,53 @@ impl CommuCatApp {
         });
         self.respond_json(session, 200, payload, "application/json")
             .await
+    }
+
+    async fn handle_friends_get(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+        let blob = self
+            .state
+            .storage
+            .read_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let friends = match blob {
+            Some(data) => serde_json::from_str::<Vec<FriendEntryPayload>>(&data)
+                .map_err(|_| ApiError::Internal)?,
+            None => Vec::new(),
+        };
+        let payload = json!({ "friends": friends });
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_friends_put(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+        let body = Self::read_body(session).await?;
+        let request = serde_json::from_slice::<FriendsUpdateRequest>(&body)
+            .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?;
+        if request.friends.len() > 512 {
+            return Err(ApiError::BadRequest("too many friends".to_string()));
+        }
+        let serialized = serde_json::to_string(&request.friends).map_err(|_| ApiError::Internal)?;
+        self.state
+            .storage
+            .write_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY, &serialized)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let payload = json!({
+            "friends": request.friends,
+        });
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
     }
 
     async fn handle_pair_create(
