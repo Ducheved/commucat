@@ -78,11 +78,7 @@ impl Metrics {
         let _ =
             self.call_sessions_active
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
-                    if value == 0 {
-                        None
-                    } else {
-                        Some(value - 1)
-                    }
+                    if value == 0 { None } else { Some(value - 1) }
                 });
     }
 

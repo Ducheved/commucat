@@ -1,6 +1,6 @@
 use crate::{MediaError, MediaResult};
 use audiopus::coder::{Decoder as OpusDecoder, Encoder as OpusEncoder};
-use audiopus::{packet::Packet, Application, Bitrate, Channels, MutSignals, SampleRate};
+use audiopus::{Application, Bitrate, Channels, MutSignals, SampleRate, packet::Packet};
 use std::convert::TryFrom;
 use std::time::Duration;
 

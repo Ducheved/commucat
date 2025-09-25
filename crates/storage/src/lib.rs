@@ -1,5 +1,5 @@
 use chrono::{DateTime, Duration, Utc};
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use serde_json::Value;
 use std::convert::TryInto;
 use std::error::Error;

@@ -18,9 +18,9 @@ pub use certificate::{DeviceCertificate, DeviceCertificateData};
 
 #[cfg(feature = "pq")]
 pub use pq::{
-    decapsulate_hybrid, encapsulate_hybrid, HybridInitiatorResult, HybridKeyMaterial,
-    HybridRatchet, HybridResponderResult, HybridSettings, PqKemKeyPair, PqSignatureKeyPair,
-    PqSignaturePublicKey, PqxdhBundle, SessionKeys, SessionRole,
+    HybridInitiatorResult, HybridKeyMaterial, HybridRatchet, HybridResponderResult, HybridSettings,
+    PqKemKeyPair, PqSignatureKeyPair, PqSignaturePublicKey, PqxdhBundle, SessionKeys, SessionRole,
+    decapsulate_hybrid, encapsulate_hybrid,
 };
 
 #[derive(Debug)]

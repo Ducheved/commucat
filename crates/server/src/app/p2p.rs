@@ -4,9 +4,9 @@ use crate::transport::{
     Endpoint, MultipathEndpoint, RaptorqDecoder, RealityConfig, ResistanceLevel, TransportType,
 };
 use crate::util::{decode_hex32, encode_hex};
-use commucat_crypto::{build_handshake, DeviceKeyPair, HandshakePattern, NoiseConfig, PqxdhBundle};
+use commucat_crypto::{DeviceKeyPair, HandshakePattern, NoiseConfig, PqxdhBundle, build_handshake};
 use ml_kem::EncodedSizeUser;
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;

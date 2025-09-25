@@ -2,40 +2,40 @@ mod p2p;
 
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
-use crate::transport::{default_manager, Endpoint, RealityConfig, TransportManager};
+use crate::transport::{Endpoint, RealityConfig, TransportManager, default_manager};
 use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
 use blake3::hash as blake3_hash;
 use chrono::{Duration, Utc};
 use commucat_crypto::zkp::{self, KnowledgeProof};
 use commucat_crypto::{
-    build_handshake, CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair,
-    EventSigner, HandshakePattern, NoiseConfig, NoiseHandshake,
+    CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair, EventSigner,
+    HandshakePattern, NoiseConfig, NoiseHandshake, build_handshake,
 };
-use commucat_federation::{sign_event, FederationError, FederationEvent};
+use commucat_federation::{FederationError, FederationEvent, sign_event};
 use commucat_ledger::{
     DebugLedgerAdapter, FileLedgerAdapter, LedgerAdapter as LedgerAdapterTrait, LedgerError,
     LedgerRecord, NullLedger,
 };
 use commucat_proto::{
+    ControlEnvelope, Frame, FramePayload, FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
     call::{
         CallAnswer as ProtoCallAnswer, CallEnd as ProtoCallEnd, CallEndReason, CallMediaDirection,
         CallMediaProfile, CallMode, CallOffer as ProtoCallOffer, CallRejectReason,
         CallStats as ProtoCallStats,
     },
-    is_supported_protocol_version, negotiate_protocol_version, ControlEnvelope, Frame,
-    FramePayload, FrameType, PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS,
+    is_supported_protocol_version, negotiate_protocol_version,
 };
 use commucat_storage::{
-    connect, ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
+    ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
     InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
-    StorageError, UserProfile,
+    StorageError, UserProfile, connect,
 };
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
-use pingora::protocols::http::v2::server::H2Options;
 use pingora::protocols::http::ServerSession;
+use pingora::protocols::http::v2::server::H2Options;
 use pingora::server::ShutdownWatch;
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -45,12 +45,12 @@ use std::fmt::{Display, Formatter};
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 use subtle::ConstantTimeEq;
 use tokio::select;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -942,10 +942,10 @@ impl CommuCatApp {
                 json!(encode_hex(&self.state.device_ca_public)),
             );
         }
-        if let Some(name) = request.device_name {
-            if let Some(obj) = response.as_object_mut() {
-                obj.insert("device_name".to_string(), json!(name));
-            }
+        if let Some(name) = request.device_name
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert("device_name".to_string(), json!(name));
         }
         self.respond_json(session, 200, response, "application/json")
             .await
@@ -1131,10 +1131,10 @@ impl CommuCatApp {
             "title": title,
             "status": status,
         });
-        if let Some(message) = detail {
-            if let Some(obj) = body.as_object_mut() {
-                obj.insert("detail".to_string(), json!(message));
-            }
+        if let Some(message) = detail
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("detail".to_string(), json!(message));
         }
         self.respond_json(session, status, body, "application/problem+json")
             .await
@@ -1200,10 +1200,10 @@ impl CommuCatApp {
                     .headers
                     .get("authorization")
                     .and_then(|value| value.to_str().ok());
-                if let Some(value) = header {
-                    if let Some(token) = value.trim().strip_prefix("Bearer ") {
-                        return bool::from(token.as_bytes().ct_eq(expected.as_bytes()));
-                    }
+                if let Some(value) = header
+                    && let Some(token) = value.trim().strip_prefix("Bearer ")
+                {
+                    return bool::from(token.as_bytes().ct_eq(expected.as_bytes()));
                 }
                 false
             }
@@ -1270,11 +1270,11 @@ impl CommuCatApp {
                                 "error": "handshake",
                                 "detail": err.to_string(),
                             });
-                            if matches!(err, ServerError::PairingRequired) {
-                                if let Some(obj) = properties.as_object_mut() {
-                                    obj.insert("title".to_string(), json!("PairingRequired"));
-                                    obj.insert("pairing_required".to_string(), json!(true));
-                                }
+                            if matches!(err, ServerError::PairingRequired)
+                                && let Some(obj) = properties.as_object_mut()
+                            {
+                                obj.insert("title".to_string(), json!("PairingRequired"));
+                                obj.insert("pairing_required".to_string(), json!(true));
                             }
                             let error_frame = Frame {
                                 channel_id: 0,
@@ -1707,16 +1707,16 @@ impl CommuCatApp {
                             if record.status != "active" {
                                 return Err(ServerError::Invalid);
                             }
-                            if let Some(provided) = &user_id_hint {
-                                if provided != &record.user_id {
-                                    return Err(ServerError::Invalid);
-                                }
+                            if let Some(provided) = &user_id_hint
+                                && provided != &record.user_id
+                            {
+                                return Err(ServerError::Invalid);
                             }
                             let profile = self.state.storage.load_user(&record.user_id).await?;
-                            if let Some(handle) = &handle_hint {
-                                if profile.handle != *handle {
-                                    return Err(ServerError::Invalid);
-                                }
+                            if let Some(handle) = &handle_hint
+                                && profile.handle != *handle
+                            {
+                                return Err(ServerError::Invalid);
                             }
                             if record.public_key != public_key_vec {
                                 let update = DeviceRecord {

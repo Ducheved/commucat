@@ -6,12 +6,12 @@ use ed25519_dalek::SigningKey;
 use hkdf::Hkdf;
 use kem::{Decapsulate, Encapsulate};
 use ml_dsa::{
+    B32, EncodedSignature, KeyGen, KeyPair as MlDsaKeyPair, MlDsa65, Signature as MlDsaSignature,
+    VerifyingKey,
     signature::{Signer, Verifier},
-    EncodedSignature, KeyGen, KeyPair as MlDsaKeyPair, MlDsa65, Signature as MlDsaSignature,
-    VerifyingKey, B32,
 };
-use ml_kem::{array::typenum::Unsigned, KemCore, MlKem768};
-use rand::{rngs::OsRng, CryptoRng, RngCore};
+use ml_kem::{KemCore, MlKem768, array::typenum::Unsigned};
+use rand::{CryptoRng, RngCore, rngs::OsRng};
 use sha3::Sha3_512;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -433,7 +433,7 @@ impl PqxdhBundle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{rngs::StdRng, SeedableRng};
+    use rand::{SeedableRng, rngs::StdRng};
 
     fn random_classical_secret(rng: &mut StdRng) -> [u8; CLASSICAL_SECRET_LEN] {
         let mut buffer = [0u8; CLASSICAL_SECRET_LEN];

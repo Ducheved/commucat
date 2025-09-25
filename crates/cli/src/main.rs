@@ -4,8 +4,8 @@ use commucat_crypto::{DeviceCertificateData, DeviceKeyPair, EventSigner};
 use commucat_ledger::{DebugLedgerAdapter, LedgerAdapter, LedgerRecord};
 use commucat_media::prelude::{CallMediaPipeline, PipelineConfig};
 use commucat_storage::{
-    connect, DeviceRecord, NewUserProfile, PresenceSnapshot, SessionRecord, Storage, StorageError,
-    UserProfile,
+    DeviceRecord, NewUserProfile, PresenceSnapshot, SessionRecord, Storage, StorageError,
+    UserProfile, connect,
 };
 use std::env;
 use std::fs::File;

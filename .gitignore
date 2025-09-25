@@ -36,3 +36,5 @@ certs/
 *.key
 *.pem
 
+# tools 
+.tools/

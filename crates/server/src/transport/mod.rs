@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
 use std::sync::Arc;
 use tokio::io::{self, AsyncRead, AsyncWrite, DuplexStream};
-use tokio::time::{sleep, timeout, Duration};
+use tokio::time::{Duration, sleep, timeout};
 use tracing::{debug, info, warn};
 
 pub use fec::{FecProfile, RaptorqDecoder, RaptorqEncoder};
@@ -630,10 +630,10 @@ impl PluggableTransport for RealityTransport {
         &self,
         ctx: &TransportContext<'_>,
     ) -> Result<TransportSession, TransportError> {
-        if let Some(reality) = &ctx.endpoint.reality {
-            if reality.fingerprint != self.fingerprint {
-                return Err(TransportError::NotSupported);
-            }
+        if let Some(reality) = &ctx.endpoint.reality
+            && reality.fingerprint != self.fingerprint
+        {
+            return Err(TransportError::NotSupported);
         }
         let cert_len = self.certificate.len();
         debug!(cert_len, "reality certificate available");

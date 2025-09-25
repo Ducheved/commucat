@@ -126,7 +126,7 @@ impl AudioCapture {
                 return Err(MediaError::InvalidConfig(match other {
                     SampleFormat::U8 => "u8 capture format unsupported",
                     _ => "unsupported capture sample format",
-                }))
+                }));
             }
         };
         let stream = stream_result

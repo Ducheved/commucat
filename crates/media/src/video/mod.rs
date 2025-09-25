@@ -347,7 +347,13 @@ unsafe fn copy_plane(
     for row in 0..height {
         let src_offset = row * src_stride;
         let dst_offset = row * dst_stride;
-        ptr::copy_nonoverlapping(src.as_ptr().add(src_offset), dst_ptr.add(dst_offset), width);
+        unsafe {
+            ptr::copy_nonoverlapping(
+                src.as_ptr().add(src_offset),
+                dst_ptr.add(dst_offset),
+                width,
+            );
+        }
     }
 }
 
@@ -360,7 +366,7 @@ unsafe fn copy_plane_into_vec(
 ) {
     for row in 0..height {
         let src_offset = row * stride;
-        let slice = slice::from_raw_parts(src_ptr.add(src_offset), width);
+        let slice = unsafe { slice::from_raw_parts(src_ptr.add(src_offset), width) };
         dst.extend_from_slice(slice);
     }
 }
