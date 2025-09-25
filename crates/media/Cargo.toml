@@ -6,7 +6,9 @@ description = "Audio and video media primitives for CommuCat calls"
 license = "MPL-2.0"
 homepage = "https://commucat.tech"
 repository = "https://github.com/ducheved/commucat"
-publish = false
+readme = "README.md"
+keywords = ["commucat", "media", "rtp", "audio", "video"]
+categories = ["multimedia::audio", "multimedia::video", "network-programming"]
 
 [features]
 default = ["audio", "pipeline"]
