@@ -1,6 +1,6 @@
 use blake3::Hasher;
-use chrono::Utc;
-use commucat_crypto::DeviceKeyPair;
+use chrono::{Duration, Utc};
+use commucat_crypto::{DeviceCertificateData, DeviceKeyPair, EventSigner};
 use commucat_ledger::{DebugLedgerAdapter, LedgerAdapter, LedgerRecord};
 use commucat_storage::{
     connect, DeviceRecord, NewUserProfile, PresenceSnapshot, SessionRecord, Storage, StorageError,
@@ -12,6 +12,8 @@ use std::io::Read;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::Builder;
 use tracing::info;
+
+const CERTIFICATE_VALIDITY_DAYS: i64 = 30;
 
 fn main() {
     let _ = dotenvy::dotenv();
@@ -129,6 +131,8 @@ async fn command_rotate_keys(args: Vec<String>) -> Result<(), String> {
             }
         }
     }
+    let ca_signer = load_certificate_signer()?;
+    let issuer_public = ca_signer.public_key();
     let device_id =
         device_id_arg.unwrap_or_else(|| format!("device-{}", Utc::now().timestamp_millis()));
     let seed = read_os_random()?;
@@ -145,30 +149,66 @@ async fn command_rotate_keys(args: Vec<String>) -> Result<(), String> {
     } else {
         return Err("specify --user <user_id> or --handle <handle>".to_string());
     };
+
+    let issued_at = Utc::now();
+    let expires_at = issued_at + Duration::days(CERTIFICATE_VALIDITY_DAYS);
+    let issued_at_ts = issued_at.timestamp();
+    let expires_at_ts = expires_at.timestamp();
+    let serial_source = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock before unix epoch".to_string())?;
+    let serial = (serial_source.as_nanos() & 0xffff_ffff_ffff_ffff) as u64;
+
     let record = DeviceRecord {
         device_id: device_id.clone(),
         user_id: user_id.clone(),
         public_key: keys.public.to_vec(),
         status: "active".to_string(),
-        created_at: Utc::now(),
+        created_at: issued_at,
     };
     storage
         .upsert_device(&record)
         .await
         .map_err(|err| format!("store failed: {}", err))?;
-    let signer = LedgerRecord {
+
+    let certificate_data = DeviceCertificateData::new(
+        serial,
+        user_id.clone(),
+        device_id.clone(),
+        keys.public,
+        issuer_public,
+        issued_at_ts,
+        expires_at_ts,
+    );
+    let certificate = ca_signer.sign_certificate(&certificate_data);
+    let certificate_json = serde_json::to_string(&certificate)
+        .map_err(|err| format!("certificate encode failed: {}", err))?;
+
+    let ledger_record = LedgerRecord {
         digest: keys.public,
-        recorded_at: Utc::now(),
-        metadata: serde_json::json!({"device": device_id, "user": user_id.clone()}),
+        recorded_at: issued_at,
+        metadata: serde_json::json!({
+            "device": device_id,
+            "user": user_id.clone(),
+            "action": "rotate",
+            "certificate_serial": serial,
+            "certificate_issued_at": issued_at_ts,
+            "certificate_expires_at": expires_at_ts,
+        }),
     };
     let ledger = DebugLedgerAdapter;
     ledger
-        .submit(&signer)
+        .submit(&ledger_record)
         .map_err(|err| format!("ledger failed: {}", err))?;
+
     println!("user_id={}", user_id);
     println!("device_id={}", record.device_id);
     println!("public_key={}", hex_string(&keys.public));
     println!("private_key={}", hex_string(&keys.private));
+    println!("issuer_public={}", hex_string(&issuer_public));
+    println!("certificate_serial={}", serial);
+    println!("certificate_expires_at={}", expires_at.to_rfc3339());
+    println!("certificate={}", certificate_json);
     Ok(())
 }
 
@@ -246,6 +286,15 @@ async fn storage_connect() -> Result<Storage, String> {
         .map_err(|err| format!("storage connect failed: {}", err))
 }
 
+fn load_certificate_signer() -> Result<EventSigner, String> {
+    let seed_hex = env::var("COMMUCAT_FEDERATION_SEED")
+        .map_err(|_| "COMMUCAT_FEDERATION_SEED not set".to_string())?;
+    let seed = decode_hex(&seed_hex)?;
+    let keys = DeviceKeyPair::from_seed(&seed)
+        .map_err(|err| format!("invalid federation seed: {}", err))?;
+    Ok(EventSigner::new(&keys))
+}
+
 fn read_os_random() -> Result<[u8; 32], String> {
     let mut file =
         File::open("/dev/urandom").map_err(|_| "unable to open /dev/urandom".to_string())?;
@@ -276,6 +325,31 @@ fn hex_string(data: &[u8; 32]) -> String {
         output.push(nibble(lo));
     }
     output
+}
+
+fn decode_hex(input: &str) -> Result<Vec<u8>, String> {
+    if input.len() % 2 != 0 {
+        return Err("hex string must have even length".to_string());
+    }
+    let mut output = Vec::with_capacity(input.len() / 2);
+    let bytes = input.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let hi = parse_hex_digit(bytes[idx])?;
+        let lo = parse_hex_digit(bytes[idx + 1])?;
+        output.push((hi << 4) | lo);
+        idx += 2;
+    }
+    Ok(output)
+}
+
+fn parse_hex_digit(value: u8) -> Result<u8, String> {
+    match value {
+        b'0'..=b'9' => Ok(value - b'0'),
+        b'a'..=b'f' => Ok(value - b'a' + 10),
+        b'A'..=b'F' => Ok(value - b'A' + 10),
+        _ => Err(format!("invalid hex digit: {}", value as char)),
+    }
 }
 
 fn nibble(value: u8) -> char {

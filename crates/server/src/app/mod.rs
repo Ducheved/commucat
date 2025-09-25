@@ -7,8 +7,8 @@ use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
 use blake3::hash as blake3_hash;
 use chrono::{Duration, Utc};
 use commucat_crypto::{
-    build_handshake, CryptoError, DeviceKeyPair, EventSigner, HandshakePattern, NoiseConfig,
-    NoiseHandshake,
+    build_handshake, CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair,
+    EventSigner, HandshakePattern, NoiseConfig, NoiseHandshake,
 };
 use commucat_federation::{sign_event, FederationError, FederationEvent};
 use commucat_ledger::{
@@ -21,8 +21,8 @@ use commucat_proto::{
 };
 use commucat_storage::{
     connect, ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
-    InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
-    StorageError, UserProfile,
+    InboxOffset, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage, StorageError,
+    UserProfile,
 };
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
@@ -50,6 +50,7 @@ use tracing::{error, info, warn};
 
 const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>CommuCat</title>\n<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0b1120;color:#f9fafb;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;}main{max-width:480px;text-align:center;padding:2rem;background:rgba(15,23,42,0.85);border-radius:20px;box-shadow:0 10px 30px rgba(15,23,42,0.4);}h1{font-size:2.25rem;margin-bottom:0.5rem;}p{margin:0.75rem 0;color:#cbd5f5;}a{color:#38bdf8;text-decoration:none;}a:hover{text-decoration:underline;}</style>\n</head>\n<body>\n<main>\n<h1>CommuCat Server</h1>\n<p>Secure Noise + TLS relay for CCP-1 chats.</p>\n<p><a href=\"https://github.com/ducheved/commucat\">Project documentation</a></p>\n<p><a href=\"/healthz\">Health</a> · <a href=\"/readyz\">Readiness</a></p>\n</main>\n</body>\n</html>\n";
 const FRIENDS_BLOB_KEY: &str = "friends";
+const DEVICE_CERT_MAX_SKEW: i64 = 300;
 
 #[derive(Debug)]
 pub enum ServerError {
@@ -148,6 +149,7 @@ pub struct AppState {
     pub allowed_peers: HashMap<String, PeerConfig>,
     pub dynamic_peers: RwLock<HashMap<String, PeerConfig>>,
     pub federation_signer: EventSigner,
+    pub device_ca_public: [u8; 32],
     pub noise_private: [u8; 32],
     pub noise_public: [u8; 32],
     pub presence_ttl: i64,
@@ -271,6 +273,7 @@ struct HandshakeContext {
     user_profile: Option<UserProfile>,
     handshake: Option<NoiseHandshake>,
     protocol_version: u16,
+    certificate: Option<DeviceCertificateData>,
 }
 
 pub struct CommuCatApp {
@@ -327,6 +330,7 @@ impl CommuCatApp {
             }
         }
         let signer = EventSigner::new(&config.federation_seed);
+        let device_ca_public = signer.public_key();
         let reality_cfg = config
             .transport
             .reality
@@ -346,6 +350,7 @@ impl CommuCatApp {
             allowed_peers,
             dynamic_peers: RwLock::new(dynamic_seed),
             federation_signer: signer,
+            device_ca_public,
             noise_private: config.noise_private,
             noise_public: config.noise_public,
             presence_ttl: config.presence_ttl_seconds,
@@ -1136,6 +1141,7 @@ impl CommuCatApp {
             user_profile: None,
             handshake: None,
             protocol_version: PROTOCOL_VERSION,
+            certificate: None,
         };
         let mut server_sequence = 1u64;
         let mut shutdown_rx = shutdown.clone();
@@ -1307,6 +1313,16 @@ impl CommuCatApp {
         });
         if let Some(obj) = ack_properties.as_object_mut() {
             obj.insert("pairing_required".to_string(), json!(pairing_required_flag));
+            if let Some(cert) = handshake.certificate.as_ref() {
+                obj.insert(
+                    "certificate".to_string(),
+                    json!({
+                        "serial": cert.serial,
+                        "issued_at": cert.issued_at,
+                        "expires_at": cert.expires_at,
+                    }),
+                );
+            }
         }
         let ack_frame = Frame {
             channel_id: 0,
@@ -1548,35 +1564,63 @@ impl CommuCatApp {
                     .and_then(|v| v.as_str())
                     .map(|v| v.to_string());
 
-                let mut ledger_action = None;
-                let user_id: String;
-                let mut user_profile: UserProfile;
+                let certificate_value = envelope
+                    .properties
+                    .get("certificate")
+                    .cloned()
+                    .ok_or(ServerError::Invalid)?;
+                let certificate: DeviceCertificate =
+                    serde_json::from_value(certificate_value).map_err(|_| ServerError::Invalid)?;
+                certificate
+                    .verify(&self.state.device_ca_public)
+                    .map_err(ServerError::from)?;
+                let certificate_data = certificate.data.clone();
+                if certificate_data.device_id != device_id {
+                    return Err(ServerError::Invalid);
+                }
+                if certificate_data.public_key != client_static {
+                    return Err(ServerError::Invalid);
+                }
+                if certificate_data.issued_at >= certificate_data.expires_at {
+                    return Err(ServerError::Invalid);
+                }
+                let now_ts = Utc::now().timestamp();
+                if certificate_data.expires_at <= now_ts {
+                    return Err(ServerError::Invalid);
+                }
+                if certificate_data.issued_at > now_ts + DEVICE_CERT_MAX_SKEW {
+                    return Err(ServerError::Invalid);
+                }
+                if let Some(provided) = &user_id_hint {
+                    if provided != &certificate_data.user_id {
+                        return Err(ServerError::Invalid);
+                    }
+                }
+
+                let user_id = certificate_data.user_id.clone();
+                let mut user_profile = self.state.storage.load_user(&user_id).await?;
+                if let Some(handle) = &handle_hint {
+                    if user_profile.handle != *handle {
+                        return Err(ServerError::Invalid);
+                    }
+                }
+
+                let public_key_vec = certificate_data.public_key.to_vec();
+                let mut ledger_action: Option<&'static str> = None;
 
                 match self.state.storage.load_device(&device_id).await {
                     Ok(record) => {
                         if record.status != "active" {
                             return Err(ServerError::Invalid);
                         }
-                        if let Some(provided) = &user_id_hint {
-                            if provided != &record.user_id {
-                                return Err(ServerError::Invalid);
-                            }
+                        if record.user_id != user_id {
+                            return Err(ServerError::Invalid);
                         }
-                        user_id = record.user_id.clone();
-                        user_profile = self.state.storage.load_user(&user_id).await?;
-                        if let Some(handle) = &handle_hint {
-                            if user_profile.handle != *handle {
-                                return Err(ServerError::Invalid);
-                            }
-                        }
-                        if record.public_key != client_static.to_vec() {
-                            if !self.state.config.auto_approve_devices {
-                                return Err(ServerError::Invalid);
-                            }
+                        if record.public_key != public_key_vec {
                             let update = DeviceRecord {
-                                device_id: device_id.clone(),
+                                device_id: record.device_id.clone(),
                                 user_id: record.user_id.clone(),
-                                public_key: client_static.to_vec(),
+                                public_key: public_key_vec.clone(),
                                 status: record.status.clone(),
                                 created_at: record.created_at,
                             };
@@ -1585,44 +1629,15 @@ impl CommuCatApp {
                         }
                     }
                     Err(StorageError::Missing) => {
-                        let (resolved_id, profile) = if let Some(provided) = &user_id_hint {
-                            let profile = self.state.storage.load_user(provided).await?;
-                            if let Some(handle) = &handle_hint {
-                                if profile.handle != *handle {
-                                    return Err(ServerError::Invalid);
-                                }
-                            }
-                            (profile.user_id.clone(), profile)
-                        } else if let Some(handle) = &handle_hint {
-                            match self.state.storage.load_user_by_handle(handle).await {
-                                Ok(profile) => (profile.user_id.clone(), profile),
-                                Err(StorageError::Missing) => {
-                                    let new_profile = NewUserProfile {
-                                        user_id: generate_id(handle),
-                                        handle: handle.clone(),
-                                        display_name: display_hint.clone(),
-                                        avatar_url: avatar_hint.clone(),
-                                    };
-                                    let profile =
-                                        self.state.storage.create_user(&new_profile).await?;
-                                    (profile.user_id.clone(), profile)
-                                }
-                                Err(err) => return Err(err.into()),
-                            }
-                        } else {
-                            return Err(ServerError::Invalid);
-                        };
-                        self.ensure_pairing_limit(&resolved_id).await?;
+                        self.ensure_pairing_limit(&user_id).await?;
                         let insert = DeviceRecord {
                             device_id: device_id.clone(),
-                            user_id: resolved_id.clone(),
-                            public_key: client_static.to_vec(),
+                            user_id: user_id.clone(),
+                            public_key: public_key_vec.clone(),
                             status: "active".to_string(),
                             created_at: Utc::now(),
                         };
                         self.state.storage.upsert_device(&insert).await?;
-                        user_id = resolved_id;
-                        user_profile = profile;
                         ledger_action = Some("register");
                     }
                     Err(err) => return Err(err.into()),
@@ -1656,7 +1671,7 @@ impl CommuCatApp {
                             recorded_at.timestamp_nanos_opt().unwrap_or_default()
                         )),
                         device_id: device_id.clone(),
-                        public_key: client_static.to_vec(),
+                        public_key: public_key_vec.clone(),
                         recorded_at,
                     };
                     self.state.storage.record_device_key_event(&event).await?;
@@ -1667,7 +1682,10 @@ impl CommuCatApp {
                             "device": device_id,
                             "user": user_id,
                             "action": action,
-                            "source": "auto-approve",
+                            "source": "certificate",
+                            "certificate_serial": certificate_data.serial,
+                            "certificate_issued_at": certificate_data.issued_at,
+                            "certificate_expires_at": certificate_data.expires_at,
                         }),
                     };
                     if let Err(err) = self.state.ledger.submit(&ledger_entry) {
@@ -1677,6 +1695,7 @@ impl CommuCatApp {
 
                 context.user_id = user_id.clone();
                 context.user_profile = Some(user_profile.clone());
+                context.certificate = Some(certificate_data);
 
                 let noise = NoiseConfig {
                     pattern,

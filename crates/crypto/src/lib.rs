@@ -7,8 +7,12 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
+mod certificate;
+
 #[cfg(feature = "pq")]
 mod pq;
+
+pub use certificate::{DeviceCertificate, DeviceCertificateData};
 
 #[cfg(feature = "pq")]
 pub use pq::{
@@ -205,9 +209,19 @@ impl EventSigner {
         Self { signing }
     }
 
-    /// Signs federation payloads with Ed25519.
+    /// Returns the Ed25519 public key of the signer.
+    pub fn public_key(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    /// Signs arbitrary payloads with Ed25519.
     pub fn sign(&self, payload: &[u8]) -> [u8; 64] {
         self.signing.sign(payload).to_bytes()
+    }
+
+    /// Signs a device certificate dataset.
+    pub fn sign_certificate(&self, data: &DeviceCertificateData) -> DeviceCertificate {
+        data.sign(self)
     }
 }
 
