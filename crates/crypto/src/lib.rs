@@ -1,11 +1,13 @@
 use blake3::Hasher;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use snow::params::NoiseParams;
 use snow::{Builder, HandshakeState, TransportState};
 use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 mod certificate;
 mod hex;
@@ -172,6 +174,21 @@ impl NoiseTransport {
     }
 }
 
+/// Generates a fresh Noise static key pair for the server.
+pub fn generate_noise_static_keypair() -> ([u8; 32], [u8; 32]) {
+    let mut rng = OsRng;
+    let private = StaticSecret::random_from_rng(&mut rng);
+    let public = X25519PublicKey::from(&private);
+    (private.to_bytes(), public.to_bytes())
+}
+
+/// Derives the Noise static public key from a private scalar.
+pub fn derive_noise_public_key(private: &[u8; 32]) -> [u8; 32] {
+    let secret = StaticSecret::from(*private);
+    let public = X25519PublicKey::from(&secret);
+    public.to_bytes()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeviceKeyPair {
     pub public: [u8; 32],
@@ -309,5 +326,21 @@ mod tests {
             public: keys.public,
         };
         verifier.verify(b"payload", &signature).unwrap();
+    }
+
+    #[test]
+    fn generated_noise_keypair_has_entropy() {
+        let (private, public) = generate_noise_static_keypair();
+        assert_eq!(private.len(), 32);
+        assert_eq!(public.len(), 32);
+        assert_ne!(private, [0u8; 32]);
+        assert_ne!(public, [0u8; 32]);
+    }
+
+    #[test]
+    fn derive_noise_public_matches_generation() {
+        let (private, public) = generate_noise_static_keypair();
+        let derived = derive_noise_public_key(&private);
+        assert_eq!(derived, public);
     }
 }

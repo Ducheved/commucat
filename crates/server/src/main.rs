@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod metrics;
+mod security;
 mod transport;
 mod util;
 

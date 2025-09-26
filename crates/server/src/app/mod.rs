@@ -2,6 +2,8 @@ mod p2p;
 
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
+use crate::security::limiter::{RateLimiter, RateScope};
+use crate::security::secrets::{NoiseKey, SecretManager};
 use crate::transport::{Endpoint, RealityConfig, TransportManager, default_manager};
 use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
 use blake3::hash as blake3_hash;
@@ -43,12 +45,12 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
-use subtle::ConstantTimeEq;
 use tokio::select;
 use tokio::sync::{RwLock, mpsc};
 use tokio::time::interval;
@@ -175,9 +177,9 @@ fn user_snapshot(profile: &UserProfile) -> serde_json::Value {
 
 pub struct AppState {
     pub config: ServerConfig,
-    pub storage: Storage,
+    pub storage: Arc<Storage>,
     pub ledger: Box<dyn LedgerAdapterTrait + Send + Sync>,
-    pub metrics: Metrics,
+    pub metrics: Arc<Metrics>,
     pub connections: RwLock<HashMap<String, ConnectionEntry>>,
     pub channel_routes: RwLock<HashMap<u64, ChannelRoute>>,
     pub call_sessions: RwLock<HashMap<String, CallSession>>,
@@ -186,10 +188,10 @@ pub struct AppState {
     pub dynamic_peers: RwLock<HashMap<String, PeerConfig>>,
     pub federation_signer: EventSigner,
     pub device_ca_public: [u8; 32],
-    pub noise_private: [u8; 32],
-    pub noise_public: [u8; 32],
     pub presence_ttl: i64,
     pub relay_ttl: i64,
+    pub secrets: Arc<SecretManager>,
+    pub rate_limits: Arc<RateLimiter>,
     pub transports: RwLock<TransportManager>,
 }
 
@@ -324,6 +326,7 @@ struct HandshakeContext {
     handshake: Option<NoiseHandshake>,
     protocol_version: u16,
     certificate: Option<DeviceCertificate>,
+    noise_key: Option<NoiseKey>,
 }
 
 pub struct CommuCatApp {
@@ -336,7 +339,7 @@ impl CommuCatApp {
     }
 
     pub async fn init(config: ServerConfig) -> Result<Arc<AppState>, ServerError> {
-        let storage = connect(&config.postgres_dsn, &config.redis_url).await?;
+        let storage = Arc::new(connect(&config.postgres_dsn, &config.redis_url).await?);
         let ledger: Box<dyn LedgerAdapterTrait + Send + Sync> = match config.ledger.adapter {
             LedgerAdapter::Null => Box::new(NullLedger),
             LedgerAdapter::Debug => Box::new(DebugLedgerAdapter),
@@ -347,6 +350,17 @@ impl CommuCatApp {
                 Box::new(adapter)
             }
         };
+        let metrics = Arc::new(Metrics::new());
+        let rate_limits = Arc::new(RateLimiter::new(&config.rate_limit));
+        let secrets = SecretManager::bootstrap(
+            Arc::clone(&storage),
+            Arc::clone(&metrics),
+            config.rotation.clone(),
+            config.noise_private,
+            config.noise_public,
+            config.admin_token.clone(),
+        )
+        .await?;
         let allowed_peers = config
             .peers
             .iter()
@@ -391,9 +405,9 @@ impl CommuCatApp {
             });
         let transports = default_manager(reality_cfg);
         let state = Arc::new(AppState {
-            storage,
+            storage: Arc::clone(&storage),
             ledger,
-            metrics: Metrics::new(),
+            metrics: Arc::clone(&metrics),
             connections: RwLock::new(HashMap::new()),
             channel_routes: RwLock::new(HashMap::new()),
             call_sessions: RwLock::new(HashMap::new()),
@@ -402,13 +416,14 @@ impl CommuCatApp {
             dynamic_peers: RwLock::new(dynamic_seed),
             federation_signer: signer,
             device_ca_public,
-            noise_private: config.noise_private,
-            noise_public: config.noise_public,
             presence_ttl: config.presence_ttl_seconds,
             relay_ttl: config.relay_ttl_seconds,
+            secrets: Arc::clone(&secrets),
+            rate_limits: Arc::clone(&rate_limits),
             transports: RwLock::new(transports),
             config,
         });
+        secrets.spawn();
         let transport_state = Arc::clone(&state);
         tokio::spawn(async move {
             let cfg = &transport_state.config;
@@ -501,6 +516,15 @@ impl CommuCatApp {
         }
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.to_string();
+        if path != "/connect" {
+            if let Some(retry_after) = self.check_rate_limit(&session, RateScope::Http).await {
+                self.state.metrics.mark_http_rate_limited();
+                if let Err(err) = self.respond_rate_limited(&mut session, retry_after).await {
+                    error!("rate limit response failed: {}", err);
+                }
+                return None;
+            }
+        }
         match path.as_str() {
             "/" | "/index.html" => {
                 self.state.metrics.mark_ingress();
@@ -562,7 +586,7 @@ impl CommuCatApp {
                 return None;
             }
             "/metrics" => {
-                if !self.authorize_admin(&session) {
+                if !self.authorize_admin(&session).await {
                     let mut response = ResponseHeader::build_no_case(401, None).ok()?;
                     response
                         .append_header("content-type", "application/problem+json")
@@ -640,6 +664,13 @@ impl CommuCatApp {
             return None;
         }
         if path == "/api/pair/claim" && method == "POST" {
+            if let Some(retry_after) = self.check_rate_limit(&session, RateScope::PairingClaim).await {
+                self.state.metrics.mark_http_rate_limited();
+                if let Err(err) = self.respond_rate_limited(&mut session, retry_after).await {
+                    error!("pairing claim rate limit response failed: {}", err);
+                }
+                return None;
+            }
             self.state.metrics.mark_ingress();
             match self.handle_pair_claim(&mut session).await {
                 Ok(()) => {}
@@ -771,9 +802,28 @@ impl CommuCatApp {
         self: &Arc<Self>,
         session: &mut ServerSession,
     ) -> Result<(), ServerError> {
+        let noise_catalog = self.state.secrets.noise_catalog().await;
+        let current_noise_hex = if let Some(first) = noise_catalog.first() {
+            encode_hex(&first.public)
+        } else {
+            encode_hex(&self.state.config.noise_public)
+        };
+        let noise_keys = noise_catalog
+            .iter()
+            .map(|key| {
+                json!({
+                    "version": key.version,
+                    "public": encode_hex(&key.public),
+                    "valid_after": key.valid_after.to_rfc3339(),
+                    "rotates_at": key.rotates_at.to_rfc3339(),
+                    "expires_at": key.expires_at.to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>();
         let payload = json!({
             "domain": self.state.config.domain,
-            "noise_public": encode_hex(&self.state.noise_public),
+            "noise_public": current_noise_hex,
+            "noise_keys": noise_keys,
             "device_ca_public": encode_hex(&self.state.device_ca_public),
             "supported_patterns": ["XK", "IK"],
             "supported_versions": SUPPORTED_PROTOCOL_VERSIONS,
@@ -1215,23 +1265,80 @@ impl CommuCatApp {
         Ok(body)
     }
 
-    fn authorize_admin(&self, session: &ServerSession) -> bool {
-        match self.state.config.admin_token.as_ref() {
-            None => true,
-            Some(expected) => {
-                let header = session
-                    .req_header()
-                    .headers
-                    .get("authorization")
-                    .and_then(|value| value.to_str().ok());
-                if let Some(value) = header
-                    && let Some(token) = value.trim().strip_prefix("Bearer ")
-                {
-                    return bool::from(token.as_bytes().ct_eq(expected.as_bytes()));
-                }
-                false
-            }
+    async fn authorize_admin(&self, session: &ServerSession) -> bool {
+        if !self.state.secrets.admin_token_required().await {
+            return true;
         }
+        let header = session
+            .req_header()
+            .headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok());
+        let bearer = match header {
+            Some(value) => value.trim(),
+            None => return false,
+        };
+        let token = bearer.strip_prefix("Bearer ").unwrap_or(bearer).trim();
+        if token.is_empty() {
+            return false;
+        }
+        let candidate = token.to_string();
+        self.state.secrets.verify_admin_token(&candidate).await
+    }
+
+    fn client_identity(session: &ServerSession) -> String {
+        session
+            .client_addr()
+            .and_then(|addr| addr.parse::<SocketAddr>().ok())
+            .map(|sock| sock.ip().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    async fn check_rate_limit(
+        &self,
+        session: &ServerSession,
+        scope: RateScope,
+    ) -> Option<StdDuration> {
+        let identity = Self::client_identity(session);
+        let decision = self.state.rate_limits.check(scope, &identity).await;
+        if decision.allowed {
+            None
+        } else {
+            Some(decision.retry_after.unwrap_or_else(|| StdDuration::from_secs(1)))
+        }
+    }
+
+    async fn respond_rate_limited(
+        &self,
+        session: &mut ServerSession,
+        retry_after: StdDuration,
+    ) -> Result<(), ServerError> {
+        let mut response =
+            ResponseHeader::build_no_case(429, None).map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("content-type", "application/problem+json")
+            .map_err(|_| ServerError::Invalid)?;
+        let retry_secs = retry_after.as_secs().max(1);
+        response
+            .append_header("retry-after", &retry_secs.to_string())
+            .map_err(|_| ServerError::Invalid)?;
+        session
+            .write_response_header(Box::new(response))
+            .await
+            .map_err(|_| ServerError::Io)?;
+        let body = json!({
+            "type": "about:blank",
+            "title": "Too Many Requests",
+            "status": 429,
+        })
+        .to_string();
+        session
+            .write_response_body(body.into_bytes().into(), true)
+            .await
+            .map_err(|_| ServerError::Io)?;
+        session.finish().await.map_err(|_| ServerError::Io)?;
+        self.state.metrics.mark_egress();
+        Ok(())
     }
 
     async fn process_connect(
@@ -1239,6 +1346,13 @@ impl CommuCatApp {
         mut session: ServerSession,
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
+        if let Some(retry_after) = self.check_rate_limit(&session, RateScope::Connect).await {
+            self.state.metrics.mark_connect_rate_limited();
+            if let Err(err) = self.respond_rate_limited(&mut session, retry_after).await {
+                error!("connect rate limit response failed: {}", err);
+            }
+            return None;
+        }
         let remote_addr = session.client_addr().map(|addr| addr.to_string());
         let mut response = ResponseHeader::build_no_case(200, None).ok()?;
         response
@@ -1420,6 +1534,24 @@ impl CommuCatApp {
         } else {
             false
         };
+        let noise_catalog = self.state.secrets.noise_catalog().await;
+        let noise_keys_payload = noise_catalog
+            .iter()
+            .map(|key| {
+                json!({
+                    "version": key.version,
+                    "public": encode_hex(&key.public),
+                    "valid_after": key.valid_after.to_rfc3339(),
+                    "rotates_at": key.rotates_at.to_rfc3339(),
+                    "expires_at": key.expires_at.to_rfc3339(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let current_noise_public = if let Some(noise_key) = context.noise_key.as_ref() {
+            encode_hex(&noise_key.public)
+        } else {
+            encode_hex(&self.state.config.noise_public)
+        };
         let mut ack_properties = json!({
             "handshake": "ok",
             "session": session_id.clone(),
@@ -1432,6 +1564,19 @@ impl CommuCatApp {
                 "device_ca_public".to_string(),
                 json!(encode_hex(&self.state.device_ca_public)),
             );
+            obj.insert("noise_public".to_string(), json!(current_noise_public));
+            if let Some(noise_key) = context.noise_key.as_ref() {
+                obj.insert("noise_key_version".to_string(), json!(noise_key.version));
+                obj.insert(
+                    "noise_rotates_at".to_string(),
+                    json!(noise_key.rotates_at.to_rfc3339()),
+                );
+                obj.insert(
+                    "noise_expires_at".to_string(),
+                    json!(noise_key.expires_at.to_rfc3339()),
+                );
+            }
+            obj.insert("noise_keys".to_string(), serde_json::Value::Array(noise_keys_payload));
             if let Some(cert) = handshake.certificate.as_ref() {
                 obj.insert(
                     "certificate".to_string(),
@@ -1691,6 +1836,29 @@ impl CommuCatApp {
                 zkp::verify_handshake(&device_public, &proof_context, &proof)
                     .map_err(|_| ServerError::Invalid)?;
                 context.device_public = device_public;
+                let prologue = self.state.config.prologue.clone();
+                let noise_candidates = self.state.secrets.active_noise_keys().await;
+                let mut selected_noise: Option<NoiseKey> = None;
+                let mut handshake_state_opt: Option<NoiseHandshake> = None;
+                for key in noise_candidates.iter() {
+                    let noise = NoiseConfig {
+                        pattern,
+                        prologue: prologue.clone(),
+                        local_private: key.private,
+                        local_static_public: Some(key.public),
+                        remote_static_public: Some(client_static),
+                    };
+                    if let Ok(mut candidate) = build_handshake(&noise, false) {
+                        if candidate.read_message(&handshake_bytes).is_ok() {
+                            handshake_state_opt = Some(candidate);
+                            selected_noise = Some(key.clone());
+                            break;
+                        }
+                    }
+                }
+                let mut handshake_state = handshake_state_opt.ok_or(ServerError::Invalid)?;
+                let selected_noise = selected_noise.ok_or(ServerError::Invalid)?;
+                context.noise_key = Some(selected_noise.clone());
                 let user_payload = envelope.properties.get("user").and_then(|v| v.as_object());
                 let user_id_hint = user_payload
                     .and_then(|map| map.get("id").or_else(|| map.get("user_id")))
@@ -1898,15 +2066,6 @@ impl CommuCatApp {
                 context.user_profile = Some(user_profile.clone());
                 context.certificate = Some(certificate.clone());
 
-                let noise = NoiseConfig {
-                    pattern,
-                    prologue: self.state.config.prologue.clone(),
-                    local_private: self.state.noise_private,
-                    local_static_public: Some(self.state.noise_public),
-                    remote_static_public: Some(client_static),
-                };
-                let mut handshake_state = build_handshake(&noise, false)?;
-                let _ = handshake_state.read_message(&handshake_bytes)?;
                 let session_id = generate_id(&device_id);
                 let user_payload = user_snapshot(&user_profile);
                 let payload = json!({
@@ -1928,7 +2087,7 @@ impl CommuCatApp {
                             "session": session_id,
                             "device_id": device_id.clone(),
                             "handshake": encode_hex(&response_bytes),
-                            "server_static": encode_hex(&self.state.noise_public),
+                            "server_static": encode_hex(&selected_noise.public),
                             "protocol_version": context.protocol_version,
                             "supported_versions": SUPPORTED_PROTOCOL_VERSIONS,
                         }),

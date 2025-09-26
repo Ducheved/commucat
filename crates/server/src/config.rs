@@ -6,6 +6,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::Path;
+use std::time::Duration as StdDuration;
 
 #[derive(Debug)]
 pub enum ConfigError {
@@ -59,6 +60,41 @@ pub struct RealitySettings {
     pub fingerprint: [u8; 32],
 }
 
+#[derive(Clone, Debug)]
+pub struct RateLimitSettings {
+    pub burst: u32,
+    pub window: StdDuration,
+    pub penalty: StdDuration,
+}
+
+#[derive(Clone, Debug)]
+pub struct RateLimitConfig {
+    pub http: RateLimitSettings,
+    pub connect: RateLimitSettings,
+    pub pairing_claim: RateLimitSettings,
+}
+
+#[derive(Clone, Debug)]
+pub struct NoiseRotationSettings {
+    pub interval: StdDuration,
+    pub grace: StdDuration,
+    pub max_versions: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdminRotationSettings {
+    pub enabled: bool,
+    pub interval: StdDuration,
+    pub grace: StdDuration,
+    pub max_versions: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct SecretRotationConfig {
+    pub noise: NoiseRotationSettings,
+    pub admin: AdminRotationSettings,
+}
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub bind: String,
@@ -80,6 +116,8 @@ pub struct ServerConfig {
     pub pairing_ttl_seconds: i64,
     pub max_auto_devices_per_user: i64,
     pub connection_keepalive: u64,
+    pub rate_limit: RateLimitConfig,
+    pub rotation: SecretRotationConfig,
     pub transport: TransportConfig,
 }
 
@@ -237,6 +275,175 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
     };
     let transport = TransportConfig { reality };
 
+    let rate_http_burst = parse_u32_field(
+        override_env(
+            "COMMUCAT_RATE_HTTP_BURST",
+            map.remove("security.rate_limit.http_burst"),
+        )?,
+        60,
+    )?;
+    let rate_http_window_ms = parse_u64_field(
+        override_env(
+            "COMMUCAT_RATE_HTTP_WINDOW_MS",
+            map.remove("security.rate_limit.http_window_ms"),
+        )?,
+        1_000,
+    )?;
+    let rate_http_penalty_ms = parse_u64_field(
+        override_env(
+            "COMMUCAT_RATE_HTTP_PENALTY_MS",
+            map.remove("security.rate_limit.http_penalty_ms"),
+        )?,
+        10_000,
+    )?;
+
+    let rate_connect_burst = parse_u32_field(
+        override_env(
+            "COMMUCAT_RATE_CONNECT_BURST",
+            map.remove("security.rate_limit.connect_burst"),
+        )?,
+        20,
+    )?;
+    let rate_connect_window_ms = parse_u64_field(
+        override_env(
+            "COMMUCAT_RATE_CONNECT_WINDOW_MS",
+            map.remove("security.rate_limit.connect_window_ms"),
+        )?,
+        1_000,
+    )?;
+    let rate_connect_penalty_ms = parse_u64_field(
+        override_env(
+            "COMMUCAT_RATE_CONNECT_PENALTY_MS",
+            map.remove("security.rate_limit.connect_penalty_ms"),
+        )?,
+        30_000,
+    )?;
+
+    let rate_pair_burst = parse_u32_field(
+        override_env(
+            "COMMUCAT_RATE_PAIRING_BURST",
+            map.remove("security.rate_limit.pairing_burst"),
+        )?,
+        5,
+    )?;
+    let rate_pair_window_ms = parse_u64_field(
+        override_env(
+            "COMMUCAT_RATE_PAIRING_WINDOW_MS",
+            map.remove("security.rate_limit.pairing_window_ms"),
+        )?,
+        60_000,
+    )?;
+    let rate_pair_penalty_ms = parse_u64_field(
+        override_env(
+            "COMMUCAT_RATE_PAIRING_PENALTY_MS",
+            map.remove("security.rate_limit.pairing_penalty_ms"),
+        )?,
+        120_000,
+    )?;
+
+    if rate_http_burst == 0
+        || rate_connect_burst == 0
+        || rate_pair_burst == 0
+        || rate_http_window_ms == 0
+        || rate_connect_window_ms == 0
+        || rate_pair_window_ms == 0
+    {
+        return Err(ConfigError::Invalid);
+    }
+
+    let rate_limit = RateLimitConfig {
+        http: RateLimitSettings {
+            burst: rate_http_burst,
+            window: StdDuration::from_millis(rate_http_window_ms),
+            penalty: StdDuration::from_millis(rate_http_penalty_ms),
+        },
+        connect: RateLimitSettings {
+            burst: rate_connect_burst,
+            window: StdDuration::from_millis(rate_connect_window_ms),
+            penalty: StdDuration::from_millis(rate_connect_penalty_ms),
+        },
+        pairing_claim: RateLimitSettings {
+            burst: rate_pair_burst,
+            window: StdDuration::from_millis(rate_pair_window_ms),
+            penalty: StdDuration::from_millis(rate_pair_penalty_ms),
+        },
+    };
+
+    let noise_interval_hours = parse_u64_field(
+        override_env(
+            "COMMUCAT_ROTATE_NOISE_INTERVAL_HOURS",
+            map.remove("security.rotation.noise_interval_hours"),
+        )?,
+        168,
+    )?;
+    let noise_grace_hours = parse_u64_field(
+        override_env(
+            "COMMUCAT_ROTATE_NOISE_GRACE_HOURS",
+            map.remove("security.rotation.noise_grace_hours"),
+        )?,
+        48,
+    )?;
+    let noise_max_versions = parse_usize_field(
+        override_env(
+            "COMMUCAT_ROTATE_NOISE_MAX_VERSIONS",
+            map.remove("security.rotation.noise_max_versions"),
+        )?,
+        3,
+    )?;
+
+    if noise_max_versions == 0 {
+        return Err(ConfigError::Invalid);
+    }
+
+    let admin_enabled_default = admin_token.is_some();
+    let admin_enabled = parse_bool_field(
+        override_env(
+            "COMMUCAT_ROTATE_ADMIN_ENABLED",
+            map.remove("security.rotation.admin_enabled"),
+        )?,
+        admin_enabled_default,
+    )?;
+
+    let admin_interval_hours = parse_u64_field(
+        override_env(
+            "COMMUCAT_ROTATE_ADMIN_INTERVAL_HOURS",
+            map.remove("security.rotation.admin_interval_hours"),
+        )?,
+        168,
+    )?;
+    let admin_grace_hours = parse_u64_field(
+        override_env(
+            "COMMUCAT_ROTATE_ADMIN_GRACE_HOURS",
+            map.remove("security.rotation.admin_grace_hours"),
+        )?,
+        72,
+    )?;
+    let admin_max_versions = parse_usize_field(
+        override_env(
+            "COMMUCAT_ROTATE_ADMIN_MAX_VERSIONS",
+            map.remove("security.rotation.admin_max_versions"),
+        )?,
+        2,
+    )?;
+
+    if admin_max_versions == 0 {
+        return Err(ConfigError::Invalid);
+    }
+
+    let rotation = SecretRotationConfig {
+        noise: NoiseRotationSettings {
+            interval: duration_from_hours(noise_interval_hours)?,
+            grace: duration_from_hours(noise_grace_hours)?,
+            max_versions: noise_max_versions,
+        },
+        admin: AdminRotationSettings {
+            enabled: admin_enabled,
+            interval: duration_from_hours(admin_interval_hours)?,
+            grace: duration_from_hours(admin_grace_hours)?,
+            max_versions: admin_max_versions,
+        },
+    };
+
     Ok(ServerConfig {
         bind: required(bind)?,
         tls_cert,
@@ -260,8 +467,45 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         pairing_ttl_seconds: pairing_ttl,
         max_auto_devices_per_user: max_auto_devices,
         connection_keepalive: keepalive,
+        rate_limit,
+        rotation,
         transport,
     })
+}
+
+fn parse_u32_field(value: Option<String>, default: u32) -> Result<u32, ConfigError> {
+    match value {
+        Some(raw) => raw.parse::<u32>().map_err(|_| ConfigError::Invalid),
+        None => Ok(default),
+    }
+}
+
+fn parse_u64_field(value: Option<String>, default: u64) -> Result<u64, ConfigError> {
+    match value {
+        Some(raw) => raw.parse::<u64>().map_err(|_| ConfigError::Invalid),
+        None => Ok(default),
+    }
+}
+
+fn parse_usize_field(value: Option<String>, default: usize) -> Result<usize, ConfigError> {
+    match value {
+        Some(raw) => raw.parse::<usize>().map_err(|_| ConfigError::Invalid),
+        None => Ok(default),
+    }
+}
+
+fn parse_bool_field(value: Option<String>, default: bool) -> Result<bool, ConfigError> {
+    match value {
+        Some(raw) => raw.parse::<bool>().map_err(|_| ConfigError::Invalid),
+        None => Ok(default),
+    }
+}
+
+fn duration_from_hours(hours: u64) -> Result<StdDuration, ConfigError> {
+    let seconds = hours
+        .checked_mul(3600)
+        .ok_or(ConfigError::Invalid)?;
+    Ok(StdDuration::from_secs(seconds))
 }
 
 fn override_env(key: &str, current: Option<String>) -> Result<Option<String>, ConfigError> {

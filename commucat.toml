@@ -48,6 +48,42 @@ relay_ttl = 86400
 # Pairing token lifetime (seconds)
 pairing_ttl = 300
 
+[security.rate_limit]
+# Burst size for generic HTTP endpoints
+http_burst = 60
+# Time window for generic HTTP rate limiting (milliseconds)
+http_window_ms = 1000
+# Penalty window when generic HTTP limit is exceeded (milliseconds)
+http_penalty_ms = 10000
+# Burst for Noise /connect handshakes
+connect_burst = 20
+# Time window for /connect rate limiting (milliseconds)
+connect_window_ms = 1000
+# Penalty window for /connect rate limiting (milliseconds)
+connect_penalty_ms = 30000
+# Burst for pairing claim attempts
+pairing_burst = 5
+# Time window for pairing claim rate limiting (milliseconds)
+pairing_window_ms = 60000
+# Penalty window for pairing claim rate limiting (milliseconds)
+pairing_penalty_ms = 120000
+
+[security.rotation]
+# Hours between automatic Noise static key rotations
+noise_interval_hours = 168
+# Grace hours to keep previous Noise key active
+noise_grace_hours = 48
+# Number of Noise key versions to keep active
+noise_max_versions = 3
+# Enable automatic rotation of admin token
+admin_enabled = true
+# Hours between administrative token rotations
+admin_interval_hours = 168
+# Grace hours for old administrative tokens
+admin_grace_hours = 72
+# Number of administrative tokens to keep active
+admin_max_versions = 2
+
 [admin]
 # Optional bearer token for /api/security-stats and /metrics
 token = "replace-with-secret"

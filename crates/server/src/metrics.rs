@@ -17,6 +17,10 @@ pub struct Metrics {
     call_sessions_total: AtomicU64,
     call_voice_frames: AtomicU64,
     call_video_frames: AtomicU64,
+    rate_limit_http: AtomicU64,
+    rate_limit_connect: AtomicU64,
+    noise_rotations: AtomicU64,
+    admin_rotations: AtomicU64,
 }
 
 impl Metrics {
@@ -90,6 +94,22 @@ impl Metrics {
         self.call_video_frames.fetch_add(1, Ordering::SeqCst);
     }
 
+    pub fn mark_http_rate_limited(&self) {
+        self.rate_limit_http.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn mark_connect_rate_limited(&self) {
+        self.rate_limit_connect.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn mark_noise_rotation(&self) {
+        self.noise_rotations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn mark_admin_rotation(&self) {
+        self.admin_rotations.fetch_add(1, Ordering::SeqCst);
+    }
+
     pub fn security_snapshot(&self) -> SecuritySnapshot {
         let sessions = self.multipath_sessions.load(Ordering::SeqCst);
         let paths_total = self.multipath_paths_total.load(Ordering::SeqCst);
@@ -109,7 +129,7 @@ impl Metrics {
 
     pub fn encode_prometheus(&self) -> String {
         format!(
-            "# TYPE commucat_connections_active gauge\ncommucat_connections_active {}\n# TYPE commucat_frames_ingress counter\ncommucat_frames_ingress {}\n# TYPE commucat_frames_egress counter\ncommucat_frames_egress {}\n# TYPE commucat_relay_enqueued counter\ncommucat_relay_enqueued {}\n# TYPE commucat_security_noise counter\ncommucat_security_noise {}\n# TYPE commucat_security_pq counter\ncommucat_security_pq {}\n# TYPE commucat_security_fec counter\ncommucat_security_fec_packets {}\n# TYPE commucat_multipath_sessions counter\ncommucat_multipath_sessions {}\n# TYPE commucat_multipath_paths gauge\ncommucat_multipath_paths {}\n# TYPE commucat_censorship_deflections counter\ncommucat_censorship_deflections {}\n# TYPE commucat_calls_active gauge\ncommucat_calls_active {}\n# TYPE commucat_calls_total counter\ncommucat_calls_total {}\n# TYPE commucat_call_voice_frames counter\ncommucat_call_voice_frames {}\n# TYPE commucat_call_video_frames counter\ncommucat_call_video_frames {}\n",
+            "# TYPE commucat_connections_active gauge\ncommucat_connections_active {}\n# TYPE commucat_frames_ingress counter\ncommucat_frames_ingress {}\n# TYPE commucat_frames_egress counter\ncommucat_frames_egress {}\n# TYPE commucat_relay_enqueued counter\ncommucat_relay_enqueued {}\n# TYPE commucat_security_noise counter\ncommucat_security_noise {}\n# TYPE commucat_security_pq counter\ncommucat_security_pq {}\n# TYPE commucat_security_fec counter\ncommucat_security_fec_packets {}\n# TYPE commucat_multipath_sessions counter\ncommucat_multipath_sessions {}\n# TYPE commucat_multipath_paths gauge\ncommucat_multipath_paths {}\n# TYPE commucat_censorship_deflections counter\ncommucat_censorship_deflections {}\n# TYPE commucat_calls_active gauge\ncommucat_calls_active {}\n# TYPE commucat_calls_total counter\ncommucat_calls_total {}\n# TYPE commucat_call_voice_frames counter\ncommucat_call_voice_frames {}\n# TYPE commucat_call_video_frames counter\ncommucat_call_video_frames {}\n# TYPE commucat_rate_limit_http counter\ncommucat_rate_limit_http {}\n# TYPE commucat_rate_limit_connect counter\ncommucat_rate_limit_connect {}\n# TYPE commucat_secret_rotations_noise counter\ncommucat_secret_rotations_noise {}\n# TYPE commucat_secret_rotations_admin counter\ncommucat_secret_rotations_admin {}\n",
             self.connections_active.load(Ordering::SeqCst),
             self.frames_ingress.load(Ordering::SeqCst),
             self.frames_egress.load(Ordering::SeqCst),
@@ -123,7 +143,11 @@ impl Metrics {
             self.call_sessions_active.load(Ordering::SeqCst),
             self.call_sessions_total.load(Ordering::SeqCst),
             self.call_voice_frames.load(Ordering::SeqCst),
-            self.call_video_frames.load(Ordering::SeqCst)
+            self.call_video_frames.load(Ordering::SeqCst),
+            self.rate_limit_http.load(Ordering::SeqCst),
+            self.rate_limit_connect.load(Ordering::SeqCst),
+            self.noise_rotations.load(Ordering::SeqCst),
+            self.admin_rotations.load(Ordering::SeqCst)
         )
     }
 }

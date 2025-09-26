@@ -13,6 +13,7 @@ use tokio_postgres::{Client, NoTls};
 const INIT_SQL: &str = include_str!("../migrations/001_init.sql");
 const PAIRING_SQL: &str = include_str!("../migrations/002_pairing.sql");
 const USER_BLOB_SQL: &str = include_str!("../migrations/003_user_blob.sql");
+const SERVER_SECRET_SQL: &str = include_str!("../migrations/004_server_secrets.sql");
 const PAIRING_MAX_ATTEMPTS: i32 = 5;
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -81,6 +82,19 @@ pub struct SessionRecord {
     pub tls_fingerprint: String,
     pub created_at: DateTime<Utc>,
     pub ttl_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerSecretRecord {
+    pub name: String,
+    pub version: i64,
+    pub secret: Vec<u8>,
+    pub public: Option<Vec<u8>>,
+    pub metadata: Value,
+    pub created_at: DateTime<Utc>,
+    pub valid_after: DateTime<Utc>,
+    pub rotates_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -300,7 +314,12 @@ impl Storage {
         self.client
             .batch_execute(USER_BLOB_SQL)
             .await
-            .map_err(|_| StorageError::Postgres)
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(SERVER_SECRET_SQL)
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
     }
 
     /// Executes lightweight probes across PostgreSQL and Redis.
@@ -351,6 +370,94 @@ impl Storage {
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(())
+    }
+
+    /// Inserts a server-scoped secret version.
+    pub async fn insert_server_secret(
+        &self,
+        record: &ServerSecretRecord,
+    ) -> Result<(), StorageError> {
+        let query = "INSERT INTO server_secret (name, version, secret, public, metadata, created_at, valid_after, rotates_at, expires_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)";
+        self.client
+            .execute(
+                query,
+                &[
+                    &record.name,
+                    &record.version,
+                    &record.secret,
+                    &record.public,
+                    &record.metadata,
+                    &record.created_at,
+                    &record.valid_after,
+                    &record.rotates_at,
+                    &record.expires_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Loads active secret material for a given name.
+    pub async fn active_server_secrets(
+        &self,
+        name: &str,
+        moment: DateTime<Utc>,
+    ) -> Result<Vec<ServerSecretRecord>, StorageError> {
+        let query = "SELECT name, version, secret, public, metadata, created_at, valid_after, rotates_at, expires_at
+            FROM server_secret
+            WHERE name = $1 AND valid_after <= $2 AND expires_at > $2
+            ORDER BY version DESC";
+        let rows = self
+            .client
+            .query(query, &[&name, &moment])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ServerSecretRecord {
+                name: row.get(0),
+                version: row.get(1),
+                secret: row.get(2),
+                public: row.get(3),
+                metadata: row.get(4),
+                created_at: row.get(5),
+                valid_after: row.get(6),
+                rotates_at: row.get(7),
+                expires_at: row.get(8),
+            })
+            .collect())
+    }
+
+    /// Returns the most recent version number for a secret name.
+    pub async fn latest_server_secret_version(&self, name: &str) -> Result<i64, StorageError> {
+        let row = self
+            .client
+            .query_one(
+                "SELECT COALESCE(MAX(version), 0) FROM server_secret WHERE name = $1",
+                &[&name],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(row.get(0))
+    }
+
+    /// Deletes expired secret versions.
+    pub async fn delete_expired_server_secrets(
+        &self,
+        name: &str,
+        threshold: DateTime<Utc>,
+    ) -> Result<u64, StorageError> {
+        let affected = self
+            .client
+            .execute(
+                "DELETE FROM server_secret WHERE name = $1 AND expires_at <= $2",
+                &[&name, &threshold],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(affected)
     }
 
     /// Creates a short-lived pairing code bound to an issuer device.
@@ -1248,6 +1355,7 @@ fn generate_pair_code() -> String {
 mod tests {
     use super::*;
     use chrono::{Duration, Utc};
+    use serde_json::json;
     use std::str::FromStr;
 
     #[test]
@@ -1442,6 +1550,35 @@ mod tests {
             .await?;
         let blob = storage.read_user_blob(&created.user_id, "friends").await?;
         assert_eq!(blob.as_deref(), Some("[]"));
+
+        let secret_name = format!("noise-static-{}", suffix);
+        let now = Utc::now();
+        let secret_record = ServerSecretRecord {
+            name: secret_name.clone(),
+            version: 1,
+            secret: vec![9u8; 32],
+            public: Some(vec![8u8; 32]),
+            metadata: json!({"purpose": "test"}),
+            created_at: now,
+            valid_after: now,
+            rotates_at: now + Duration::hours(1),
+            expires_at: now + Duration::hours(2),
+        };
+        storage.insert_server_secret(&secret_record).await?;
+        let latest = storage
+            .latest_server_secret_version(&secret_name)
+            .await?;
+        assert_eq!(latest, 1);
+        let active = storage
+            .active_server_secrets(&secret_name, now + Duration::minutes(30))
+            .await?;
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].public.as_ref().map(|v| v.len()), Some(32));
+        assert_eq!(active[0].metadata["purpose"], json!("test"));
+        let removed = storage
+            .delete_expired_server_secrets(&secret_name, now + Duration::hours(3))
+            .await?;
+        assert_eq!(removed, 1);
         Ok(())
     }
 }
