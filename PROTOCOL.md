@@ -2,6 +2,8 @@
 
 CCP-1 (CommuCat Protocol v1) is a binary framing protocol transported over a duplex HTTP/2 or HTTP/1.1 (chunked) stream that is upgraded at `/connect`. The tunnel is TLS 1.3, with an application-layer Noise handshake layered on top of the HTTP stream to deliver forward secrecy. Frames are encrypted end-to-end by the clients; the server forwards ciphertext without access to content.
 
+> **Implementation status (октябрь 2024):** базовый фрейминг, Noise-туннель и ACK-и реализованы. Сервер умеет кодировать RAW PCM/I420 в Opus/VP8, но микширования, адаптивного битрейта, FEC/multipath, PQ-гибрида, обфускации и плагиуемых транспортов по-прежнему нет.
+
 ## Transport
 
 * **Upgrade endpoint**: `POST /connect`
@@ -75,6 +77,8 @@ CCP-1 encodes integers in little-endian base-128 with continuation bit (`0x80`).
 
 Real-time calls are negotiated with the trio of `CALL_OFFER`, `CALL_ANSWER`, and `CALL_END` control frames. Media content is transmitted over the existing encrypted tunnel using `VOICE_FRAME` (Opus audio) and `VIDEO_FRAME` (VP8 video) frames. Each media frame inherits the channel membership of the negotiated call and is acknowledged with a regular `ACK` carrying `{"call_id": ...}`.
 
+> **Implementation note:** сервер хранит state звонка, при необходимости перекодирует RAW→Opus/VP8, но не выполняет renegotiation по полям `available_codecs`/`selected_*`, не микширует и не управляет качеством.
+
 ### Call Offer (`CALL_OFFER`)
 
 ```jsonc
@@ -89,16 +93,36 @@ Real-time calls are negotiated with the trio of `CALL_OFFER`, `CALL_ANSWER`, and
       "sample_rate": 48000,
       "channels": 1,
       "fec": true,
-      "dtx": true
+      "dtx": true,
+      "source": "raw",
+      "available_codecs": [
+        { "codec": "opus", "bitrate": 32000, "sample_rate": 48000, "channels": 1, "priority": 120 },
+        { "codec": "raw_pcm", "bitrate": 1536000, "sample_rate": 48000, "channels": 2, "priority": 60 }
+      ],
+      "allow_passthrough": true
     },
     "video": {
       "codec": "vp8",
       "max_bitrate": 500000,
       "max_resolution": { "width": 640, "height": 360 },
       "frame_rate": 24,
-      "adaptive": true
+      "adaptive": true,
+      "source": "raw",
+      "available_codecs": [
+        { "codec": "vp8", "max_bitrate": 500000, "max_resolution": { "width": 1280, "height": 720 }, "frame_rate": 30, "priority": 110 },
+        { "codec": "h264_baseline", "max_bitrate": 1000000, "max_resolution": { "width": 1280, "height": 720 }, "frame_rate": 30, "priority": 80 }
+      ],
+      "hardware": ["cpu"],
+      "allow_passthrough": true,
+      "capabilities": null
     },
-    "mode": "full_duplex" // or "half_duplex" for push-to-talk
+    "mode": "full_duplex",
+    "capabilities": {
+      "audio": [ { "codec": "opus" } ],
+      "video": [ { "codec": "vp8" } ],
+      "allow_raw_audio": true,
+      "allow_raw_video": true
+    }
   },
   "transport": {
     "prefer_relay": true,
@@ -113,7 +137,7 @@ Real-time calls are negotiated with the trio of `CALL_OFFER`, `CALL_ANSWER`, and
 }
 ```
 
-The offer describes the requested codecs and duplex mode. Implementations should fall back to audio-only if the callee cannot satisfy the proposed video profile. `transport` hints are advisory; the initial release always relays through the server.
+The offer describes the requested codecs and duplex mode. Implementation today only persists this blob; сервер не валидирует и не подбирает профили. Клиентам требуется самим договориться о конкретном наборе кодеков и поставлять уже закодированные кадры. `transport` hints остаются advisory: все вызовы проходят через серверный relay.
 
 ### Call Answer (`CALL_ANSWER`)
 
@@ -122,16 +146,21 @@ The offer describes the requested codecs and duplex mode. Implementations should
   "call_id": "uuid-v4",
   "accept": true,
   "media": {
-    "audio": { "bitrate": 12000, "codec": "opus", "sample_rate": 48000, "channels": 1, "fec": true, "dtx": true },
+    "audio": { "bitrate": 12000, "codec": "opus", "sample_rate": 48000, "channels": 1, "fec": true, "dtx": true, "source": "encoded" },
     "video": null,
     "mode": "full_duplex"
   },
+  "selected_audio_codec": "opus",
+  "selected_video_codec": null,
+  "audio_source": "encoded",
+  "video_source": null,
+  "video_hardware": null,
   "reason": null,
   "metadata": {}
 }
 ```
 
-Declining a call sets `accept` to `false` and includes a `reason` of `"busy"`, `"decline"`, `"unsupported"`, `"timeout"`, or `"error"`. When both parties accept, media transmission may begin immediately. The server acknowledges each offer and answer with an `ACK` that mirrors `call_id` and the inbound sequence.
+Declining a call sets `accept` to `false` and includes a `reason` of `"busy"`, `"decline"`, `"unsupported"`, `"timeout"`, or `"error"`. Сегодня сервер лишь отмечает факт ответа и ретранслирует кадр; поля `selected_*` не участвуют в автоматическом renegotiation. When both parties accept, media transmission may begin immediately. The server acknowledges each offer and answer with an `ACK` that mirrors `call_id` and the inbound sequence.
 
 ### Call Termination (`CALL_END`)
 
@@ -139,12 +168,28 @@ Call teardown frames include the `call_id` and a reason string (`"hangup"`, `"ca
 
 ### Media Frames
 
+Every `VOICE_FRAME`/`VIDEO_FRAME` payload uses a lightweight binary header:
+
+```
++---------+---------+---------+--------------------
+| byte 0  | byte 1  | byte 2  | payload bytes ...
++---------+---------+---------+--------------------
+| version | source  | codec   | media data
+```
+
+* `version` — текущая версия (`1`).
+* `source` — `MediaSourceMode` (`0=encoded`, `1=raw`, `2=hybrid`).
+* `codec` — `AudioCodec` или `VideoCodec` (Opus/RawPCM, VP8/RawI420 и т.д.).
+* `payload` — для RAW-аудио это PCM little-endian (`i16`) на 20 мс, для RAW-видео — I420 (Y plane, затем U/V) с размерами из профиля звонка.
+
+На сервере RAW-пакеты кодируются в Opus/VP8; уже закодированные кадры транзитом пересылаются дальше.
+
 * `VOICE_FRAME` payloads contain a single Opus packet produced with the negotiated parameters (default: 20 ms, mono, 16 kbps, FEC enabled). Frames inherit the channel identifier of the call and are sequenced just like `MSG` frames to drive jitter buffers.
-* `VIDEO_FRAME` payloads carry either a full VP8 frame or a deterministic fragment. Large frames SHOULD be split into MTU-sized chunks before encryption. The client reconstructs full images using the `frame.sequence` field.
+* `VIDEO_FRAME` payloads carry either a full VP8 frame or a deterministic fragment. Large frames SHOULD be split into MTU-sized chunks before encryption. Server-side chunking/aggregation отсутствует — клиентам нужно самим управлять нарезкой и сборкой.
 
 ### Quality Reporting (`CALL_STATS`)
 
-Participants may periodically emit quality telemetry to help peers adapt their bitrate:
+Participants may periodically emit quality telemetry to help peers adapt their bitrate. На стороне сервера счётчики обновляются, но никакой автоматической обратной связи клиентам не отправляется.
 
 ```jsonc
 {
@@ -245,7 +290,9 @@ Servers echo the subset they accept inside the second `AUTH` message (`accepted_
 
 ### Hybrid Key Establishment (`pq`)
 
-When both sides negotiate `pq-hybrid`, the Noise transport keys are immediately augmented with an ML-KEM-768 exchange and a deterministic ML-DSA signature bundle. The flow is layered on top of Noise:
+When both sides negotiate `pq-hybrid`, the Noise transport keys are immediately augmented with an ML-KEM-768 exchange and a deterministic ML-DSA signature bundle. The flow is layered on top of Noise.
+
+> **Implementation note:** на текущий момент `pq-hybrid` поддерживается только в `/api/p2p/assist`; основной HTTP-туннель игнорирует capability и не выполняет описанный ниже обмен.
 
 ```mermaid
 sequenceDiagram
@@ -287,6 +334,8 @@ sequenceDiagram
 
 CommuCat tunnels shard payloads across concurrent transports to raise resistance against active interference and link degradation.
 
+> **Implementation note:** описанный механизм пока не активирован; библиотека RaptorQ используется только для расчётов в `/api/p2p/assist`, сами кадры идут по одному пути.
+
 * **Codec**: each plaintext frame is segmented by a RaptorQ encoder (`mtu` defaults to 1,152 bytes) and produces both systematic symbols and repair packets. The repair overhead can be advertised by the assisting endpoint and defaults to 35% of the source symbols.
 * **Dispatch**: systematic symbols are striped across every active path in round-robin order. Repair symbols are biased towards non-primary paths so that censored primaries still recover with high probability.
 * **Recovery**: receivers reconstruct frames by feeding any combination of systematic/repair packets into a RaptorQ decoder until the original payload surfaces. Packet metadata (`ObjectTransmissionInformation`) is attached to the envelope so every path can decode independently.
@@ -294,7 +343,9 @@ CommuCat tunnels shard payloads across concurrent transports to raise resistance
 
 ## Multipath P2P Assistance
 
-`POST /api/p2p/assist` returns transport recommendations and ephemeral cryptographic material that two peers can use to bootstrap a direct tunnel:
+`POST /api/p2p/assist` returns transport recommendations and ephemeral cryptographic material that two peers can use to bootstrap a direct tunnel.
+
+> **Implementation note:** возвращаемые transport-профили соответствуют заглушкам; фактическая реализация hole punching/tor/Reality остаётся на клиентах.
 
 ```jsonc
 {
@@ -352,7 +403,9 @@ The derived values feed a post-quantum hardened double ratchet (`HybridRatchet`)
 
 ### Adaptive Protocol Polymorphism (`adaptive-obf`)
 
-When `adaptive-obf` is negotiated, peers wrap every CCP frame in an `ObfuscatedPacket` prior to transport-mode encryption. The structure is intentionally protocol-agnostic:
+When `adaptive-obf` is negotiated, peers wrap every CCP frame in an `ObfuscatedPacket` prior to transport-mode encryption. The structure is intentionally protocol-agnostic.
+
+> **Implementation note:** сервер пока не включает обфускацию даже при сборке с фичей `obfuscation`; описанный ниже формат отражает планируемое поведение.
 
 ```text
 prefix_s1 || snapshot || frame_bytes || suffix_s2 || MAC16
@@ -370,12 +423,15 @@ Feature-flag builds keep the new machinery completely opt-in. Disabling `obfusca
 ### Compliance & Known Limitations
 - REST API не содержит встроенного rate-limiting; рекомендуется внешний firewall или reverse-proxy throttling.
 - Zero-knowledge proofs упоминаются в дорожной карте, но пока не реализованы.
-- Обфускация и PQ опциональны и должны быть согласованно включены на обеих сторонах.
+- Обфускация и PQ опциональны и должны быть согласованно включены на обеих сторонах; текущая сборка их не включает.
+- Сервер не использует `crates/media`: клиенты обязаны присылать уже закодированное Opus/VP8, а перечисленные в сигнализации альтернативы (AV1/H264, GPU) недоступны.
 - Управление долговременными секретами (Noise static, federation seed) выполняется вручную (`commucat-cli rotate-keys`) и внешними secret stores; автоматической ротации нет.
 
 ### Pluggable Transports (Phase 2)
 
 CommuCat nodes negotiate the outer transport independently from CCP-1. The server provisions a `TransportManager` that ranks transports based on historical success, assessed network quality, and detected censorship pressure. Each transport implements the `PluggableTransport` trait and publishes:
+
+> **Implementation note:** текущие реализации `Reality`, `AmnesiaWG`, `Shadowsocks`, `Onion` — лишь заглушки на `tokio::io::duplex` и не производят реальных подключений.
 
 * `handshake()` – establishes or simulates the outer tunnel and returns a `TransportSession` bound to the selected `TransportType`.
 * `detect_censorship()` – performs light-weight probes to update the current `CensorshipStatus`.

@@ -1,5 +1,7 @@
+mod media;
 mod p2p;
 
+use self::media::{CallMediaTranscoder, SharedCallMediaTranscoder};
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
 use crate::security::limiter::{RateLimiter, RateScope};
@@ -51,7 +53,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
 use tokio::select;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
@@ -182,6 +184,7 @@ pub struct AppState {
     pub connections: RwLock<HashMap<String, ConnectionEntry>>,
     pub channel_routes: RwLock<HashMap<u64, ChannelRoute>>,
     pub call_sessions: RwLock<HashMap<String, CallSession>>,
+    pub media_transcoders: RwLock<HashMap<String, SharedCallMediaTranscoder>>,
     pub peer_sessions: RwLock<HashMap<String, PeerPresence>>,
     pub allowed_peers: HashMap<String, PeerConfig>,
     pub dynamic_peers: RwLock<HashMap<String, PeerConfig>>,
@@ -410,6 +413,7 @@ impl CommuCatApp {
             connections: RwLock::new(HashMap::new()),
             channel_routes: RwLock::new(HashMap::new()),
             call_sessions: RwLock::new(HashMap::new()),
+            media_transcoders: RwLock::new(HashMap::new()),
             peer_sessions: RwLock::new(HashMap::new()),
             allowed_peers,
             dynamic_peers: RwLock::new(dynamic_seed),
@@ -2232,6 +2236,8 @@ impl CommuCatApp {
         };
         sessions.insert(offer.call_id.clone(), session);
         drop(sessions);
+        self.ensure_call_transcoder(&offer.call_id, &offer.media)
+            .await?;
         self.state.metrics.mark_call_started();
         let participant_list: Vec<String> = participants.iter().cloned().collect();
         self.emit_call_event(
@@ -2246,6 +2252,38 @@ impl CommuCatApp {
             }),
         );
         Ok(())
+    }
+
+    async fn ensure_call_transcoder(
+        &self,
+        call_id: &str,
+        profile: &CallMediaProfile,
+    ) -> Result<(), ServerError> {
+        let transcoder = CallMediaTranscoder::new(profile)?;
+        let mut guard = self.state.media_transcoders.write().await;
+        guard.insert(call_id.to_string(), Arc::new(Mutex::new(transcoder)));
+        Ok(())
+    }
+
+    async fn update_call_transcoder(&self, call_id: &str, profile: &CallMediaProfile) {
+        if let Some(handle) = self
+            .state
+            .media_transcoders
+            .read()
+            .await
+            .get(call_id)
+            .cloned()
+        {
+            let mut guard = handle.lock().await;
+            if let Err(err) = guard.update_profile(profile) {
+                warn!(call = %call_id, error = %err, "failed to update call media profile");
+            }
+        }
+    }
+
+    async fn remove_call_transcoder(&self, call_id: &str) {
+        let mut guard = self.state.media_transcoders.write().await;
+        guard.remove(call_id);
     }
 
     async fn apply_call_answer(
@@ -2265,6 +2303,7 @@ impl CommuCatApp {
         if !answer.accept {
             sessions.remove(&call_id);
             drop(sessions);
+            self.remove_call_transcoder(&call_id).await;
             self.state.metrics.mark_call_ended();
             let reason = answer.reason.map(Self::call_reject_reason_label);
             self.emit_call_event(
@@ -2282,10 +2321,13 @@ impl CommuCatApp {
         if let Some(profile) = &answer.media {
             session.media = profile.clone();
         }
-        let mode = session.media.mode;
-        let video = session.media.video.is_some();
+        let updated_profile = session.media.clone();
+        let mode = updated_profile.mode;
+        let video = updated_profile.video.is_some();
         let accepted = session.accepted.len();
         drop(sessions);
+        self.update_call_transcoder(&call_id, &updated_profile)
+            .await;
         self.emit_call_event(
             &call_id,
             "answer",
@@ -2313,6 +2355,7 @@ impl CommuCatApp {
         let initiator = session.initiator.clone();
         sessions.remove(&end.call_id);
         drop(sessions);
+        self.remove_call_transcoder(&end.call_id).await;
         self.state.metrics.mark_call_ended();
         let duration = (Utc::now() - started).num_seconds().max(0);
         self.emit_call_event(
@@ -2343,6 +2386,64 @@ impl CommuCatApp {
         session.last_update = Utc::now();
         session.stats.insert(device_id.to_string(), stats.clone());
         Ok(())
+    }
+
+    async fn call_id_by_channel(&self, channel_id: u64) -> Option<String> {
+        let sessions = self.state.call_sessions.read().await;
+        sessions
+            .values()
+            .find(|session| session.channel_id == channel_id)
+            .map(|session| session.call_id.clone())
+    }
+
+    async fn process_voice_payload(
+        &self,
+        channel_id: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ServerError> {
+        let Some(call_id) = self.call_id_by_channel(channel_id).await else {
+            return Ok(payload);
+        };
+        let handle = {
+            let guard = self.state.media_transcoders.read().await;
+            guard.get(&call_id).cloned()
+        };
+        let Some(handle) = handle else {
+            return Ok(payload);
+        };
+        let mut transcoder = handle.lock().await;
+        match transcoder.process_audio(payload) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                warn!(call = %call_id, channel = channel_id, error = %err, "voice transcoding failed");
+                Err(ServerError::from(err))
+            }
+        }
+    }
+
+    async fn process_video_payload(
+        &self,
+        channel_id: u64,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, ServerError> {
+        let Some(call_id) = self.call_id_by_channel(channel_id).await else {
+            return Ok(payload);
+        };
+        let handle = {
+            let guard = self.state.media_transcoders.read().await;
+            guard.get(&call_id).cloned()
+        };
+        let Some(handle) = handle else {
+            return Ok(payload);
+        };
+        let mut transcoder = handle.lock().await;
+        match transcoder.process_video(payload) {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                warn!(call = %call_id, channel = channel_id, error = %err, "video transcoding failed");
+                Err(ServerError::from(err))
+            }
+        }
     }
 
     async fn consume_established_frames(
@@ -2385,7 +2486,7 @@ impl CommuCatApp {
     async fn handle_established_frame(
         &self,
         device_id: &str,
-        frame: Frame,
+        mut frame: Frame,
         tx_out: &mpsc::Sender<Frame>,
         server_sequence: &mut u64,
     ) -> Result<(), ServerError> {
@@ -2634,18 +2735,60 @@ impl CommuCatApp {
                 let _ = tx_out.send(ack).await;
                 Ok(())
             }
-            FrameType::Msg
-            | FrameType::Typing
-            | FrameType::KeyUpdate
-            | FrameType::GroupEvent
-            | FrameType::VoiceFrame
-            | FrameType::VideoFrame => {
+            FrameType::VoiceFrame => {
+                let payload = match frame.payload {
+                    FramePayload::Opaque(ref mut data) => std::mem::take(data),
+                    _ => return Err(ServerError::Invalid),
+                };
+                let processed = self
+                    .process_voice_payload(frame.channel_id, payload)
+                    .await?;
+                frame.payload = FramePayload::Opaque(processed);
                 let inbound_sequence = frame.sequence;
-                if matches!(frame.frame_type, FrameType::VoiceFrame) {
-                    self.state.metrics.mark_call_voice_frame();
-                } else if matches!(frame.frame_type, FrameType::VideoFrame) {
-                    self.state.metrics.mark_call_video_frame();
-                }
+                self.state.metrics.mark_call_voice_frame();
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: json!({
+                            "ack": inbound_sequence,
+                        }),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::VideoFrame => {
+                let payload = match frame.payload {
+                    FramePayload::Opaque(ref mut data) => std::mem::take(data),
+                    _ => return Err(ServerError::Invalid),
+                };
+                let processed = self
+                    .process_video_payload(frame.channel_id, payload)
+                    .await?;
+                frame.payload = FramePayload::Opaque(processed);
+                let inbound_sequence = frame.sequence;
+                self.state.metrics.mark_call_video_frame();
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: json!({
+                            "ack": inbound_sequence,
+                        }),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::Msg | FrameType::Typing | FrameType::KeyUpdate | FrameType::GroupEvent => {
+                let inbound_sequence = frame.sequence;
                 self.broadcast_frame(device_id, frame.clone()).await?;
                 let ack = Frame {
                     channel_id: frame.channel_id,
@@ -3115,6 +3258,7 @@ impl CommuCatApp {
             affected
         };
         for (call_id, channel_id, started_at, initiator) in terminated_calls {
+            self.remove_call_transcoder(&call_id).await;
             self.state.metrics.mark_call_ended();
             let duration = (Utc::now() - started_at).num_seconds().max(0);
             self.emit_call_event(

@@ -835,6 +835,7 @@ dependencies = [
  "commucat-crypto",
  "commucat-federation",
  "commucat-ledger",
+ "commucat-media",
  "commucat-proto",
  "commucat-storage",
  "ml-kem",

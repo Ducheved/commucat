@@ -17,6 +17,7 @@ commucat-crypto = { path = "../crypto", version = "1.0", features = ["pq"] }
 commucat-federation = { path = "../federation", version = "1.0" }
 commucat-ledger = { path = "../ledger", version = "1.0" }
 commucat-proto = { path = "../proto", version = "1.0" }
+commucat-media = { path = "../media", version = "1.0", features = ["video"] }
 commucat-storage = { path = "../storage", version = "1.0" }
 blake3 = { workspace = true }
 redis = { workspace = true }

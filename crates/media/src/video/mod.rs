@@ -1,5 +1,12 @@
 #![allow(clippy::cast_possible_wrap)]
 #![allow(clippy::cast_sign_loss)]
+#![allow(clippy::borrow_as_ptr)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::manual_div_ceil)]
 
 use crate::{MediaError, MediaResult};
 use commucat_media_types::{HardwareAcceleration, MediaSourceMode, VideoCodec};
@@ -74,6 +81,7 @@ pub struct VideoFrame {
     pub data: Vec<u8>,
 }
 
+#[derive(Clone, Copy)]
 pub struct I420Borrowed<'a> {
     pub y: &'a [u8],
     pub u: &'a [u8],
@@ -92,7 +100,7 @@ impl fmt::Debug for VideoEncoder {
             .field("bitrate", &self.cfg.bitrate)
             .field("threads", &self.cfg.threads)
             .field("pts", &self.pts)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -270,8 +278,9 @@ impl VideoDecoder {
     fn ensure_backend(&mut self, codec: VideoCodec) -> MediaResult<()> {
         let need_switch = match (&self.backend, codec) {
             (VideoDecoderBackend::Raw, VideoCodec::RawI420) => false,
-            (VideoDecoderBackend::Vpx(decoder), VideoCodec::Vp8)
-            | (VideoDecoderBackend::Vpx(decoder), VideoCodec::Vp9) => decoder.codec != codec,
+            (VideoDecoderBackend::Vpx(decoder), VideoCodec::Vp8 | VideoCodec::Vp9) => {
+                decoder.codec != codec
+            }
             #[cfg(feature = "codec-av1")]
             (VideoDecoderBackend::Av1, VideoCodec::Av1Main) => false,
             #[cfg(feature = "codec-h264")]
@@ -322,6 +331,10 @@ struct VpxEncoder {
     cfg: vpx::vpx_codec_enc_cfg_t,
     codec: VideoCodec,
 }
+
+unsafe impl Send for VpxEncoder {}
+unsafe impl Send for VideoEncoder {}
+unsafe impl Send for VideoDecoder {}
 
 impl VpxEncoder {
     fn new(codec: VideoCodec, config: &VideoEncoderConfig) -> MediaResult<Self> {
@@ -444,7 +457,7 @@ impl VpxEncoder {
                 .map_err(|_| MediaError::InvalidConfig("timestamp exceeds encoder range"))?;
             let duration: c_ulong = 1;
             let flags: c_long = if force_keyframe {
-                vpx::VPX_EFLAG_FORCE_KF as c_long
+                c_long::from(vpx::VPX_EFLAG_FORCE_KF)
             } else {
                 0
             };
@@ -454,7 +467,7 @@ impl VpxEncoder {
                 pts,
                 duration,
                 flags,
-                vpx::VPX_DL_REALTIME as c_ulong,
+                c_ulong::from(vpx::VPX_DL_REALTIME),
             );
             vpx::vpx_img_free(image);
             if res != vpx::vpx_codec_err_t::VPX_CODEC_OK {
@@ -476,7 +489,7 @@ impl VpxEncoder {
                     }
                     let data =
                         slice::from_raw_parts(frame_pkt.buf as *const u8, frame_pkt.sz).to_vec();
-                    let keyframe = frame_pkt.flags & vpx::VPX_FRAME_IS_KEY as u32 != 0;
+                    let keyframe = frame_pkt.flags & vpx::VPX_FRAME_IS_KEY != 0;
                     output.push(VideoFrame {
                         timestamp,
                         keyframe,

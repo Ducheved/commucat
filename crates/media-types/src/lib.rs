@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::convert::TryFrom;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +11,27 @@ pub enum AudioCodec {
 impl Default for AudioCodec {
     fn default() -> Self {
         Self::Opus
+    }
+}
+
+impl From<AudioCodec> for u8 {
+    fn from(value: AudioCodec) -> Self {
+        match value {
+            AudioCodec::Opus => 0,
+            AudioCodec::RawPcm => 1,
+        }
+    }
+}
+
+impl TryFrom<u8> for AudioCodec {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(AudioCodec::Opus),
+            1 => Ok(AudioCodec::RawPcm),
+            _ => Err("unknown audio codec"),
+        }
     }
 }
 
@@ -31,6 +53,37 @@ impl Default for VideoCodec {
     }
 }
 
+impl From<VideoCodec> for u8 {
+    fn from(value: VideoCodec) -> Self {
+        match value {
+            VideoCodec::RawI420 => 0,
+            VideoCodec::Vp8 => 1,
+            VideoCodec::Vp9 => 2,
+            VideoCodec::H264Baseline => 3,
+            VideoCodec::H264Main => 4,
+            VideoCodec::H265Main => 5,
+            VideoCodec::Av1Main => 6,
+        }
+    }
+}
+
+impl TryFrom<u8> for VideoCodec {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(VideoCodec::RawI420),
+            1 => Ok(VideoCodec::Vp8),
+            2 => Ok(VideoCodec::Vp9),
+            3 => Ok(VideoCodec::H264Baseline),
+            4 => Ok(VideoCodec::H264Main),
+            5 => Ok(VideoCodec::H265Main),
+            6 => Ok(VideoCodec::Av1Main),
+            _ => Err("unknown video codec"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaSourceMode {
@@ -38,6 +91,29 @@ pub enum MediaSourceMode {
     Encoded,
     Raw,
     Hybrid,
+}
+
+impl From<MediaSourceMode> for u8 {
+    fn from(value: MediaSourceMode) -> Self {
+        match value {
+            MediaSourceMode::Encoded => 0,
+            MediaSourceMode::Raw => 1,
+            MediaSourceMode::Hybrid => 2,
+        }
+    }
+}
+
+impl TryFrom<u8> for MediaSourceMode {
+    type Error = &'static str;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(MediaSourceMode::Encoded),
+            1 => Ok(MediaSourceMode::Raw),
+            2 => Ok(MediaSourceMode::Hybrid),
+            _ => Err("unknown media source mode"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,4 +223,48 @@ pub struct MediaCapabilities {
     pub allow_raw_audio: bool,
     #[serde(default)]
     pub allow_raw_video: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_codec_roundtrip() {
+        for value in [AudioCodec::Opus, AudioCodec::RawPcm] {
+            let encoded: u8 = value.into();
+            let decoded = AudioCodec::try_from(encoded).expect("audio codec");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn video_codec_roundtrip() {
+        for value in [
+            VideoCodec::RawI420,
+            VideoCodec::Vp8,
+            VideoCodec::Vp9,
+            VideoCodec::H264Baseline,
+            VideoCodec::H264Main,
+            VideoCodec::H265Main,
+            VideoCodec::Av1Main,
+        ] {
+            let encoded: u8 = value.into();
+            let decoded = VideoCodec::try_from(encoded).expect("video codec");
+            assert_eq!(decoded, value);
+        }
+    }
+
+    #[test]
+    fn media_source_mode_roundtrip() {
+        for value in [
+            MediaSourceMode::Encoded,
+            MediaSourceMode::Raw,
+            MediaSourceMode::Hybrid,
+        ] {
+            let encoded: u8 = value.into();
+            let decoded = MediaSourceMode::try_from(encoded).expect("source mode");
+            assert_eq!(decoded, value);
+        }
+    }
 }
