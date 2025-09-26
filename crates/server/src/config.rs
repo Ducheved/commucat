@@ -502,9 +502,7 @@ fn parse_bool_field(value: Option<String>, default: bool) -> Result<bool, Config
 }
 
 fn duration_from_hours(hours: u64) -> Result<StdDuration, ConfigError> {
-    let seconds = hours
-        .checked_mul(3600)
-        .ok_or(ConfigError::Invalid)?;
+    let seconds = hours.checked_mul(3600).ok_or(ConfigError::Invalid)?;
     Ok(StdDuration::from_secs(seconds))
 }
 

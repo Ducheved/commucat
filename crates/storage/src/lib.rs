@@ -1565,9 +1565,7 @@ mod tests {
             expires_at: now + Duration::hours(2),
         };
         storage.insert_server_secret(&secret_record).await?;
-        let latest = storage
-            .latest_server_secret_version(&secret_name)
-            .await?;
+        let latest = storage.latest_server_secret_version(&secret_name).await?;
         assert_eq!(latest, 1);
         let active = storage
             .active_server_secrets(&secret_name, now + Duration::minutes(30))

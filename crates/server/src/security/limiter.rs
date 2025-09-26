@@ -1,5 +1,5 @@
 use crate::config::{RateLimitConfig, RateLimitSettings};
-use std::collections::{hash_map::Entry, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
@@ -37,7 +37,7 @@ impl RateState {
 mod tests {
     use super::*;
     use std::time::Duration as StdDuration;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     fn make_config() -> RateLimitConfig {
         let settings = RateLimitSettings {
@@ -115,7 +115,7 @@ impl RateLimiter {
                 return RateDecision {
                     allowed: true,
                     retry_after: None,
-                }
+                };
             }
         };
         let mut guard = self.states.lock().await;
@@ -150,25 +150,24 @@ impl RateLimiter {
                     allowed: true,
                     retry_after: None,
                 };
+            } else if settings.penalty.is_zero() {
+                decision = RateDecision {
+                    allowed: false,
+                    retry_after: Some(settings.window),
+                };
             } else {
-                if settings.penalty.is_zero() {
-                    decision = RateDecision {
-                        allowed: false,
-                        retry_after: Some(settings.window),
-                    };
-                } else {
-                    let until = now + settings.penalty;
-                    entry.blocked_until = Some(until);
-                    decision = RateDecision {
-                        allowed: false,
-                        retry_after: Some(settings.penalty),
-                    };
-                }
+                let until = now + settings.penalty;
+                entry.blocked_until = Some(until);
+                decision = RateDecision {
+                    allowed: false,
+                    retry_after: Some(settings.penalty),
+                };
             }
-            if entry.hits.is_empty() && entry.blocked_until.is_none() {
-                if now.duration_since(entry.last_seen) > settings.window {
-                    remove_entry = true;
-                }
+            if entry.hits.is_empty()
+                && entry.blocked_until.is_none()
+                && now.duration_since(entry.last_seen) > settings.window
+            {
+                remove_entry = true;
             }
             entry.last_seen = now;
         }

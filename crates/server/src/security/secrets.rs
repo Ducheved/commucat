@@ -5,7 +5,7 @@ use blake3::Hasher;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use commucat_crypto::{derive_noise_public_key, generate_noise_static_keypair};
 use commucat_storage::{ServerSecretRecord, Storage, StorageError};
-use rand::{rngs::OsRng, RngCore};
+use rand::{RngCore, rngs::OsRng};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use subtle::ConstantTimeEq;
@@ -36,13 +36,6 @@ struct AdminToken {
     valid_after: DateTime<Utc>,
     rotates_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
-    source: AdminTokenSource,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AdminTokenSource {
-    Static,
-    Rotated,
 }
 
 pub struct SecretManager {
@@ -63,20 +56,19 @@ impl SecretManager {
         initial_noise_public: [u8; 32],
         initial_admin_token: Option<String>,
     ) -> Result<Arc<Self>, StorageError> {
+        let admin_rotation_enabled = rotation.admin.enabled;
         let manager = Arc::new(SecretManager {
             storage,
             metrics,
-            rotation,
+            rotation: rotation.clone(),
             noise_keys: RwLock::new(Vec::new()),
             admin_tokens: RwLock::new(Vec::new()),
-            admin_rotation_enabled: rotation.admin.enabled,
+            admin_rotation_enabled,
         });
         manager
             .initialize_noise(initial_noise_private, initial_noise_public)
             .await?;
-        manager
-            .initialize_admin(initial_admin_token)
-            .await?;
+        manager.initialize_admin(initial_admin_token).await?;
         Ok(manager)
     }
 
@@ -124,11 +116,6 @@ impl SecretManager {
         }
         let tokens = self.admin_tokens.read().await;
         !tokens.is_empty()
-    }
-
-    pub async fn current_noise_key(&self) -> Option<NoiseKey> {
-        let guard = self.noise_keys.read().await;
-        guard.first().cloned()
     }
 
     async fn rotation_loop(self: Arc<Self>) {
@@ -179,10 +166,7 @@ impl SecretManager {
         }
         let keys = records
             .iter()
-            .filter_map(|record| match noise_from_record(record) {
-                Ok(key) => Some(key),
-                Err(_) => None,
-            })
+            .filter_map(|record| noise_from_record(record).ok())
             .collect::<Vec<_>>();
         let mut guard = self.noise_keys.write().await;
         *guard = keys;
@@ -220,28 +204,26 @@ impl SecretManager {
         }
         let tokens = records
             .iter()
-            .filter_map(|record| admin_from_record(record))
+            .filter_map(admin_from_record)
             .collect::<Vec<_>>();
         let mut guard = self.admin_tokens.write().await;
         *guard = tokens;
         guard.sort_by(|a, b| b.version.cmp(&a.version));
-        if !self.rotation.admin.enabled {
-            if let Some(token) = initial_token {
-                if guard.is_empty() {
-                    let salt = random_salt();
-                    let hash = hash_admin_token(token.as_bytes(), &salt);
-                    let sentinel = AdminToken {
-                        version: 0,
-                        hash,
-                        salt,
-                        valid_after: now,
-                        rotates_at: now,
-                        expires_at: far_future(now),
-                        source: AdminTokenSource::Static,
-                    };
-                    guard.push(sentinel);
-                }
-            }
+        if !self.rotation.admin.enabled
+            && guard.is_empty()
+            && let Some(token) = initial_token
+        {
+            let salt = random_salt();
+            let hash = hash_admin_token(token.as_bytes(), &salt);
+            let sentinel = AdminToken {
+                version: 0,
+                hash,
+                salt,
+                valid_after: now,
+                rotates_at: now,
+                expires_at: far_future(now),
+            };
+            guard.push(sentinel);
         } else if guard.is_empty() {
             let (token, record) = self.generate_fresh_admin_record(now).await?;
             let version = record.version;
@@ -295,7 +277,8 @@ impl SecretManager {
         let version = record.version;
         self.storage.insert_server_secret(&record).await?;
         let mut guard = self.admin_tokens.write().await;
-        guard.insert(0, admin_from_record(&record)?);
+        let entry = admin_from_record(&record).ok_or(StorageError::Invalid)?;
+        guard.insert(0, entry);
         guard.sort_by(|a, b| b.version.cmp(&a.version));
         guard.truncate(self.rotation.admin.max_versions);
         self.metrics.mark_admin_rotation();
@@ -418,10 +401,7 @@ fn noise_from_record(record: &ServerSecretRecord) -> Result<NoiseKey, StorageErr
     }
     let mut private = [0u8; 32];
     private.copy_from_slice(private_vec);
-    let public_vec = record
-        .public
-        .as_ref()
-        .ok_or(StorageError::Invalid)?;
+    let public_vec = record.public.as_ref().ok_or(StorageError::Invalid)?;
     if public_vec.len() != 32 {
         return Err(StorageError::Invalid);
     }
@@ -457,7 +437,6 @@ fn admin_from_record(record: &ServerSecretRecord) -> Option<AdminToken> {
         valid_after: record.valid_after,
         rotates_at: record.rotates_at,
         expires_at: record.expires_at,
-        source: AdminTokenSource::Rotated,
     })
 }
 

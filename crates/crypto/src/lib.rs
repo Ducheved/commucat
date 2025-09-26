@@ -176,8 +176,7 @@ impl NoiseTransport {
 
 /// Generates a fresh Noise static key pair for the server.
 pub fn generate_noise_static_keypair() -> ([u8; 32], [u8; 32]) {
-    let mut rng = OsRng;
-    let private = StaticSecret::random_from_rng(&mut rng);
+    let private = StaticSecret::random_from_rng(OsRng);
     let public = X25519PublicKey::from(&private);
     (private.to_bytes(), public.to_bytes())
 }

@@ -1,0 +1,11 @@
+[package]
+name = "commucat-media-types"
+version = "1.0.0"
+edition = "2024"
+description = "Shared media codec descriptors for CommuCat"
+license = "MPL-2.0"
+repository = "https://github.com/ducheved/commucat"
+homepage = "https://commucat.tech"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }

@@ -45,7 +45,6 @@ use std::convert::TryFrom;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -516,14 +515,14 @@ impl CommuCatApp {
         }
         let path = session.req_header().uri.path().to_string();
         let method = session.req_header().method.to_string();
-        if path != "/connect" {
-            if let Some(retry_after) = self.check_rate_limit(&session, RateScope::Http).await {
-                self.state.metrics.mark_http_rate_limited();
-                if let Err(err) = self.respond_rate_limited(&mut session, retry_after).await {
-                    error!("rate limit response failed: {}", err);
-                }
-                return None;
+        if path != "/connect"
+            && let Some(retry_after) = self.check_rate_limit(&session, RateScope::Http).await
+        {
+            self.state.metrics.mark_http_rate_limited();
+            if let Err(err) = self.respond_rate_limited(session, retry_after).await {
+                error!("rate limit response failed: {}", err);
             }
+            return None;
         }
         match path.as_str() {
             "/" | "/index.html" => {
@@ -664,9 +663,12 @@ impl CommuCatApp {
             return None;
         }
         if path == "/api/pair/claim" && method == "POST" {
-            if let Some(retry_after) = self.check_rate_limit(&session, RateScope::PairingClaim).await {
+            if let Some(retry_after) = self
+                .check_rate_limit(&session, RateScope::PairingClaim)
+                .await
+            {
                 self.state.metrics.mark_http_rate_limited();
-                if let Err(err) = self.respond_rate_limited(&mut session, retry_after).await {
+                if let Err(err) = self.respond_rate_limited(session, retry_after).await {
                     error!("pairing claim rate limit response failed: {}", err);
                 }
                 return None;
@@ -1289,8 +1291,7 @@ impl CommuCatApp {
     fn client_identity(session: &ServerSession) -> String {
         session
             .client_addr()
-            .and_then(|addr| addr.parse::<SocketAddr>().ok())
-            .map(|sock| sock.ip().to_string())
+            .map(|addr| addr.to_string())
             .unwrap_or_else(|| "unknown".to_string())
     }
 
@@ -1304,13 +1305,17 @@ impl CommuCatApp {
         if decision.allowed {
             None
         } else {
-            Some(decision.retry_after.unwrap_or_else(|| StdDuration::from_secs(1)))
+            Some(
+                decision
+                    .retry_after
+                    .unwrap_or_else(|| StdDuration::from_secs(1)),
+            )
         }
     }
 
     async fn respond_rate_limited(
         &self,
-        session: &mut ServerSession,
+        mut session: ServerSession,
         retry_after: StdDuration,
     ) -> Result<(), ServerError> {
         let mut response =
@@ -1320,7 +1325,7 @@ impl CommuCatApp {
             .map_err(|_| ServerError::Invalid)?;
         let retry_secs = retry_after.as_secs().max(1);
         response
-            .append_header("retry-after", &retry_secs.to_string())
+            .append_header("retry-after", retry_secs.to_string())
             .map_err(|_| ServerError::Invalid)?;
         session
             .write_response_header(Box::new(response))
@@ -1348,7 +1353,7 @@ impl CommuCatApp {
     ) -> Option<ReusedHttpStream> {
         if let Some(retry_after) = self.check_rate_limit(&session, RateScope::Connect).await {
             self.state.metrics.mark_connect_rate_limited();
-            if let Err(err) = self.respond_rate_limited(&mut session, retry_after).await {
+            if let Err(err) = self.respond_rate_limited(session, retry_after).await {
                 error!("connect rate limit response failed: {}", err);
             }
             return None;
@@ -1375,6 +1380,7 @@ impl CommuCatApp {
             handshake: None,
             protocol_version: PROTOCOL_VERSION,
             certificate: None,
+            noise_key: None,
         };
         let mut server_sequence = 1u64;
         let mut shutdown_rx = shutdown.clone();
@@ -1547,7 +1553,7 @@ impl CommuCatApp {
                 })
             })
             .collect::<Vec<_>>();
-        let current_noise_public = if let Some(noise_key) = context.noise_key.as_ref() {
+        let current_noise_public = if let Some(noise_key) = handshake.noise_key.as_ref() {
             encode_hex(&noise_key.public)
         } else {
             encode_hex(&self.state.config.noise_public)
@@ -1565,7 +1571,7 @@ impl CommuCatApp {
                 json!(encode_hex(&self.state.device_ca_public)),
             );
             obj.insert("noise_public".to_string(), json!(current_noise_public));
-            if let Some(noise_key) = context.noise_key.as_ref() {
+            if let Some(noise_key) = handshake.noise_key.as_ref() {
                 obj.insert("noise_key_version".to_string(), json!(noise_key.version));
                 obj.insert(
                     "noise_rotates_at".to_string(),
@@ -1576,7 +1582,10 @@ impl CommuCatApp {
                     json!(noise_key.expires_at.to_rfc3339()),
                 );
             }
-            obj.insert("noise_keys".to_string(), serde_json::Value::Array(noise_keys_payload));
+            obj.insert(
+                "noise_keys".to_string(),
+                serde_json::Value::Array(noise_keys_payload),
+            );
             if let Some(cert) = handshake.certificate.as_ref() {
                 obj.insert(
                     "certificate".to_string(),
@@ -1848,12 +1857,12 @@ impl CommuCatApp {
                         local_static_public: Some(key.public),
                         remote_static_public: Some(client_static),
                     };
-                    if let Ok(mut candidate) = build_handshake(&noise, false) {
-                        if candidate.read_message(&handshake_bytes).is_ok() {
-                            handshake_state_opt = Some(candidate);
-                            selected_noise = Some(key.clone());
-                            break;
-                        }
+                    if let Ok(mut candidate) = build_handshake(&noise, false)
+                        && candidate.read_message(&handshake_bytes).is_ok()
+                    {
+                        handshake_state_opt = Some(candidate);
+                        selected_noise = Some(key.clone());
+                        break;
                     }
                 }
                 let mut handshake_state = handshake_state_opt.ok_or(ServerError::Invalid)?;

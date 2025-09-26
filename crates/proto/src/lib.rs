@@ -381,10 +381,20 @@ mod tests {
 
     #[test]
     fn encode_roundtrip_call_offer_frame() {
-        use crate::call::{AudioParameters, VideoCodec, VideoParameters, VideoResolution};
+        use crate::call::{AudioParameters, VideoParameters};
         use crate::call::{CallMediaProfile, TransportCandidate, TransportProtocol};
         use crate::call::{CallMode, CallOffer, CallTransport};
+        use commucat_media_types::{VideoCodec, VideoResolution};
         use std::convert::TryInto;
+
+        let video = VideoParameters {
+            codec: VideoCodec::Vp8,
+            max_bitrate: 500_000,
+            max_resolution: VideoResolution::default(),
+            frame_rate: 24,
+            adaptive: true,
+            ..VideoParameters::default()
+        };
 
         let offer = CallOffer {
             call_id: "call-xyz".to_string(),
@@ -392,17 +402,9 @@ mod tests {
             to: vec!["bob:device".to_string()],
             media: CallMediaProfile {
                 audio: AudioParameters::default(),
-                video: Some(VideoParameters {
-                    codec: VideoCodec::Vp8,
-                    max_bitrate: 500_000,
-                    max_resolution: VideoResolution {
-                        width: 640,
-                        height: 360,
-                    },
-                    frame_rate: 24,
-                    adaptive: true,
-                }),
+                video: Some(video),
                 mode: CallMode::FullDuplex,
+                capabilities: None,
             },
             metadata: serde_json::json!({"mode": "voice"}),
             transport: Some(CallTransport {

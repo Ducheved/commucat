@@ -2,6 +2,7 @@ use crate::audio::{
     VoiceDecoder, VoiceDecoderConfig, VoiceEncoder, VoiceEncoderConfig, VoiceFrame,
 };
 use crate::{MediaError, MediaResult};
+use commucat_media_types::{AudioCodec, MediaSourceMode};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PipelineConfig {
@@ -20,9 +21,14 @@ impl CallMediaPipeline {
     /// Returns `MediaError` if either codec backend fails to initialise.
     pub fn new(config: PipelineConfig) -> MediaResult<Self> {
         let decoder_cfg = VoiceDecoderConfig {
+            codec: config.voice.codec,
             sample_rate: config.voice.sample_rate,
             channels: config.voice.channels,
             frame_duration_ms: config.voice.frame_duration_ms,
+            source: match config.voice.codec {
+                AudioCodec::RawPcm => MediaSourceMode::Raw,
+                AudioCodec::Opus => MediaSourceMode::Encoded,
+            },
         };
         Ok(Self {
             encoder: VoiceEncoder::new(config.voice)?,
@@ -51,8 +57,8 @@ impl CallMediaPipeline {
     ///
     /// # Errors
     /// Forwards decoding failures from the Opus backend.
-    pub fn decode_audio(&mut self, frame: &[u8], fec: bool) -> MediaResult<Vec<i16>> {
-        self.decoder.decode(frame, fec)
+    pub fn decode_audio(&mut self, frame: &VoiceFrame, fec: bool) -> MediaResult<Vec<i16>> {
+        self.decoder.decode(frame.codec, frame.payload(), fec)
     }
 }
 
@@ -70,9 +76,7 @@ mod tests {
             *sample = phase.wrapping_mul(23);
         }
         let voice_frame = pipeline.encode_audio(&pcm, 0).expect("encode");
-        let decoded_pcm = pipeline
-            .decode_audio(voice_frame.payload(), false)
-            .expect("decode");
+        let decoded_pcm = pipeline.decode_audio(&voice_frame, false).expect("decode");
         assert_eq!(decoded_pcm.len(), pcm.len());
     }
 }

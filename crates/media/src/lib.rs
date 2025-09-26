@@ -2,6 +2,11 @@
 #![deny(clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub use commucat_media_types::{
+    AudioCodec, AudioCodecDescriptor, CodecPriority, HardwareAcceleration, MediaCapabilities,
+    MediaSourceMode, VideoCodec, VideoCodecDescriptor, VideoResolution,
+};
+
 pub mod audio;
 #[cfg(feature = "audio-io")]
 pub mod capture;
@@ -58,5 +63,9 @@ pub mod prelude {
         DecodedFrame, I420Borrowed, VideoDecoder, VideoEncoder, VideoEncoderConfig, VideoFrame,
     };
     pub use crate::voice::VoiceMessage;
-    pub use crate::{MediaError, MediaResult};
+    pub use crate::{
+        AudioCodec, AudioCodecDescriptor, CodecPriority, HardwareAcceleration, MediaCapabilities,
+        MediaError, MediaResult, MediaSourceMode, VideoCodec, VideoCodecDescriptor,
+        VideoResolution,
+    };
 }

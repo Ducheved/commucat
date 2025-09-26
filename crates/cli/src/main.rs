@@ -75,7 +75,7 @@ async fn command_call_simulate(args: Vec<String>) -> Result<(), String> {
             .map_err(|err| format!("encode failed at frame {iter}: {err}"))?;
         total_bytes += frame.payload().len();
         let decoded = pipeline
-            .decode_audio(frame.payload(), false)
+            .decode_audio(&frame, false)
             .map_err(|err| format!("decode failed at frame {iter}: {err}"))?;
         if decoded.len() != pcm.len() {
             return Err(format!(

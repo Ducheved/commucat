@@ -1,4 +1,8 @@
 use crate::{CodecError, ControlEnvelope};
+use commucat_media_types::{
+    AudioCodec, AudioCodecDescriptor, HardwareAcceleration, MediaCapabilities, MediaSourceMode,
+    VideoCodec, VideoCodecDescriptor, VideoResolution,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -12,34 +16,6 @@ pub enum CallMode {
     HalfDuplex,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AudioCodec {
-    Opus,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VideoCodec {
-    Vp8,
-    Vp9,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VideoResolution {
-    pub width: u16,
-    pub height: u16,
-}
-
-impl Default for VideoResolution {
-    fn default() -> Self {
-        VideoResolution {
-            width: 640,
-            height: 360,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AudioParameters {
     pub codec: AudioCodec,
@@ -50,6 +26,12 @@ pub struct AudioParameters {
     pub fec: bool,
     #[serde(default)]
     pub dtx: bool,
+    #[serde(default)]
+    pub source: MediaSourceMode,
+    #[serde(default)]
+    pub available_codecs: Vec<AudioCodecDescriptor>,
+    #[serde(default)]
+    pub allow_passthrough: bool,
 }
 
 impl Default for AudioParameters {
@@ -61,6 +43,9 @@ impl Default for AudioParameters {
             channels: 1,
             fec: true,
             dtx: true,
+            source: MediaSourceMode::Raw,
+            available_codecs: vec![AudioCodecDescriptor::default()],
+            allow_passthrough: false,
         }
     }
 }
@@ -73,6 +58,16 @@ pub struct VideoParameters {
     pub frame_rate: u8,
     #[serde(default)]
     pub adaptive: bool,
+    #[serde(default)]
+    pub source: MediaSourceMode,
+    #[serde(default)]
+    pub available_codecs: Vec<VideoCodecDescriptor>,
+    #[serde(default)]
+    pub hardware: Vec<HardwareAcceleration>,
+    #[serde(default)]
+    pub allow_passthrough: bool,
+    #[serde(default)]
+    pub capabilities: Option<MediaCapabilities>,
 }
 
 impl Default for VideoParameters {
@@ -83,6 +78,11 @@ impl Default for VideoParameters {
             max_resolution: VideoResolution::default(),
             frame_rate: 24,
             adaptive: true,
+            source: MediaSourceMode::Raw,
+            available_codecs: vec![VideoCodecDescriptor::default()],
+            hardware: vec![HardwareAcceleration::Cpu],
+            allow_passthrough: true,
+            capabilities: None,
         }
     }
 }
@@ -94,6 +94,8 @@ pub struct CallMediaProfile {
     pub video: Option<VideoParameters>,
     #[serde(default)]
     pub mode: CallMode,
+    #[serde(default)]
+    pub capabilities: Option<MediaCapabilities>,
 }
 
 impl Default for CallMediaProfile {
@@ -102,6 +104,7 @@ impl Default for CallMediaProfile {
             audio: AudioParameters::default(),
             video: None,
             mode: CallMode::FullDuplex,
+            capabilities: None,
         }
     }
 }
@@ -165,6 +168,16 @@ pub struct CallAnswer {
     pub reason: Option<CallRejectReason>,
     #[serde(default = "default_metadata")]
     pub metadata: Value,
+    #[serde(default)]
+    pub selected_audio_codec: Option<AudioCodec>,
+    #[serde(default)]
+    pub selected_video_codec: Option<VideoCodec>,
+    #[serde(default)]
+    pub audio_source: Option<MediaSourceMode>,
+    #[serde(default)]
+    pub video_source: Option<MediaSourceMode>,
+    #[serde(default)]
+    pub video_hardware: Option<HardwareAcceleration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -214,6 +227,12 @@ pub struct MediaStreamStats {
     pub frames_per_second: Option<u8>,
     #[serde(default)]
     pub key_frames: Option<u32>,
+    #[serde(default)]
+    pub codec: Option<String>,
+    #[serde(default)]
+    pub source: Option<MediaSourceMode>,
+    #[serde(default)]
+    pub hardware: Option<HardwareAcceleration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -275,6 +294,7 @@ impl_control_codec!(CallStats);
 mod tests {
     use super::*;
     use crate::ControlEnvelope;
+    use commucat_media_types::CodecPriority;
 
     #[test]
     fn offer_roundtrip() {
@@ -290,18 +310,71 @@ mod tests {
                     channels: 1,
                     fec: true,
                     dtx: false,
+                    source: MediaSourceMode::Raw,
+                    available_codecs: vec![
+                        AudioCodecDescriptor {
+                            codec: AudioCodec::Opus,
+                            bitrate: Some(32_000),
+                            sample_rate: Some(48_000),
+                            channels: Some(1),
+                            priority: CodecPriority(120),
+                        },
+                        AudioCodecDescriptor {
+                            codec: AudioCodec::RawPcm,
+                            bitrate: Some(1_536_000),
+                            sample_rate: Some(48_000),
+                            channels: Some(2),
+                            priority: CodecPriority(60),
+                        },
+                    ],
+                    allow_passthrough: true,
                 },
                 video: Some(VideoParameters {
                     codec: VideoCodec::Vp8,
                     max_bitrate: 350_000,
-                    max_resolution: VideoResolution {
-                        width: 640,
-                        height: 360,
-                    },
+                    max_resolution: VideoResolution::new(640, 360),
                     frame_rate: 20,
                     adaptive: true,
+                    source: MediaSourceMode::Raw,
+                    available_codecs: vec![
+                        VideoCodecDescriptor {
+                            codec: VideoCodec::Vp8,
+                            max_bitrate: Some(350_000),
+                            max_resolution: Some(VideoResolution::new(640, 360)),
+                            frame_rate: Some(25),
+                            hardware: vec![HardwareAcceleration::Cpu],
+                            priority: CodecPriority(110),
+                            supports_scalability: true,
+                        },
+                        VideoCodecDescriptor {
+                            codec: VideoCodec::H264Baseline,
+                            max_bitrate: Some(1_000_000),
+                            max_resolution: Some(VideoResolution::new(1280, 720)),
+                            frame_rate: Some(30),
+                            hardware: vec![
+                                HardwareAcceleration::Nvidia,
+                                HardwareAcceleration::Intel,
+                            ],
+                            priority: CodecPriority(80),
+                            supports_scalability: false,
+                        },
+                    ],
+                    hardware: vec![HardwareAcceleration::Cpu, HardwareAcceleration::Nvidia],
+                    allow_passthrough: true,
+                    capabilities: Some(MediaCapabilities {
+                        audio: vec![],
+                        video: vec![VideoCodecDescriptor::default()],
+                        allow_raw_audio: false,
+                        allow_raw_video: true,
+                    }),
                 }),
                 mode: CallMode::FullDuplex,
+                capabilities: Some(MediaCapabilities {
+                    audio: vec![AudioCodecDescriptor::default()],
+                    video: vec![VideoCodecDescriptor::default()],
+                    allow_raw_audio: true,
+                    allow_raw_video: true,
+                }),
             },
             metadata: serde_json::json!({"mode": "voice"}),
             transport: Some(CallTransport {
@@ -320,6 +393,16 @@ mod tests {
         let decoded = CallOffer::try_from(&envelope).expect("decode");
         assert_eq!(decoded.call_id, offer.call_id);
         assert_eq!(decoded.transport.as_ref().unwrap().udp_candidates.len(), 1);
+        assert_eq!(
+            decoded
+                .media
+                .audio
+                .available_codecs
+                .iter()
+                .filter(|desc| desc.codec == AudioCodec::RawPcm)
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -331,11 +414,39 @@ mod tests {
             transport: None,
             reason: Some(CallRejectReason::Busy),
             metadata: Value::Null,
+            selected_audio_codec: None,
+            selected_video_codec: None,
+            audio_source: None,
+            video_source: None,
+            video_hardware: None,
         };
         let envelope: ControlEnvelope = (&answer).try_into().expect("encode");
         let decoded = CallAnswer::try_from(&envelope).expect("decode");
         assert!(!decoded.accept);
         assert_eq!(decoded.reason, Some(CallRejectReason::Busy));
+        assert!(decoded.selected_audio_codec.is_none());
+    }
+
+    #[test]
+    fn answer_accept_with_selection_roundtrip() {
+        let answer = CallAnswer {
+            call_id: "call-555".to_string(),
+            accept: true,
+            media: None,
+            transport: None,
+            reason: None,
+            metadata: Value::Null,
+            selected_audio_codec: Some(AudioCodec::Opus),
+            selected_video_codec: Some(VideoCodec::Av1Main),
+            audio_source: Some(MediaSourceMode::Encoded),
+            video_source: Some(MediaSourceMode::Raw),
+            video_hardware: Some(HardwareAcceleration::Nvidia),
+        };
+        let envelope: ControlEnvelope = (&answer).try_into().expect("encode");
+        let decoded = CallAnswer::try_from(&envelope).expect("decode");
+        assert!(decoded.accept);
+        assert_eq!(decoded.selected_video_codec, Some(VideoCodec::Av1Main));
+        assert_eq!(decoded.video_hardware, Some(HardwareAcceleration::Nvidia));
     }
 
     #[test]
@@ -350,12 +461,29 @@ mod tests {
                 rtt_ms: Some(90),
                 frames_per_second: None,
                 key_frames: None,
+                codec: Some("opus".to_string()),
+                source: Some(MediaSourceMode::Encoded),
+                hardware: None,
             }),
-            video: None,
+            video: Some(MediaStreamStats {
+                bitrate: 600_000,
+                packet_loss: 0.03,
+                jitter_ms: 15,
+                rtt_ms: Some(120),
+                frames_per_second: Some(30),
+                key_frames: Some(4),
+                codec: Some("av1".to_string()),
+                source: Some(MediaSourceMode::Raw),
+                hardware: Some(HardwareAcceleration::Nvidia),
+            }),
             timestamp: Some(1_690_000_000),
         };
         let envelope: ControlEnvelope = (&stats).try_into().expect("encode");
         let decoded = CallStats::try_from(&envelope).expect("decode");
-        assert_eq!(decoded.audio.unwrap().bitrate, 18_000);
+        assert_eq!(decoded.audio.as_ref().unwrap().bitrate, 18_000);
+        assert_eq!(
+            decoded.video.as_ref().unwrap().hardware,
+            Some(HardwareAcceleration::Nvidia)
+        );
     }
 }
