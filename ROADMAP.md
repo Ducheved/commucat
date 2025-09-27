@@ -1,6 +1,6 @@
 # Дорожная карта CommuCat (2025–2026)
 
-_Last updated: 27 сентября 2025_
+_Last updated: 28 сентября 2025_
 
 ## 0. Состояние проекта
 
@@ -11,6 +11,7 @@ _Last updated: 27 сентября 2025_
 - Серверное перекодирование RAW PCM/I420 → Opus/VP8; SFU-передача media-кадров.
 - Базовый CCP-1 протокол: ACK, оффлайн-доставка, Presence, CallStats, capability поля.
 - Ротация Noise static ключей и админ-токена; аудит через Ledger.
+- Авто-ротация ключей устройств (CSR API, CCP `KeyUpdate` уведомления).
 - Диагностика: `/metrics`, `commucat-cli diagnose`.
 - Roadmap на GitHub, документация (`README.md`, `PROTOCOL.md`).
 
@@ -20,7 +21,6 @@ _Last updated: 27 сентября 2025_
 - Pluggable transports, TOR/onion routing, AmnesiaWG.
 - AV1/H264/GPU, FEC, SVC, мультипутной медиапайплайн.
 - Полноценная федерация, auto-install (в один клик), клиенты.
-- Автоматическая ротация ключей устройств и рассылка сертификатов.
 - Блокчейн-интеграция, криптообмен, ZKP.
 
 ---
@@ -31,8 +31,8 @@ _Last updated: 27 сентября 2025_
 | Задача | Описание | Ответственные |
 |--------|----------|---------------|
 | One-line installer | Скрипт “set-up.sh/ps1” (Postgres, Redis, миграции, генерация ключей, запуск службы). | DevOps (команда) |
-| Авто-ротация ключей устройств | Сервис: принятие CSR, выпуск сертификатов, нотификация клиента (CCP Control frame). | Нужен Rust-разработчик + криптоинженер |
-| CLI onboarding | Команда `commucat-cli autopair` — bootstrap устройства без пароля. | Rust контрибьюторы |
+| Авто-ротация ключей устройств | ✅ Вершина закрыта (CSR API на сервере, `KeyUpdate` уведомления) | Done (Codex) |
+| CLI onboarding | Команда `commucat-cli autopair` — bootstrap устройства без пароля. | Rust контрибьюторы (Codex в работе) |
 | Документация Quick Start | Обновить `docs/quickstart.md` и пример конфигов. | Технический писатель/дизайнер |
 
 ### 1.2 Медиа и протокол

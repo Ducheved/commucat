@@ -80,6 +80,12 @@ enabled = true
 interval = 604800
 max_versions = 2
 
+[rotation.device]
+enabled = true
+min_interval = 86400
+proof_ttl = 600
+notify_channel = 0
+
 [transport.reality]
 certificate_pem = "certs/reality.pem"
 fingerprint = "0123..." # hex32
@@ -145,6 +151,7 @@ fingerprint = "0123..." # hex32
 ---
 
 ## Ссылки
+- [Quick Start](docs/quickstart.md)
 - [Подробная спецификация протокола](PROTOCOL.md)
 - [Лицензия MPL-2.0](LICENSE)
 
