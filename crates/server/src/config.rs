@@ -95,6 +95,14 @@ pub struct SecretRotationConfig {
     pub admin: AdminRotationSettings,
 }
 
+#[derive(Clone, Debug)]
+pub struct DeviceRotationConfig {
+    pub enabled: bool,
+    pub min_interval: StdDuration,
+    pub proof_ttl: StdDuration,
+    pub notify_channel: u64,
+}
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub bind: String,
@@ -118,6 +126,7 @@ pub struct ServerConfig {
     pub connection_keepalive: u64,
     pub rate_limit: RateLimitConfig,
     pub rotation: SecretRotationConfig,
+    pub device_rotation: DeviceRotationConfig,
     pub transport: TransportConfig,
 }
 
@@ -444,6 +453,44 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         },
     };
 
+    let device_rotation_enabled = parse_bool_field(
+        override_env(
+            "COMMUCAT_ROTATION_DEVICE_ENABLED",
+            map.remove("rotation.device.enabled"),
+        )?,
+        true,
+    )?;
+    let device_rotation_min_interval = parse_u64_field(
+        override_env(
+            "COMMUCAT_ROTATION_DEVICE_MIN_INTERVAL",
+            map.remove("rotation.device.min_interval"),
+        )?,
+        86_400,
+    )?;
+    let device_rotation_proof_ttl = parse_u64_field(
+        override_env(
+            "COMMUCAT_ROTATION_DEVICE_PROOF_TTL",
+            map.remove("rotation.device.proof_ttl"),
+        )?,
+        600,
+    )?;
+    let device_rotation_notify_channel = parse_u64_field(
+        override_env(
+            "COMMUCAT_ROTATION_DEVICE_NOTIFY_CHANNEL",
+            map.remove("rotation.device.notify_channel"),
+        )?,
+        0,
+    )?;
+    if device_rotation_proof_ttl == 0 {
+        return Err(ConfigError::Invalid);
+    }
+    let device_rotation = DeviceRotationConfig {
+        enabled: device_rotation_enabled,
+        min_interval: StdDuration::from_secs(device_rotation_min_interval),
+        proof_ttl: StdDuration::from_secs(device_rotation_proof_ttl),
+        notify_channel: device_rotation_notify_channel,
+    };
+
     Ok(ServerConfig {
         bind: required(bind)?,
         tls_cert,
@@ -469,6 +516,7 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         connection_keepalive: keepalive,
         rate_limit,
         rotation,
+        device_rotation,
         transport,
     })
 }
@@ -564,6 +612,10 @@ mod tests {
         assert_eq!(config.relay_ttl_seconds, 86400);
         assert_eq!(config.pairing_ttl_seconds, 300);
         assert_eq!(config.max_auto_devices_per_user, 1);
+        assert!(config.device_rotation.enabled);
+        assert_eq!(config.device_rotation.notify_channel, 0);
+        assert_eq!(config.device_rotation.min_interval.as_secs(), 86_400);
+        assert_eq!(config.device_rotation.proof_ttl.as_secs(), 600);
         assert!(config.transport.reality.is_none());
         fs::remove_file(path).unwrap();
     }

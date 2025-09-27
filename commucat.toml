@@ -84,6 +84,16 @@ admin_grace_hours = 72
 # Number of administrative tokens to keep active
 admin_max_versions = 2
 
+[rotation.device]
+# Enable device CSR auto-rotation service
+enabled = true
+# Minimum seconds between successive rotations for the same device
+min_interval = 86400
+# Maximum lifetime of CSR proof signatures (seconds)
+proof_ttl = 600
+# CCP channel used for KeyUpdate notifications
+notify_channel = 0
+
 [admin]
 # Optional bearer token for /api/security-stats and /metrics
 token = "replace-with-secret"

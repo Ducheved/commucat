@@ -838,6 +838,7 @@ dependencies = [
  "commucat-media",
  "commucat-proto",
  "commucat-storage",
+ "ed25519-dalek",
  "ml-kem",
  "pingora",
  "rand 0.8.5",

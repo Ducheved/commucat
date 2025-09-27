@@ -14,6 +14,7 @@ const INIT_SQL: &str = include_str!("../migrations/001_init.sql");
 const PAIRING_SQL: &str = include_str!("../migrations/002_pairing.sql");
 const USER_BLOB_SQL: &str = include_str!("../migrations/003_user_blob.sql");
 const SERVER_SECRET_SQL: &str = include_str!("../migrations/004_server_secrets.sql");
+const DEVICE_ROTATION_SQL: &str = include_str!("../migrations/005_device_rotation.sql");
 const PAIRING_MAX_ATTEMPTS: i32 = 5;
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -174,6 +175,32 @@ pub struct DeviceKeyEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRotationAudit {
+    pub rotation_id: String,
+    pub device_id: String,
+    pub old_public_key: Vec<u8>,
+    pub new_public_key: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub nonce: Option<Vec<u8>>,
+    pub proof_expires_at: DateTime<Utc>,
+    pub applied_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeviceRotationRecord<'a> {
+    pub rotation_id: &'a str,
+    pub device_id: &'a str,
+    pub user_id: &'a str,
+    pub old_public_key: &'a [u8],
+    pub new_public_key: &'a [u8],
+    pub signature: &'a [u8],
+    pub nonce: Option<&'a [u8]>,
+    pub proof_expires_at: DateTime<Utc>,
+    pub applied_at: DateTime<Utc>,
+    pub event_id: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PairingTokenIssued {
     pub pair_code: String,
     pub issued_at: DateTime<Utc>,
@@ -317,6 +344,10 @@ impl Storage {
             .map_err(|_| StorageError::Postgres)?;
         self.client
             .batch_execute(SERVER_SECRET_SQL)
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(DEVICE_ROTATION_SQL)
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(())
@@ -536,6 +567,78 @@ impl Storage {
             )
             .await
             .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Applies a device key rotation atomically.
+    pub async fn apply_device_key_rotation(
+        &self,
+        rotation: &DeviceRotationRecord<'_>,
+    ) -> Result<(), StorageError> {
+        self.client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let update_result = self
+            .client
+            .execute(
+                "UPDATE user_device SET pubkey = $1 WHERE opaque_id = $2 AND user_id = $3",
+                &[
+                    &rotation.new_public_key,
+                    &rotation.device_id,
+                    &rotation.user_id,
+                ],
+            )
+            .await;
+        let updated = match update_result {
+            Ok(value) => value,
+            Err(_) => {
+                let _ = self.client.batch_execute("ROLLBACK").await;
+                return Err(StorageError::Postgres);
+            }
+        };
+        if updated != 1 {
+            let _ = self.client.batch_execute("ROLLBACK").await;
+            return Err(StorageError::Missing);
+        }
+        if self
+            .client
+            .execute(
+                "INSERT INTO device_key_event (event_id, device_id, public_key, recorded_at) VALUES ($1, $2, $3, $4)",
+                &[&rotation.event_id, &rotation.device_id, &rotation.new_public_key, &rotation.applied_at],
+            )
+            .await
+            .is_err()
+        {
+            let _ = self.client.batch_execute("ROLLBACK").await;
+            return Err(StorageError::Postgres);
+        }
+        if self
+            .client
+            .execute(
+                "INSERT INTO device_rotation_audit (rotation_id, device_id, old_public_key, new_public_key, signature, nonce, proof_expires_at, applied_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &rotation.rotation_id,
+                    &rotation.device_id,
+                    &rotation.old_public_key,
+                    &rotation.new_public_key,
+                    &rotation.signature,
+                    &rotation.nonce,
+                    &rotation.proof_expires_at,
+                    &rotation.applied_at,
+                ],
+            )
+            .await
+            .is_err()
+        {
+            let _ = self.client.batch_execute("ROLLBACK").await;
+            return Err(StorageError::Postgres);
+        }
+        if self.client.batch_execute("COMMIT").await.is_err() {
+            let _ = self.client.batch_execute("ROLLBACK").await;
+            return Err(StorageError::Postgres);
+        }
         Ok(())
     }
 
@@ -1478,6 +1581,46 @@ mod tests {
             .await?
             .expect("expected key event");
         assert_eq!(latest.public_key.len(), 32);
+
+        let new_key = vec![2u8; 32];
+        let rotation_id = format!("rot-{}", suffix);
+        let rotation_event_id = format!("evt-rot-{}", suffix);
+        let signature = vec![3u8; 64];
+        let nonce = vec![4u8; 16];
+        let applied_at = Utc::now();
+        let proof_expires_at = applied_at + Duration::seconds(120);
+        let rotation_record = DeviceRotationRecord {
+            rotation_id: &rotation_id,
+            device_id: &device_id,
+            user_id: &created.user_id,
+            old_public_key: device_record.public_key.as_slice(),
+            new_public_key: new_key.as_slice(),
+            signature: signature.as_slice(),
+            nonce: Some(nonce.as_slice()),
+            proof_expires_at,
+            applied_at,
+            event_id: &rotation_event_id,
+        };
+        storage.apply_device_key_rotation(&rotation_record).await?;
+        let rotated = storage
+            .latest_device_key_event(&device_id)
+            .await?
+            .expect("expected rotation event");
+        assert_eq!(rotated.event_id, rotation_event_id);
+        assert_eq!(rotated.public_key, new_key);
+        let audit_row = storage
+            .client
+            .query_one(
+                "SELECT old_public_key, new_public_key, proof_expires_at FROM device_rotation_audit WHERE rotation_id = $1",
+                &[&rotation_id],
+            )
+            .await?;
+        let stored_old: Vec<u8> = audit_row.get(0);
+        let stored_new: Vec<u8> = audit_row.get(1);
+        let stored_expiry: DateTime<Utc> = audit_row.get(2);
+        assert_eq!(stored_old, device_record.public_key);
+        assert_eq!(stored_new, new_key);
+        assert_eq!(stored_expiry, proof_expires_at);
 
         let group = ChatGroup {
             group_id: format!("group-{}", suffix),

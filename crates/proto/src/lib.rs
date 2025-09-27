@@ -157,10 +157,9 @@ impl FramePayload {
 
     fn from_bytes(frame_type: FrameType, data: &[u8]) -> Result<Self, CodecError> {
         match frame_type {
-            FrameType::Msg
-            | FrameType::KeyUpdate
-            | FrameType::VoiceFrame
-            | FrameType::VideoFrame => Ok(FramePayload::Opaque(data.to_vec())),
+            FrameType::Msg | FrameType::VoiceFrame | FrameType::VideoFrame => {
+                Ok(FramePayload::Opaque(data.to_vec()))
+            }
             FrameType::Hello
             | FrameType::Auth
             | FrameType::Join
@@ -175,7 +174,8 @@ impl FramePayload {
             | FrameType::CallOffer
             | FrameType::CallAnswer
             | FrameType::CallEnd
-            | FrameType::CallStats => {
+            | FrameType::CallStats
+            | FrameType::KeyUpdate => {
                 if data.len() > MAX_CONTROL_JSON_LEN {
                     return Err(CodecError::ControlTooLarge);
                 }
@@ -346,6 +346,33 @@ mod tests {
                 assert_eq!(version.as_u64(), Some(PROTOCOL_VERSION as u64));
             }
             _ => panic!("unexpected payload"),
+        }
+    }
+
+    #[test]
+    fn key_update_roundtrip_returns_control() {
+        let frame = Frame {
+            channel_id: 5,
+            sequence: 2,
+            frame_type: FrameType::KeyUpdate,
+            payload: FramePayload::Control(ControlEnvelope {
+                properties: serde_json::json!({
+                    "type": "device-key-rotated",
+                    "rotation_id": "rot-123",
+                }),
+            }),
+        };
+        let encoded = frame.encode().expect("encode");
+        let (decoded, _) = Frame::decode(&encoded).expect("decode");
+        assert_eq!(decoded.frame_type, FrameType::KeyUpdate);
+        match decoded.payload {
+            FramePayload::Control(ctrl) => {
+                assert_eq!(
+                    ctrl.properties["type"],
+                    serde_json::json!("device-key-rotated")
+                );
+            }
+            other => panic!("expected control payload, got {:?}", other),
         }
     }
 

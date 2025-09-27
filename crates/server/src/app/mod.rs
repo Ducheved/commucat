@@ -1,7 +1,12 @@
 mod media;
 mod p2p;
+mod rotation;
 
 use self::media::{CallMediaTranscoder, SharedCallMediaTranscoder};
+use self::rotation::{
+    DecodedRotationRequest, DeviceRotationRequest, RotationNotification, RotationRequestError,
+    rotation_proof_message,
+};
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
 use crate::security::limiter::{RateLimiter, RateScope};
@@ -30,10 +35,11 @@ use commucat_proto::{
     is_supported_protocol_version, negotiate_protocol_version,
 };
 use commucat_storage::{
-    ChatGroup, DeviceKeyEvent, DeviceRecord, FederationPeerStatus, GroupMember, GroupRole,
-    InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
-    StorageError, UserProfile, connect,
+    ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederationPeerStatus,
+    GroupMember, GroupRole, InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope,
+    SessionRecord, Storage, StorageError, UserProfile, connect,
 };
+use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
 use pingora::protocols::http::ServerSession;
@@ -41,7 +47,7 @@ use pingora::protocols::http::v2::server::H2Options;
 use pingora::server::ShutdownWatch;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use std::error::Error;
@@ -759,6 +765,16 @@ impl CommuCatApp {
             }
             return None;
         }
+        if path == "/api/device/csr" && method == "POST" {
+            self.state.metrics.mark_ingress();
+            match self.handle_device_csr(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
         if path == "/api/devices" && method == "GET" {
             self.state.metrics.mark_ingress();
             match self.handle_devices_list(&mut session).await {
@@ -1063,6 +1079,171 @@ impl CommuCatApp {
             .map_err(|_| ApiError::Internal)
     }
 
+    async fn handle_device_csr(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        if !self.state.config.device_rotation.enabled {
+            return Err(ApiError::NotFound);
+        }
+        let context = self.authenticate_session(session).await?;
+        let body = Self::read_body(session).await?;
+        if body.is_empty() {
+            return Err(ApiError::BadRequest("request body required".to_string()));
+        }
+        let request = serde_json::from_slice::<DeviceRotationRequest>(&body)
+            .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?;
+        let now = Utc::now();
+        let decoded = match request.decode(now, self.state.config.device_rotation.proof_ttl) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                let message = match error {
+                    RotationRequestError::InvalidPublicKey => "invalid public_key",
+                    RotationRequestError::InvalidSignature => "invalid signature encoding",
+                    RotationRequestError::InvalidExpiresAt => "invalid expires_at",
+                    RotationRequestError::Expired => "proof expired",
+                    RotationRequestError::ExpiresTooFar => "expires_at exceeds proof_ttl",
+                    RotationRequestError::InvalidNonce => "invalid nonce",
+                };
+                return Err(ApiError::BadRequest(message.to_string()));
+            }
+        };
+        let DecodedRotationRequest {
+            public_key: new_key_array,
+            signature: signature_bytes,
+            expires_at: proof_expires_at,
+            nonce,
+        } = decoded;
+        if context.device.public_key.len() != 32 {
+            return Err(ApiError::Internal);
+        }
+        if new_key_array.as_slice() == context.device.public_key.as_slice() {
+            return Err(ApiError::Conflict("public key unchanged".to_string()));
+        }
+        if self.state.config.device_rotation.min_interval > StdDuration::ZERO {
+            let threshold =
+                chrono::Duration::from_std(self.state.config.device_rotation.min_interval)
+                    .map_err(|_| ApiError::Internal)?;
+            if let Some(latest) = self
+                .state
+                .storage
+                .latest_device_key_event(&context.device.device_id)
+                .await
+                .map_err(|_| ApiError::Internal)?
+                && now - latest.recorded_at < threshold
+            {
+                return Err(ApiError::Conflict(
+                    "rotation interval not elapsed".to_string(),
+                ));
+            }
+        }
+        let mut current_key = [0u8; 32];
+        current_key.copy_from_slice(&context.device.public_key);
+        let verifying = VerifyingKey::from_bytes(&current_key).map_err(|_| ApiError::Internal)?;
+        let signature = Ed25519Signature::from_bytes(&signature_bytes);
+        let proof_message = rotation_proof_message(
+            &context.device.device_id,
+            &new_key_array,
+            proof_expires_at,
+            nonce.as_deref(),
+        );
+        verifying
+            .verify(proof_message.as_bytes(), &signature)
+            .map_err(|_| ApiError::BadRequest("signature verification failed".to_string()))?;
+        let rotation_id = generate_id(&format!(
+            "rot:{}:{}",
+            &context.device.device_id,
+            now.timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let event_id = generate_id(&format!(
+            "dke:{}:{}",
+            &context.device.device_id,
+            now.timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let old_key = context.device.public_key.clone();
+        let new_key_vec = new_key_array.to_vec();
+        let rotation_record = DeviceRotationRecord {
+            rotation_id: &rotation_id,
+            device_id: &context.device.device_id,
+            user_id: &context.user.user_id,
+            old_public_key: old_key.as_slice(),
+            new_public_key: new_key_vec.as_slice(),
+            signature: signature_bytes.as_slice(),
+            nonce: nonce.as_deref(),
+            proof_expires_at,
+            applied_at: now,
+            event_id: &event_id,
+        };
+        self.state
+            .storage
+            .apply_device_key_rotation(&rotation_record)
+            .await
+            .map_err(|err| match err {
+                StorageError::Missing => ApiError::Conflict("device not found".to_string()),
+                _ => ApiError::Internal,
+            })?;
+        let certificate = self
+            .issue_device_certificate(
+                &context.user.user_id,
+                &context.device.device_id,
+                &new_key_array,
+            )
+            .map_err(|_| ApiError::Internal)?;
+        let certificate_value =
+            serde_json::to_value(&certificate).map_err(|_| ApiError::Internal)?;
+        let ledger_entry = LedgerRecord {
+            digest: new_key_array,
+            recorded_at: now,
+            metadata: json!({
+                "device": context.device.device_id,
+                "user": context.user.user_id,
+                "action": "rotate",
+                "source": "device-csr",
+                "rotation_id": rotation_id,
+                "event_id": event_id,
+                "certificate_serial": certificate.data.serial,
+                "certificate_issued_at": certificate.data.issued_at,
+                "certificate_expires_at": certificate.data.expires_at,
+            }),
+        };
+        if let Err(err) = self.state.ledger.submit(&ledger_entry) {
+            warn!("ledger submission failed: {}", err);
+        }
+        self.state.metrics.mark_device_rotation();
+        let new_key_hex = encode_hex(&new_key_vec);
+        let old_key_hex = encode_hex(&old_key);
+        let notification = RotationNotification {
+            r#type: "device-key-rotated",
+            device_id: &context.device.device_id,
+            user_id: &context.user.user_id,
+            public_key: &new_key_hex,
+            old_public_key: &old_key_hex,
+            rotation_id: &rotation_id,
+            event_id: &event_id,
+            certificate: &certificate_value,
+            issued_at: certificate.data.issued_at,
+            expires_at: certificate.data.expires_at,
+        };
+        if let Ok(notification_value) = serde_json::to_value(&notification) {
+            self.notify_device_key_rotation(&context.device.device_id, notification_value)
+                .await;
+        }
+        let response = json!({
+            "device_id": context.device.device_id,
+            "user_id": context.user.user_id,
+            "public_key": new_key_hex,
+            "old_public_key": old_key_hex,
+            "rotation_id": rotation_id,
+            "event_id": event_id,
+            "applied_at": now.to_rfc3339(),
+            "proof_expires_at": proof_expires_at.to_rfc3339(),
+            "certificate": certificate_value,
+        });
+        self.respond_json(session, 200, response, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
     async fn handle_device_revoke(
         self: &Arc<Self>,
         session: &mut ServerSession,
@@ -1218,6 +1399,30 @@ impl CommuCatApp {
         }
         self.respond_json(session, status, body, "application/problem+json")
             .await
+    }
+
+    async fn notify_device_key_rotation(&self, device_id: &str, payload: Value) {
+        let (sender, sequence) = {
+            let connections = self.state.connections.read().await;
+            match connections.get(device_id) {
+                Some(entry) => (entry.sender.clone(), entry.next_sequence()),
+                None => return,
+            }
+        };
+        let frame = Frame {
+            channel_id: self.state.config.device_rotation.notify_channel,
+            sequence,
+            frame_type: FrameType::KeyUpdate,
+            payload: FramePayload::Control(ControlEnvelope {
+                properties: payload,
+            }),
+        };
+        if sender.send(frame).await.is_err() {
+            warn!(
+                device = device_id,
+                "failed to deliver key rotation notification"
+            );
+        }
     }
 
     async fn ensure_pairing_limit(&self, user_id: &str) -> Result<(), ServerError> {

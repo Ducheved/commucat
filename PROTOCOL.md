@@ -141,6 +141,29 @@ frame_body   = frame_type (u8) || channel_id (varint) || sequence (varint) || pa
 
 - `JOIN`: обновляет `channel_routes` (список участников, `relay` flag).
 - `LEAVE`: удаляет участника; при пустом канале сервер чистит `channel_routes`.
+- `KEY_UPDATE`: JSON-уведомление, рассылаемое сервером при выпуске нового сертификата устройства. Поля: `type` (`"device-key-rotated"`), `rotation_id`, `event_id`, `public_key`, `old_public_key`, `certificate`, `issued_at`, `expires_at`.
+
+### Device Key Rotation Service
+
+Устройства могут запускать ротацию собственных ключей без участия оператора:
+
+1. Авторизованный клиент отправляет `POST /api/device/csr` с JSON:
+   ```json
+   {
+     "public_key": "<hex32>",
+     "signature": "<hex64>",
+     "expires_at": "2025-09-27T12:00:00Z",
+     "nonce": "<hex16...>"
+   }
+   ```
+2. `signature` — Ed25519-подпись текущим ключом устройства от сообщения
+   ```
+   blake3("commucat:device-rotation:v1" || device_id || new_public_key || expires_at || nonce)
+   ```
+   где `new_public_key` и `nonce` представлены в бинарном виде.
+3. Сервер проверяет минимальный интервал (`rotation.device.min_interval`), валидирует подпись, хранит событие в `device_rotation_audit`, выпускает сертификат и записывает его в Ledger.
+4. HTTP-ответ содержит новый сертификат и метаданные (`rotation_id`, `event_id`).
+5. Если устройство онлайн, сервер отправляет CCP `KeyUpdate` кадр на канал `rotation.device.notify_channel` (по умолчанию `0`). Оффлайн-устройства получают уведомление при следующем подключении в виде релэй-контента.
 - `MSG` (и аналогичные) ретранслируются во все активные подключения (`broadcast_frame`).
 - Оффлайн-клиентам кадры сохраняются в `relay_queue` (Postgres) c новым `sequence`.
 

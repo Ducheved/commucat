@@ -127,6 +127,7 @@ fingerprint = "0123..." # hex32
 - **Noise static ключи**: ротация по расписанию (`rotation.noise.interval`), поддерживаются одновременно несколько версий (grace-период `rotation.noise.grace`).
 - **Админ-токен**: при включённой ротации генерируется новый токен, старые хранятся до истечения grace.
 - **Ledger**: каждое изменение ключа устройства фиксируется (`DeviceKeyEvent`).
+- **Device CSR авто-ротация**: авторизованные устройства вызывают `POST /api/device/csr`, сервер проверяет подпись нового ключа, выпускает сертификат и рассылает CCP `KeyUpdate` уведомление по каналу `rotation.device.notify_channel`.
 - **Rate limiting**: HTTP, `/connect`, `/api/pair/claim` — отдельные лимиты (burst/window/penalty).
 - **Presence**: Redis-записи обновляются при каждом heart-beat; при обрыве соединения сервер помечает устройство как offline и завершает звонки.
 
