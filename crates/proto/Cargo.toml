@@ -22,4 +22,4 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 rand = { workspace = true, optional = true }
 blake3 = { workspace = true, optional = true }
-commucat-media-types = { path = "../media-types" }
+commucat-media-types = { version = "1.0.0", path = "../media-types" }
