@@ -70,6 +70,7 @@ jobs:
         run: |
           set -euo pipefail
           manifests=(
+            "crates/media-types/Cargo.toml"
             "crates/proto/Cargo.toml"
             "crates/crypto/Cargo.toml"
             "crates/federation/Cargo.toml"
