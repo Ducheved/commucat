@@ -18,7 +18,7 @@ use chrono::{Duration, Utc};
 use commucat_crypto::zkp::{self, KnowledgeProof};
 use commucat_crypto::{
     CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair, EventSigner,
-    HandshakePattern, NoiseConfig, NoiseHandshake, build_handshake,
+    HandshakePattern, NoiseConfig, NoiseHandshake, NoiseTransport, build_handshake,
 };
 use commucat_federation::{FederationError, FederationEvent, sign_event};
 use commucat_ledger::{
@@ -335,6 +335,7 @@ struct HandshakeContext {
     protocol_version: u16,
     certificate: Option<DeviceCertificate>,
     noise_key: Option<NoiseKey>,
+    transport: Option<Arc<Mutex<NoiseTransport>>>,
 }
 
 pub struct CommuCatApp {
@@ -1590,6 +1591,7 @@ impl CommuCatApp {
             protocol_version: PROTOCOL_VERSION,
             certificate: None,
             noise_key: None,
+            transport: None,
         };
         let mut server_sequence = 1u64;
         let mut shutdown_rx = shutdown.clone();
@@ -1635,7 +1637,7 @@ impl CommuCatApp {
                                 frame_type: FrameType::Error,
                                 payload: FramePayload::Control(ControlEnvelope { properties }),
                             };
-                            let _ = self.write_frame(&mut session, error_frame).await;
+                            let _ = self.write_frame(&mut session, error_frame, None).await;
                             session.finish().await.ok()?;
                             return None;
                         }
@@ -1656,7 +1658,7 @@ impl CommuCatApp {
                                 }),
                             }),
                         };
-                        let _ = self.write_frame(&mut session, error_frame).await;
+                        let _ = self.write_frame(&mut session, error_frame, None).await;
                         session.finish().await.ok()?;
                         return None;
                     }
@@ -1818,7 +1820,7 @@ impl CommuCatApp {
             }),
         };
         server_sequence += 1;
-        if let Err(err) = self.write_frame(&mut session, ack_frame).await {
+        if let Err(err) = self.write_frame(&mut session, ack_frame, None).await {
             error!("handshake ack send failed: {}", err);
             return None;
         }
@@ -1874,13 +1876,43 @@ impl CommuCatApp {
             }
         }
 
-        loop {
+        let transport = match handshake.transport.clone() {
+            Some(handle) => handle,
+            None => {
+                error!("noise transport missing after handshake");
+                return None;
+            }
+        };
+
+        'session_loop: loop {
             select! {
                 inbound = session.read_request_body() => {
                     match inbound {
                         Ok(Some(chunk)) => {
-                            buffer.extend_from_slice(&chunk);
-                            match self.consume_established_frames(&mut session, &device_id, &mut buffer, &tx_out, &mut server_sequence).await {
+                            if chunk.is_empty() {
+                                continue;
+                            }
+                            let plaintext = {
+                                let mut guard = transport.lock().await;
+                                match guard.read_message(chunk.as_ref()) {
+                                    Ok(data) => data,
+                                    Err(_) => {
+                                        error!("noise decrypt failed");
+                                        break 'session_loop;
+                                    }
+                                }
+                            };
+                            buffer.extend_from_slice(&plaintext);
+                            match self.consume_established_frames(
+                                &mut session,
+                                &device_id,
+                                &mut buffer,
+                                &tx_out,
+                                &mut server_sequence,
+                                Some(&transport),
+                            )
+                            .await
+                            {
                                 Ok(continue_running) => {
                                     if !continue_running {
                                         break;
@@ -2336,7 +2368,8 @@ impl CommuCatApp {
                     decode_hex(handshake_hex).map_err(|_| ServerError::Invalid)?;
                 let mut handshake_state = context.handshake.take().ok_or(ServerError::Invalid)?;
                 let _ = handshake_state.read_message(&handshake_bytes)?;
-                let _ = handshake_state.into_transport()?;
+                let transport = handshake_state.into_transport()?;
+                context.transport = Some(Arc::new(Mutex::new(transport)));
                 context.stage = HandshakeStage::Established;
                 Ok(())
             }
@@ -2348,10 +2381,17 @@ impl CommuCatApp {
         &self,
         session: &mut ServerSession,
         frame: Frame,
+        transport: Option<&Arc<Mutex<NoiseTransport>>>,
     ) -> Result<(), ServerError> {
         let encoded = frame.encode()?;
+        let payload = if let Some(noise) = transport {
+            let mut guard = noise.lock().await;
+            guard.write_message(&encoded).map_err(|_| ServerError::Crypto)?
+        } else {
+            encoded
+        };
         session
-            .write_response_body(encoded.into(), false)
+            .write_response_body(payload.into(), false)
             .await
             .map_err(|_| ServerError::Io)?;
         self.state.metrics.mark_egress();
@@ -2658,6 +2698,7 @@ impl CommuCatApp {
         buffer: &mut Vec<u8>,
         tx_out: &mpsc::Sender<Frame>,
         server_sequence: &mut u64,
+        transport: Option<&Arc<Mutex<NoiseTransport>>>,
     ) -> Result<bool, ServerError> {
         loop {
             match Frame::decode(buffer) {
@@ -2681,7 +2722,7 @@ impl CommuCatApp {
                         }),
                     };
                     *server_sequence += 1;
-                    let _ = self.write_frame(session, error_frame).await;
+                    let _ = self.write_frame(session, error_frame, transport).await;
                     return Err(ServerError::Codec);
                 }
             }
