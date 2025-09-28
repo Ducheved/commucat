@@ -146,6 +146,18 @@ mod tests {
     }
 
     #[test]
+    fn cipher_varint_roundtrip() {
+        let values = [0usize, 1, 127, 128, 16_384, (u32::MAX as usize)];
+        for value in values {
+            let encoded = encode_varint_usize(value);
+            let (decoded, consumed) =
+                decode_varint_prefix(&encoded).expect("decode varint");
+            assert_eq!(decoded, value);
+            assert_eq!(consumed, encoded.len());
+        }
+    }
+
+    #[test]
     fn user_snapshot_includes_alias() {
         let now = Utc::now();
         let profile = UserProfile {
@@ -2433,7 +2445,9 @@ impl CommuCatApp {
         let payload = if let Some(noise) = transport {
             let ciphertext = {
                 let mut guard = noise.lock().await;
-                guard.write_message(&encoded).map_err(|_| ServerError::Crypto)?
+                guard
+                    .write_message(&encoded)
+                    .map_err(|_| ServerError::Crypto)?
             };
             let mut framed = encode_varint_usize(ciphertext.len());
             framed.extend_from_slice(&ciphertext);
