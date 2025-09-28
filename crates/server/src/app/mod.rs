@@ -99,6 +99,33 @@ impl Display for ServerError {
     }
 }
 
+fn encode_varint_usize(mut value: usize) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    while value >= 0x80 {
+        bytes.push(((value & 0x7f) as u8) | 0x80);
+        value >>= 7;
+    }
+    bytes.push(value as u8);
+    bytes
+}
+
+fn decode_varint_prefix(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut result: usize = 0;
+    let mut shift = 0usize;
+    for (index, byte) in buffer.iter().copied().enumerate() {
+        let value = (byte & 0x7f) as usize;
+        result |= value << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, index + 1));
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1883,6 +1910,7 @@ impl CommuCatApp {
                 return None;
             }
         };
+        let mut cipher_buffer: Vec<u8> = Vec::new();
 
         'session_loop: loop {
             select! {
@@ -1892,35 +1920,53 @@ impl CommuCatApp {
                             if chunk.is_empty() {
                                 continue;
                             }
-                            let plaintext = {
-                                let mut guard = transport.lock().await;
-                                match guard.read_message(chunk.as_ref()) {
-                                    Ok(data) => data,
-                                    Err(_) => {
-                                        error!("noise decrypt failed");
-                                        break 'session_loop;
-                                    }
+                            cipher_buffer.extend_from_slice(chunk.as_ref());
+                            let mut decrypted_any = false;
+                            loop {
+                                let Some((message_len, header_len)) = decode_varint_prefix(&cipher_buffer) else {
+                                    break;
+                                };
+                                let total_len = header_len + message_len;
+                                if cipher_buffer.len() < total_len {
+                                    break;
                                 }
-                            };
-                            buffer.extend_from_slice(&plaintext);
-                            match self.consume_established_frames(
-                                &mut session,
-                                &device_id,
-                                &mut buffer,
-                                &tx_out,
-                                &mut server_sequence,
-                                Some(&transport),
-                            )
-                            .await
-                            {
-                                Ok(continue_running) => {
-                                    if !continue_running {
+                                let ciphertext = cipher_buffer[header_len..total_len].to_vec();
+                                cipher_buffer.drain(0..total_len);
+                                let plaintext = {
+                                    let mut guard = transport.lock().await;
+                                    match guard.read_message(&ciphertext) {
+                                        Ok(data) => data,
+                                        Err(_) => {
+                                            error!("noise decrypt failed");
+                                            break 'session_loop;
+                                        }
+                                    }
+                                };
+                                if !plaintext.is_empty() {
+                                    buffer.extend_from_slice(&plaintext);
+                                }
+                                decrypted_any = true;
+                            }
+                            if decrypted_any {
+                                match self.consume_established_frames(
+                                    &mut session,
+                                    &device_id,
+                                    &mut buffer,
+                                    &tx_out,
+                                    &mut server_sequence,
+                                    Some(&transport),
+                                )
+                                .await
+                                {
+                                    Ok(continue_running) => {
+                                        if !continue_running {
+                                            break;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        error!("frame processing failure: {}", err);
                                         break;
                                     }
-                                }
-                                Err(err) => {
-                                    error!("frame processing failure: {}", err);
-                                    break;
                                 }
                             }
                         }
@@ -2344,7 +2390,7 @@ impl CommuCatApp {
                     }),
                 };
                 *server_sequence += 1;
-                self.write_frame(session, response_frame).await?;
+                self.write_frame(session, response_frame, None).await?;
                 context.device_id = device_id;
                 context.session_id = session_id;
                 context.handshake = Some(handshake_state);
@@ -2385,8 +2431,13 @@ impl CommuCatApp {
     ) -> Result<(), ServerError> {
         let encoded = frame.encode()?;
         let payload = if let Some(noise) = transport {
-            let mut guard = noise.lock().await;
-            guard.write_message(&encoded).map_err(|_| ServerError::Crypto)?
+            let ciphertext = {
+                let mut guard = noise.lock().await;
+                guard.write_message(&encoded).map_err(|_| ServerError::Crypto)?
+            };
+            let mut framed = encode_varint_usize(ciphertext.len());
+            framed.extend_from_slice(&ciphertext);
+            framed
         } else {
             encoded
         };
