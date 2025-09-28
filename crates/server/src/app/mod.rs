@@ -150,8 +150,7 @@ mod tests {
         let values = [0usize, 1, 127, 128, 16_384, (u32::MAX as usize)];
         for value in values {
             let encoded = encode_varint_usize(value);
-            let (decoded, consumed) =
-                decode_varint_prefix(&encoded).expect("decode varint");
+            let (decoded, consumed) = decode_varint_prefix(&encoded).expect("decode varint");
             assert_eq!(decoded, value);
             assert_eq!(consumed, encoded.len());
         }
