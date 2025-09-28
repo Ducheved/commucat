@@ -172,6 +172,63 @@ mod tests {
         assert_eq!(payload["user_id"], json!("user-123"));
         assert_eq!(payload["handle"], json!("alice"));
     }
+
+    #[test]
+    fn friends_request_accepts_user_id_only() {
+        let payload = json!({
+            "friends": [
+                {
+                    "user_id": " user-42 ",
+                    "alias": "  Pal  "
+                }
+            ]
+        });
+        let entries = parse_friends_request(&payload).expect("valid friends payload");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].user_id, "user-42");
+        assert_eq!(entries[0].alias.as_deref(), Some("Pal"));
+    }
+
+    #[test]
+    fn friends_request_rejects_handle_field() {
+        let payload = json!({
+            "friends": [
+                {
+                    "user_id": "user-1",
+                    "handle": "alice"
+                }
+            ]
+        });
+        match parse_friends_request(&payload) {
+            Err(ApiError::BadRequest(message)) => assert!(message.contains("handle")),
+            Err(_) => panic!("unexpected error variant"),
+            Ok(_) => panic!("handle field must be rejected"),
+        }
+    }
+
+    #[test]
+    fn friends_request_rejects_duplicate_ids() {
+        let payload = json!({
+            "friends": [
+                { "user_id": "user-1" },
+                { "user_id": "user-1" }
+            ]
+        });
+        match parse_friends_request(&payload) {
+            Err(ApiError::BadRequest(message)) => assert!(message.contains("duplicate")),
+            Err(_) => panic!("unexpected error variant"),
+            Ok(_) => panic!("duplicate friend user_id must be rejected"),
+        }
+    }
+
+    #[test]
+    fn friends_blob_accepts_legacy_entries() {
+        let raw = r#"[{"user_id": "user-1", "handle": "alice", "alias": "  Pal  "}]"#;
+        let entries = parse_friends_blob(raw).expect("legacy friends blob");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].user_id, "user-1");
+        assert_eq!(entries[0].alias.as_deref(), Some("Pal"));
+    }
 }
 
 impl Error for ServerError {}
@@ -288,18 +345,11 @@ pub struct PeerPresence {
     pub last_seen: chrono::DateTime<Utc>,
 }
 
-#[derive(Deserialize, Serialize, Clone)]
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 struct FriendEntryPayload {
     user_id: String,
-    #[serde(default)]
-    handle: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     alias: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct FriendsUpdateRequest {
-    friends: Vec<FriendEntryPayload>,
 }
 
 #[derive(Deserialize)]
@@ -318,11 +368,13 @@ struct DeviceRevokeRequest {
     device_id: String,
 }
 
+#[derive(Debug)]
 struct SessionContext {
     user: UserProfile,
     device: DeviceRecord,
 }
 
+#[derive(Debug)]
 enum ApiError {
     Unauthorized,
     Forbidden,
@@ -353,6 +405,84 @@ impl ApiError {
             Self::Conflict(_) => "Conflict",
             Self::Internal => "InternalError",
         }
+    }
+}
+
+impl FriendEntryPayload {
+    fn from_storage_value(value: &Value) -> Result<Self, ApiError> {
+        let map = value.as_object().ok_or(ApiError::Internal)?;
+        let user_id = map
+            .get("user_id")
+            .or_else(|| map.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or(ApiError::Internal)?;
+        let alias = match map.get("alias") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Some(_) => return Err(ApiError::Internal),
+        };
+        Ok(Self {
+            user_id: user_id.to_string(),
+            alias,
+        })
+    }
+
+    fn from_request_value(value: &Value) -> Result<Self, ApiError> {
+        let map = value.as_object().ok_or_else(|| {
+            ApiError::BadRequest("friend entry must be a JSON object".to_string())
+        })?;
+        if map.contains_key("handle") {
+            return Err(ApiError::BadRequest(
+                "friend entry must specify user_id; handle is not supported".to_string(),
+            ));
+        }
+        for key in map.keys() {
+            if key != "user_id" && key != "alias" {
+                return Err(ApiError::BadRequest(format!(
+                    "unexpected field in friend entry: {}",
+                    key
+                )));
+            }
+        }
+        let user_id_raw = map
+            .get("user_id")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| ApiError::BadRequest("friend.user_id is required".to_string()))?;
+        let user_id = user_id_raw.trim();
+        if user_id.is_empty() {
+            return Err(ApiError::BadRequest(
+                "friend.user_id must be a non-empty string".to_string(),
+            ));
+        }
+        let alias = match map.get("alias") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) => {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            Some(_) => {
+                return Err(ApiError::BadRequest(
+                    "friend.alias must be a string if present".to_string(),
+                ));
+            }
+        };
+        Ok(Self {
+            user_id: user_id.to_string(),
+            alias,
+        })
     }
 }
 
@@ -546,6 +676,43 @@ impl HttpServerApp for CommuCatApp {
     fn server_options(&self) -> Option<&HttpServerOptions> {
         None
     }
+}
+
+fn parse_friends_blob(blob: &str) -> Result<Vec<FriendEntryPayload>, ApiError> {
+    if blob.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let raw = serde_json::from_str::<Vec<Value>>(blob).map_err(|_| ApiError::Internal)?;
+    let mut entries = Vec::with_capacity(raw.len());
+    for value in raw.iter() {
+        entries.push(FriendEntryPayload::from_storage_value(value)?);
+    }
+    Ok(entries)
+}
+
+fn parse_friends_request(root: &Value) -> Result<Vec<FriendEntryPayload>, ApiError> {
+    let map = root
+        .as_object()
+        .ok_or_else(|| ApiError::BadRequest("payload must be a JSON object".to_string()))?;
+    let friends_value = map
+        .get("friends")
+        .ok_or_else(|| ApiError::BadRequest("\"friends\" field is required".to_string()))?;
+    let friends_array = friends_value
+        .as_array()
+        .ok_or_else(|| ApiError::BadRequest("\"friends\" must be an array".to_string()))?;
+    let mut entries = Vec::with_capacity(friends_array.len());
+    let mut seen = HashSet::new();
+    for value in friends_array {
+        let entry = FriendEntryPayload::from_request_value(value)?;
+        if !seen.insert(entry.user_id.clone()) {
+            return Err(ApiError::BadRequest(format!(
+                "duplicate friend user_id: {}",
+                entry.user_id
+            )));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 impl CommuCatApp {
@@ -910,8 +1077,7 @@ impl CommuCatApp {
             .await
             .map_err(|_| ApiError::Internal)?;
         let friends = match blob {
-            Some(data) => serde_json::from_str::<Vec<FriendEntryPayload>>(&data)
-                .map_err(|_| ApiError::Internal)?,
+            Some(data) => parse_friends_blob(&data)?,
             None => Vec::new(),
         };
         let payload = json!({ "friends": friends });
@@ -926,19 +1092,20 @@ impl CommuCatApp {
     ) -> Result<(), ApiError> {
         let context = self.authenticate_session(session).await?;
         let body = Self::read_body(session).await?;
-        let request = serde_json::from_slice::<FriendsUpdateRequest>(&body)
+        let root = serde_json::from_slice::<Value>(&body)
             .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?;
-        if request.friends.len() > 512 {
+        let friends = parse_friends_request(&root)?;
+        if friends.len() > 512 {
             return Err(ApiError::BadRequest("too many friends".to_string()));
         }
-        let serialized = serde_json::to_string(&request.friends).map_err(|_| ApiError::Internal)?;
+        let serialized = serde_json::to_string(&friends).map_err(|_| ApiError::Internal)?;
         self.state
             .storage
             .write_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY, &serialized)
             .await
             .map_err(|_| ApiError::Internal)?;
         let payload = json!({
-            "friends": request.friends,
+            "friends": friends,
         });
         self.respond_json(session, 200, payload, "application/json")
             .await

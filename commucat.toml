@@ -101,4 +101,4 @@ token = "replace-with-secret"
 [transport]
 # REALITY / XRay transport material (optional)
 reality_cert = "certs/reality.pem"
-reality_fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+reality_fingerprint = "0dc9ec3e2457782fab76e8debad009d12a69220df895d0ef3c3e8c6323599b9b"
