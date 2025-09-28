@@ -1936,7 +1936,7 @@ impl CommuCatApp {
                 outbound = rx_out.recv() => {
                     match outbound {
                         Some(frame) => {
-                            if let Err(err) = self.write_frame(&mut session, frame).await {
+                            if let Err(err) = self.write_frame(&mut session, frame, Some(&transport)).await {
                                 error!("outbound send failed: {}", err);
                                 break;
                             }
