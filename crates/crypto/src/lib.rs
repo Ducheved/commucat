@@ -136,6 +136,17 @@ impl NoiseHandshake {
         Ok(buffer)
     }
 
+    /// Returns the running handshake hash as defined by Noise.
+    pub fn handshake_hash(&self) -> Result<[u8; 32], CryptoError> {
+        let hash = self.state.get_handshake_hash();
+        if hash.len() != 32 {
+            return Err(CryptoError::NoiseFailure);
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(hash);
+        Ok(out)
+    }
+
     /// Finalizes the handshake and returns a transport object.
     pub fn into_transport(self) -> Result<NoiseTransport, CryptoError> {
         let state = self
