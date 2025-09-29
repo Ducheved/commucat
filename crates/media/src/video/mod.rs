@@ -11,6 +11,13 @@
 use crate::{MediaError, MediaResult};
 use commucat_media_types::{HardwareAcceleration, MediaSourceMode, VideoCodec};
 use env_libvpx_sys as vpx;
+#[cfg(feature = "codec-av1")]
+use rav1e::prelude::{
+    Config as Rav1eConfig, Context as Rav1eContext, EncoderConfig as Rav1eEncoderConfig,
+    EncoderStatus as Rav1eStatus, FrameParameters as Rav1eFrameParameters,
+    FrameType as Rav1eFrameType, FrameTypeOverride, Plane as Rav1ePlane, Rational as Rav1eRational,
+    Tune as Rav1eTune,
+};
 use std::convert::TryFrom;
 use std::fmt;
 use std::mem::MaybeUninit;
@@ -62,9 +69,8 @@ pub struct VideoEncoder {
 enum VideoEncoderBackend {
     Raw,
     Vpx(VpxEncoder),
-    #[allow(dead_code)]
     #[cfg(feature = "codec-av1")]
-    Av1,
+    Av1(Rav1eEncoder),
     #[allow(dead_code)]
     #[cfg(feature = "codec-h264")]
     H264,
@@ -130,8 +136,7 @@ impl VideoEncoder {
             VideoCodec::Av1Main => {
                 #[cfg(feature = "codec-av1")]
                 {
-                    // TODO: integrate rav1e encoder backend
-                    VideoEncoderBackend::Unsupported(VideoCodec::Av1Main)
+                    VideoEncoderBackend::Av1(Rav1eEncoder::new(&config)?)
                 }
                 #[cfg(not(feature = "codec-av1"))]
                 {
@@ -171,7 +176,11 @@ impl VideoEncoder {
                 Ok(frames)
             }
             #[cfg(feature = "codec-av1")]
-            VideoEncoderBackend::Av1 => Err(MediaError::Unsupported),
+            VideoEncoderBackend::Av1(encoder) => {
+                let frames = encoder.encode(frame, timestamp, force_keyframe, &self.cfg)?;
+                self.pts = self.pts.wrapping_add(1);
+                Ok(frames)
+            }
             #[cfg(feature = "codec-h264")]
             VideoEncoderBackend::H264 => Err(MediaError::Unsupported),
             VideoEncoderBackend::Unsupported(codec) => Err(MediaError::Codec(format!(
@@ -332,9 +341,142 @@ struct VpxEncoder {
     codec: VideoCodec,
 }
 
+#[cfg(feature = "codec-av1")]
+struct Rav1eEncoder {
+    ctx: Rav1eContext<u8>,
+    config: Rav1eEncoderConfig,
+    threads: usize,
+}
+
 unsafe impl Send for VpxEncoder {}
 unsafe impl Send for VideoEncoder {}
 unsafe impl Send for VideoDecoder {}
+
+#[cfg(feature = "codec-av1")]
+impl Rav1eEncoder {
+    fn new(config: &VideoEncoderConfig) -> MediaResult<Self> {
+        let mut rav_config = Rav1eEncoderConfig::with_speed_preset(6);
+        rav_config.width = usize::try_from(config.width)
+            .map_err(|_| MediaError::InvalidConfig("width exceeds usize"))?;
+        rav_config.height = usize::try_from(config.height)
+            .map_err(|_| MediaError::InvalidConfig("height exceeds usize"))?;
+        rav_config.time_base = Rav1eRational::new(
+            u64::from(config.timebase_num.max(1)),
+            u64::from(config.timebase_den.max(1)),
+        );
+        rav_config.min_quantizer = config.min_quantizer.min(u32::from(u8::MAX)) as u8;
+        rav_config.quantizer = config.max_quantizer.min(u32::from(u8::MAX)) as usize;
+        rav_config.low_latency = true;
+        rav_config.bitrate = config.bitrate.min(i32::MAX as u32) as i32;
+        rav_config.tune = Rav1eTune::Psychovisual;
+        let threads = usize::from(config.threads.max(1));
+        let builder = Rav1eConfig::new()
+            .with_encoder_config(rav_config.clone())
+            .with_threads(threads);
+        let ctx = builder
+            .new_context()
+            .map_err(|err| MediaError::Codec(format!("rav1e context init failed: {err}")))?;
+        Ok(Self {
+            ctx,
+            config: rav_config,
+            threads,
+        })
+    }
+
+    fn encode(
+        &mut self,
+        frame: I420Borrowed<'_>,
+        timestamp: u64,
+        force_keyframe: bool,
+        settings: &VideoEncoderConfig,
+    ) -> MediaResult<Vec<VideoFrame>> {
+        let mut rav_frame = self.ctx.new_frame();
+        let width = settings.width as usize;
+        let height = settings.height as usize;
+        copy_to_rav1e_plane(
+            &mut rav_frame.planes[0],
+            frame.y,
+            frame.stride_y,
+            width,
+            height,
+        );
+        copy_to_rav1e_plane(
+            &mut rav_frame.planes[1],
+            frame.u,
+            frame.stride_u,
+            width / 2,
+            height / 2,
+        );
+        copy_to_rav1e_plane(
+            &mut rav_frame.planes[2],
+            frame.v,
+            frame.stride_v,
+            width / 2,
+            height / 2,
+        );
+
+        if force_keyframe {
+            let mut params = Rav1eFrameParameters::default();
+            params.frame_type_override = FrameTypeOverride::Key;
+            self.ctx
+                .send_frame((rav_frame, params))
+                .map_err(|err| MediaError::Codec(format!("rav1e send_frame failed: {err}")))?;
+        } else {
+            self.ctx
+                .send_frame(rav_frame)
+                .map_err(|err| MediaError::Codec(format!("rav1e send_frame failed: {err}")))?;
+        }
+
+        self.ctx.flush();
+        let mut output = Vec::new();
+        loop {
+            match self.ctx.receive_packet() {
+                Ok(packet) => {
+                    let keyframe = matches!(packet.frame_type, Rav1eFrameType::KEY);
+                    let data = packet.data;
+                    output.push(VideoFrame {
+                        timestamp,
+                        keyframe,
+                        codec: VideoCodec::Av1Main,
+                        width: settings.width,
+                        height: settings.height,
+                        data,
+                    });
+                }
+                Err(Rav1eStatus::NeedMoreData) | Err(Rav1eStatus::LimitReached) => break,
+                Err(Rav1eStatus::Encoded) => continue,
+                Err(err) => {
+                    return Err(MediaError::Codec(format!(
+                        "rav1e receive_packet failed: {err}"
+                    )));
+                }
+            }
+        }
+        let builder = Rav1eConfig::new()
+            .with_encoder_config(self.config.clone())
+            .with_threads(self.threads);
+        self.ctx = builder
+            .new_context()
+            .map_err(|err| MediaError::Codec(format!("rav1e context reset failed: {err}")))?;
+        Ok(output)
+    }
+}
+
+#[cfg(feature = "codec-av1")]
+fn copy_to_rav1e_plane(
+    plane: &mut Rav1ePlane<u8>,
+    src: &[u8],
+    src_stride: usize,
+    width: usize,
+    height: usize,
+) {
+    let dst_stride = plane.cfg.stride;
+    let data = &mut plane.data[..];
+    for (row_idx, dst_row) in data.chunks_mut(dst_stride).take(height).enumerate() {
+        let src_offset = row_idx * src_stride;
+        dst_row[..width].copy_from_slice(&src[src_offset..src_offset + width]);
+    }
+}
 
 impl VpxEncoder {
     fn new(codec: VideoCodec, config: &VideoEncoderConfig) -> MediaResult<Self> {
@@ -704,6 +846,40 @@ mod tests {
         assert_eq!(decoded[0].width, encoder.cfg.width);
         assert_eq!(decoded[0].height, encoder.cfg.height);
         assert_eq!(decoded[0].codec, VideoCodec::RawI420);
+    }
+
+    #[cfg(feature = "codec-av1")]
+    #[test]
+    fn av1_encoder_outputs_bitstream() {
+        let mut encoder = VideoEncoder::new(VideoEncoderConfig {
+            codec: VideoCodec::Av1Main,
+            ..VideoEncoderConfig::default()
+        })
+        .expect("av1 encoder");
+        let width = encoder.cfg.width as usize;
+        let height = encoder.cfg.height as usize;
+        let uv_width = (width + 1) / 2;
+        let uv_height = (height + 1) / 2;
+        let y = vec![0x20; width * height];
+        let u = vec![0x80; uv_width * uv_height];
+        let v = vec![0x80; uv_width * uv_height];
+        let frames = encoder
+            .encode(
+                I420Borrowed {
+                    y: &y,
+                    u: &u,
+                    v: &v,
+                    stride_y: width,
+                    stride_u: uv_width,
+                    stride_v: uv_width,
+                },
+                0,
+                true,
+            )
+            .expect("encode");
+        assert!(!frames.is_empty());
+        assert_eq!(frames[0].codec, VideoCodec::Av1Main);
+        assert!(!frames[0].data.is_empty());
     }
 
     #[test]

@@ -11,6 +11,11 @@ keywords = ["commucat", "server", "pingora"]
 categories = ["network-programming", "asynchronous"]
 publish = false
 
+[features]
+default = []
+media-av1 = ["commucat-media/codec-av1"]
+media-h264 = ["commucat-media/codec-h264"]
+
 [dependencies]
 chrono = { workspace = true }
 commucat-crypto = { path = "../crypto", version = "1.0", features = ["pq"] }

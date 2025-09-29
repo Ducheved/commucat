@@ -126,6 +126,7 @@ fingerprint = "0123..." # hex32
    - `hybrid` — зарезервировано под будущую адаптацию.
 4. **Ограничения**: нет FEC, нет SVC, нет контроля битрейта. AV1/H264, GPU и capability renegotiation пока не реализованы.
 5. **ICE/trickle**: `CallTransport` описывает кандидатов, ICE-креды и `consent_interval_secs`; incremental обновления летят через `FrameType::TransportUpdate`, сервер валидирует их, пишет в `CallSession.transport_updates` и подтверждает ACK с `call_id`/`update`.
+6. **AV1**: при включённой фиче `media-av1` сервер транскодирует RAW I420 в AV1 (rav1e) и автоматически выбирает целевой кодек по `preferred_codecs`, откатываясь на VP8/VP9 для старых клиентов.
 
 ---
 

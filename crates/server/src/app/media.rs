@@ -291,13 +291,34 @@ fn build_audio_transcoder(
     }
 }
 
+fn select_video_codec(params: &VideoParameters) -> VideoCodec {
+    for candidate in params
+        .preferred_codecs
+        .iter()
+        .chain(std::iter::once(&params.codec))
+    {
+        match candidate {
+            VideoCodec::Vp8 | VideoCodec::Vp9 => return *candidate,
+            VideoCodec::Av1Main => {
+                #[cfg(feature = "media-av1")]
+                {
+                    return VideoCodec::Av1Main;
+                }
+            }
+            _ => {}
+        }
+    }
+    VideoCodec::Vp8
+}
+
 fn build_video_transcoder(
     params: &VideoParameters,
 ) -> Result<Option<VideoTranscoder>, MediaTranscoderError> {
-    match params.codec {
-        VideoCodec::Vp8 => {
+    let target = select_video_codec(params);
+    match target {
+        VideoCodec::Vp8 | VideoCodec::Vp9 => {
             let config = VideoEncoderConfig {
-                codec: VideoCodec::Vp8,
+                codec: target,
                 width: params.max_resolution.width.into(),
                 height: params.max_resolution.height.into(),
                 timebase_num: 1,
@@ -315,7 +336,7 @@ fn build_video_transcoder(
             let uv_height = height_usize.div_ceil(2);
             Ok(Some(VideoTranscoder {
                 encoder,
-                target_codec: VideoCodec::Vp8,
+                target_codec: target,
                 width,
                 height,
                 uv_width,
@@ -323,6 +344,42 @@ fn build_video_transcoder(
                 next_pts: 0,
                 force_keyframe: true,
             }))
+        }
+        VideoCodec::Av1Main => {
+            #[cfg(feature = "media-av1")]
+            {
+                let config = VideoEncoderConfig {
+                    codec: VideoCodec::Av1Main,
+                    width: params.max_resolution.width.into(),
+                    height: params.max_resolution.height.into(),
+                    timebase_num: 1,
+                    timebase_den: u32::from(params.frame_rate.max(1)),
+                    bitrate: params.max_bitrate,
+                    source: MediaSourceMode::Raw,
+                    ..VideoEncoderConfig::default()
+                };
+                let width = config.width;
+                let height = config.height;
+                let encoder = VideoEncoder::new(config).map_err(MediaTranscoderError::from)?;
+                let width_usize = usize::try_from(width).expect("width fits usize");
+                let height_usize = usize::try_from(height).expect("height fits usize");
+                let uv_width = width_usize.div_ceil(2);
+                let uv_height = height_usize.div_ceil(2);
+                return Ok(Some(VideoTranscoder {
+                    encoder,
+                    target_codec: VideoCodec::Av1Main,
+                    width,
+                    height,
+                    uv_width,
+                    uv_height,
+                    next_pts: 0,
+                    force_keyframe: true,
+                }));
+            }
+            #[cfg(not(feature = "media-av1"))]
+            {
+                Ok(None)
+            }
         }
         _ => Ok(None),
     }
@@ -414,5 +471,24 @@ mod tests {
         let parsed = ParsedVideoPacket::parse(encoded.as_slice()).expect("parse");
         assert_eq!(parsed.source, MediaSourceMode::Encoded);
         assert!(!parsed.payload.is_empty());
+    }
+
+    #[cfg(feature = "media-av1")]
+    #[test]
+    fn select_video_codec_prefers_av1() {
+        let params = VideoParameters {
+            codec: VideoCodec::Vp8,
+            max_bitrate: 750_000,
+            max_resolution: VideoResolution::new(1280, 720),
+            frame_rate: 30,
+            adaptive: true,
+            source: MediaSourceMode::Raw,
+            preferred_codecs: vec![VideoCodec::Av1Main, VideoCodec::Vp8],
+            available_codecs: vec![VideoCodecDescriptor::default()],
+            hardware: vec![],
+            allow_passthrough: true,
+            capabilities: None,
+        };
+        assert_eq!(select_video_codec(&params), VideoCodec::Av1Main);
     }
 }

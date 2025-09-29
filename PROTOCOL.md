@@ -240,6 +240,7 @@ byte 2: кодек (AudioCodec либо VideoCodec)
     }
   }
   ```
+- При включённой фиче `media-av1` сервер транскодирует RAW I420 в AV1 (rav1e) и возвращает VP8/VP9 при отсутствии пересечения `preferred_codecs`.
 - Для incremental ICE используется `FrameType::TransportUpdate` (`CallTransportUpdate`). Сервер принимает JSON вида:
   ```json
   {"update":"candidate","call_id":"call-xyz","candidate":{...}}
