@@ -3,12 +3,13 @@ use crate::metrics::SecuritySnapshot;
 use crate::transport::{
     Endpoint, MultipathEndpoint, RaptorqDecoder, RealityConfig, ResistanceLevel, TransportType,
 };
-use crate::util::{decode_hex32, encode_hex};
+use crate::util::{decode_hex32, encode_hex, generate_id};
 use commucat_crypto::{DeviceKeyPair, HandshakePattern, NoiseConfig, PqxdhBundle, build_handshake};
 use ml_kem::EncodedSizeUser;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -55,6 +56,7 @@ pub struct FecHint {
 pub struct P2pAssistResponse {
     pub noise: NoiseAdvice,
     pub pq: PqAdvice,
+    pub ice: IceAdvice,
     pub transports: Vec<TransportAdvice>,
     pub multipath: MultipathAdvice,
     pub obfuscation: ObfuscationAdvice,
@@ -75,6 +77,15 @@ pub struct PqAdvice {
     pub signed_prekey_public_hex: String,
     pub kem_public_hex: String,
     pub signature_public_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IceAdvice {
+    pub username_fragment: String,
+    pub password: String,
+    pub ttl_secs: u32,
+    pub keepalive_interval_secs: u16,
+    pub trickle: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -198,10 +209,12 @@ pub(super) async fn handle_assist(
     state.metrics.mark_noise_handshake();
     let pq = build_pq_advice()?;
     state.metrics.mark_pq_handshake();
+    let ice = build_ice_advice(state);
 
     let response = P2pAssistResponse {
         noise,
         pq,
+        ice,
         transports,
         multipath: MultipathAdvice {
             fec_mtu: fec_profile.mtu,
@@ -362,4 +375,21 @@ fn build_pq_advice() -> Result<PqAdvice, ApiError> {
         kem_public_hex: encode_hex(kem_public.as_ref()),
         signature_public_hex: encode_hex(signature_public.as_ref()),
     })
+}
+
+fn build_ice_advice(state: &AppState) -> IceAdvice {
+    let ufrag_seed = generate_id("ice-ufrag");
+    let pwd_seed = generate_id("ice-password");
+    let username_fragment: String = ufrag_seed.chars().take(16).collect();
+    let password: String = pwd_seed.chars().take(64).collect();
+    let ttl_secs = state.config.pairing_ttl_seconds.clamp(60, 3_600) as u32;
+    let keepalive = state.config.connection_keepalive.clamp(5, 120);
+    let keepalive_interval_secs = u16::try_from(keepalive).unwrap_or(30);
+    IceAdvice {
+        username_fragment,
+        password,
+        ttl_secs,
+        keepalive_interval_secs,
+        trickle: true,
+    }
 }

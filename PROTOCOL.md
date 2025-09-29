@@ -125,7 +125,7 @@ frame_body   = frame_type (u8) || channel_id (varint) || sequence (varint) || pa
 Ограничения: `frame_len ≤ 16 MiB`, JSON ≤ 256 KiB, `channel_id`/`sequence ≤ 2^32-1`.
 
 ### 5.2 Типы кадров
-- Управляющие: `HELLO`, `AUTH`, `JOIN`, `LEAVE`, `ACK`, `ERROR`, `CALL_*`, `PRESENCE`, `CALL_STATS`.
+- Управляющие: `HELLO`, `AUTH`, `JOIN`, `LEAVE`, `ACK`, `ERROR`, `CALL_*`, `PRESENCE`, `CALL_STATS`, `TRANSPORT_UPDATE`.
 - Контент: `MSG`, `TYPING`, `KEY_UPDATE`, `GROUP_EVENT`, `VOICE_FRAME`, `VIDEO_FRAME`.
 
 `FramePayload::Control` содержит JSON (serde), `FramePayload::Opaque` — произвольные байты.
@@ -133,6 +133,7 @@ frame_body   = frame_type (u8) || channel_id (varint) || sequence (varint) || pa
 ### 5.3 ACK/Sequencing
 - Каждое приложение ведёт локальный `sequence` (u32). Сервер проверяет монотонность.
 - На каждое входящее сообщение сервер отвечает `ACK` с `{"ack": <sequence>}`.
+- Для `TRANSPORT_UPDATE` дополнительно возвращаются `call_id` и `update` (`candidate`, `selected_candidate_pair`, `consent_keepalive`).
 
 ### 5.4 Ошибки
 `ERROR` следует [RFC 9457]. Типичные ошибки: `Invalid Frame Type`, `Protocol Version Mismatch`, `PairingRequired`, `Varint Overflow`, `Frame Too Large`.
@@ -206,11 +207,54 @@ byte 2: кодек (AudioCodec либо VideoCodec)
 - `MediaSourceMode::Hybrid` пока не имеет особенной логики.
 - Сервер не выполняет синхронизацию RTP/таймингов — только монотонный `sequence`.
 
+### 7.5 ICE и trickle-кандидаты
+- `CallTransport` теперь содержит `candidates` (расширенные ICE-кандидаты с `foundation`, `component`, `priority`, `candidate_type`, `related_*`, `tcp_type`, `sdp_mid`, `sdp_mline_index`, `url`), `ice_credentials` (`username_fragment`, `password`, `expires_at`), флаг `trickle` и `consent_interval_secs` (рекомендуемый интервал STUN Binding-запросов).
+- Пример фрагмента `CallOffer`/`CallAnswer`:
+  ```json
+  {
+    "transport": {
+      "prefer_relay": false,
+      "trickle": true,
+      "consent_interval_secs": 20,
+      "ice_credentials": {
+        "username_fragment": "1f2e3d4c5b6a",
+        "password": "4e39d8...",
+        "expires_at": 1700000600
+      },
+      "candidates": [
+        {
+          "address": "198.51.100.12",
+          "port": 60000,
+          "protocol": "udp",
+          "foundation": "f1",
+          "component": 1,
+          "priority": 12345678,
+          "candidate_type": "srflx",
+          "related_address": "10.0.0.5",
+          "related_port": 52333,
+          "sdp_mid": "0",
+          "sdp_mline_index": 0
+        }
+      ],
+      "fingerprints": ["sha-256 01:23:..." ]
+    }
+  }
+  ```
+- Для incremental ICE используется `FrameType::TransportUpdate` (`CallTransportUpdate`). Сервер принимает JSON вида:
+  ```json
+  {"update":"candidate","call_id":"call-xyz","candidate":{...}}
+  {"update":"selected_candidate_pair","call_id":"call-xyz","local":{...},"remote":{...},"rtt_ms":22}
+  {"update":"consent_keepalive","call_id":"call-xyz","interval_secs":20}
+  ```
+  Проверяется принадлежность устройства звонку, обновляется `CallSession.transport_updates`, и в ответ приходит `ACK` с `{"ack":<seq>,"call_id":"call-xyz","update":"candidate"}`.
+- Метрики фиксируют количество кандидатов (`commucat_transport_candidates`), выбор пар (`commucat_transport_pairs`) и keepalive-события (`commucat_transport_keepalive`).
+
 ## 8. P2P assist и дополнительные сервисы
 
 ### 8.1 `POST /api/p2p/assist`
 Возвращает
 - рекомендации по Noise/PQ ключам (черновик для прямых каналов),
+- ICE-блок (`ice`): `username_fragment`, `password`, `ttl_secs`, `keepalive_interval_secs`, флаг `trickle`.
 - список транспортов (TOR/Reality/AmnesiaWG/Shadowsocks) — сейчас заглушки, базируются на `tokio::io::duplex`.
 - параметры FEC/Multi-path (только аналитика).
 

@@ -68,6 +68,7 @@ pub enum FrameType {
     VoiceFrame = 0x11,
     VideoFrame = 0x12,
     CallStats = 0x13,
+    TransportUpdate = 0x14,
 }
 
 impl FrameType {
@@ -92,6 +93,7 @@ impl FrameType {
             0x11 => Some(Self::VoiceFrame),
             0x12 => Some(Self::VideoFrame),
             0x13 => Some(Self::CallStats),
+            0x14 => Some(Self::TransportUpdate),
             _ => None,
         }
     }
@@ -175,6 +177,7 @@ impl FramePayload {
             | FrameType::CallAnswer
             | FrameType::CallEnd
             | FrameType::CallStats
+            | FrameType::TransportUpdate
             | FrameType::KeyUpdate => {
                 if data.len() > MAX_CONTROL_JSON_LEN {
                     return Err(CodecError::ControlTooLarge);
@@ -409,7 +412,10 @@ mod tests {
     #[test]
     fn encode_roundtrip_call_offer_frame() {
         use crate::call::{AudioParameters, VideoParameters};
-        use crate::call::{CallMediaProfile, TransportCandidate, TransportProtocol};
+        use crate::call::{
+            CallMediaProfile, IceCandidateType, IceCredentials, TransportCandidate,
+            TransportProtocol,
+        };
         use crate::call::{CallMode, CallOffer, CallTransport};
         use commucat_media_types::{VideoCodec, VideoResolution};
         use std::convert::TryInto;
@@ -436,12 +442,29 @@ mod tests {
             metadata: serde_json::json!({"mode": "voice"}),
             transport: Some(CallTransport {
                 prefer_relay: false,
-                udp_candidates: vec![TransportCandidate {
+                candidates: vec![TransportCandidate {
                     address: "198.51.100.12".to_string(),
-                    port: 60000,
+                    port: 60_000,
                     protocol: TransportProtocol::Udp,
+                    foundation: Some("f1".to_string()),
+                    component: Some(1),
+                    priority: Some(12_345_678),
+                    candidate_type: Some(IceCandidateType::Srflx),
+                    related_address: Some("10.0.0.5".to_string()),
+                    related_port: Some(52_333),
+                    tcp_type: None,
+                    sdp_mid: Some("0".to_string()),
+                    sdp_mline_index: Some(0),
+                    url: None,
                 }],
                 fingerprints: vec!["deadbeef".to_string()],
+                ice_credentials: Some(IceCredentials {
+                    username_fragment: "ufrag".to_string(),
+                    password: "pwd".to_string(),
+                    expires_at: None,
+                }),
+                trickle: false,
+                consent_interval_secs: None,
             }),
             expires_at: Some(1_690_000_000),
             ephemeral_key: None,

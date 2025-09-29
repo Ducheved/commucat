@@ -125,6 +125,7 @@ fingerprint = "0123..." # hex32
    - `raw` — сервер перекодирует;
    - `hybrid` — зарезервировано под будущую адаптацию.
 4. **Ограничения**: нет FEC, нет SVC, нет контроля битрейта. AV1/H264, GPU и capability renegotiation пока не реализованы.
+5. **ICE/trickle**: `CallTransport` описывает кандидатов, ICE-креды и `consent_interval_secs`; incremental обновления летят через `FrameType::TransportUpdate`, сервер валидирует их, пишет в `CallSession.transport_updates` и подтверждает ACK с `call_id`/`update`.
 
 ---
 

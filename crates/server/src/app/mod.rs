@@ -30,7 +30,7 @@ use commucat_proto::{
     call::{
         CallAnswer as ProtoCallAnswer, CallEnd as ProtoCallEnd, CallEndReason, CallMediaDirection,
         CallMediaProfile, CallMode, CallOffer as ProtoCallOffer, CallRejectReason,
-        CallStats as ProtoCallStats,
+        CallStats as ProtoCallStats, CallTransport, CallTransportUpdate, TransportUpdatePayload,
     },
     is_supported_protocol_version, negotiate_protocol_version,
 };
@@ -338,6 +338,8 @@ pub struct CallSession {
     pub accepted: HashSet<String>,
     pub participants: HashSet<String>,
     pub stats: HashMap<String, ProtoCallStats>,
+    pub transport: Option<CallTransport>,
+    pub transport_updates: HashMap<String, CallTransportUpdate>,
 }
 
 pub struct PeerPresence {
@@ -2709,6 +2711,8 @@ impl CommuCatApp {
             accepted,
             participants: participants.clone(),
             stats: HashMap::new(),
+            transport: offer.transport.clone(),
+            transport_updates: HashMap::new(),
         };
         sessions.insert(offer.call_id.clone(), session);
         drop(sessions);
@@ -2797,6 +2801,9 @@ impl CommuCatApp {
         if let Some(profile) = &answer.media {
             session.media = profile.clone();
         }
+        if let Some(transport) = &answer.transport {
+            session.transport = Some(transport.clone());
+        }
         let updated_profile = session.media.clone();
         let mode = updated_profile.mode;
         let video = updated_profile.video.is_some();
@@ -2861,6 +2868,46 @@ impl CommuCatApp {
         }
         session.last_update = Utc::now();
         session.stats.insert(device_id.to_string(), stats.clone());
+        Ok(())
+    }
+
+    async fn apply_transport_update(
+        &self,
+        device_id: &str,
+        update: &CallTransportUpdate,
+    ) -> Result<(), ServerError> {
+        let mut sessions = self.state.call_sessions.write().await;
+        let Some(session) = sessions.get_mut(&update.call_id) else {
+            return Err(ServerError::Invalid);
+        };
+        if !session.participants.contains(device_id) {
+            return Err(ServerError::Invalid);
+        }
+        session.last_update = Utc::now();
+        session
+            .transport_updates
+            .insert(device_id.to_string(), update.clone());
+        match &update.payload {
+            TransportUpdatePayload::Candidate { .. } => {
+                self.state.metrics.mark_transport_candidate();
+            }
+            TransportUpdatePayload::SelectedCandidatePair { .. } => {
+                self.state.metrics.mark_transport_pair_selected();
+            }
+            TransportUpdatePayload::ConsentKeepalive { interval_secs } => {
+                if let Some(interval) = interval_secs {
+                    if let Some(transport) = session.transport.as_mut() {
+                        transport.consent_interval_secs = Some(*interval);
+                    } else {
+                        session.transport = Some(CallTransport {
+                            consent_interval_secs: Some(*interval),
+                            ..CallTransport::default()
+                        });
+                    }
+                }
+                self.state.metrics.mark_transport_keepalive();
+            }
+        }
         Ok(())
     }
 
@@ -3200,6 +3247,38 @@ impl CommuCatApp {
                         CallMediaDirection::Receive => "receive",
                     }),
                 );
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: serde_json::Value::Object(properties),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::TransportUpdate => {
+                let envelope = match frame.payload {
+                    FramePayload::Control(ref env) => env,
+                    _ => return Err(ServerError::Invalid),
+                };
+                let update =
+                    CallTransportUpdate::try_from(envelope).map_err(|_| ServerError::Invalid)?;
+                self.apply_transport_update(device_id, &update).await?;
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let update_label = match &update.payload {
+                    TransportUpdatePayload::Candidate { .. } => "candidate",
+                    TransportUpdatePayload::SelectedCandidatePair { .. } => {
+                        "selected_candidate_pair"
+                    }
+                    TransportUpdatePayload::ConsentKeepalive { .. } => "consent_keepalive",
+                };
+                let mut properties = serde_json::Map::new();
+                properties.insert("ack".to_string(), json!(frame.sequence));
+                properties.insert("call_id".to_string(), json!(update.call_id.clone()));
+                properties.insert("update".to_string(), json!(update_label));
                 let ack = Frame {
                     channel_id: frame.channel_id,
                     sequence: *server_sequence,

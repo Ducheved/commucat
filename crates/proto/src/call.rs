@@ -29,6 +29,8 @@ pub struct AudioParameters {
     #[serde(default)]
     pub source: MediaSourceMode,
     #[serde(default)]
+    pub preferred_codecs: Vec<AudioCodec>,
+    #[serde(default)]
     pub available_codecs: Vec<AudioCodecDescriptor>,
     #[serde(default)]
     pub allow_passthrough: bool,
@@ -44,6 +46,7 @@ impl Default for AudioParameters {
             fec: true,
             dtx: true,
             source: MediaSourceMode::Raw,
+            preferred_codecs: vec![AudioCodec::Opus],
             available_codecs: vec![AudioCodecDescriptor::default()],
             allow_passthrough: false,
         }
@@ -60,6 +63,8 @@ pub struct VideoParameters {
     pub adaptive: bool,
     #[serde(default)]
     pub source: MediaSourceMode,
+    #[serde(default)]
+    pub preferred_codecs: Vec<VideoCodec>,
     #[serde(default)]
     pub available_codecs: Vec<VideoCodecDescriptor>,
     #[serde(default)]
@@ -79,6 +84,7 @@ impl Default for VideoParameters {
             frame_rate: 24,
             adaptive: true,
             source: MediaSourceMode::Raw,
+            preferred_codecs: vec![VideoCodec::Vp8],
             available_codecs: vec![VideoCodecDescriptor::default()],
             hardware: vec![HardwareAcceleration::Cpu],
             allow_passthrough: true,
@@ -109,14 +115,6 @@ impl Default for CallMediaProfile {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TransportCandidate {
-    pub address: String,
-    pub port: u16,
-    #[serde(default)]
-    pub protocol: TransportProtocol,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum TransportProtocol {
@@ -125,14 +123,112 @@ pub enum TransportProtocol {
     Udp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IceCandidateType {
+    Host,
+    Srflx,
+    Prflx,
+    Relay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IceTcpCandidateType {
+    Active,
+    Passive,
+    So,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IceCredentials {
+    pub username_fragment: String,
+    pub password: String,
+    #[serde(default)]
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportCandidate {
+    pub address: String,
+    pub port: u16,
+    #[serde(default)]
+    pub protocol: TransportProtocol,
+    #[serde(default)]
+    pub foundation: Option<String>,
+    #[serde(default)]
+    pub component: Option<u8>,
+    #[serde(default)]
+    pub priority: Option<u32>,
+    #[serde(default)]
+    pub candidate_type: Option<IceCandidateType>,
+    #[serde(default)]
+    pub related_address: Option<String>,
+    #[serde(default)]
+    pub related_port: Option<u16>,
+    #[serde(default)]
+    pub tcp_type: Option<IceTcpCandidateType>,
+    #[serde(default)]
+    pub sdp_mid: Option<String>,
+    #[serde(default)]
+    pub sdp_mline_index: Option<u16>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct CallTransport {
     #[serde(default)]
     pub prefer_relay: bool,
-    #[serde(default)]
-    pub udp_candidates: Vec<TransportCandidate>,
+    #[serde(default, alias = "udp_candidates")]
+    pub candidates: Vec<TransportCandidate>,
     #[serde(default)]
     pub fingerprints: Vec<String>,
+    #[serde(default)]
+    pub ice_credentials: Option<IceCredentials>,
+    #[serde(default)]
+    pub trickle: bool,
+    #[serde(default)]
+    pub consent_interval_secs: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportCandidateRef {
+    pub address: String,
+    pub port: u16,
+    #[serde(default)]
+    pub protocol: TransportProtocol,
+    #[serde(default)]
+    pub candidate_type: Option<IceCandidateType>,
+    #[serde(default)]
+    pub foundation: Option<String>,
+    #[serde(default)]
+    pub priority: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallTransportUpdate {
+    pub call_id: String,
+    #[serde(flatten)]
+    pub payload: TransportUpdatePayload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "update", rename_all = "snake_case")]
+pub enum TransportUpdatePayload {
+    Candidate {
+        candidate: TransportCandidate,
+    },
+    SelectedCandidatePair {
+        local: TransportCandidateRef,
+        remote: TransportCandidateRef,
+        #[serde(default)]
+        rtt_ms: Option<u32>,
+    },
+    ConsentKeepalive {
+        #[serde(default)]
+        interval_secs: Option<u16>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +385,7 @@ impl_control_codec!(CallOffer);
 impl_control_codec!(CallAnswer);
 impl_control_codec!(CallEnd);
 impl_control_codec!(CallStats);
+impl_control_codec!(CallTransportUpdate);
 
 #[cfg(test)]
 mod tests {
@@ -311,6 +408,7 @@ mod tests {
                     fec: true,
                     dtx: false,
                     source: MediaSourceMode::Raw,
+                    preferred_codecs: vec![AudioCodec::Opus, AudioCodec::RawPcm],
                     available_codecs: vec![
                         AudioCodecDescriptor {
                             codec: AudioCodec::Opus,
@@ -336,6 +434,7 @@ mod tests {
                     frame_rate: 20,
                     adaptive: true,
                     source: MediaSourceMode::Raw,
+                    preferred_codecs: vec![VideoCodec::Vp8, VideoCodec::H264Baseline],
                     available_codecs: vec![
                         VideoCodecDescriptor {
                             codec: VideoCodec::Vp8,
@@ -379,12 +478,29 @@ mod tests {
             metadata: serde_json::json!({"mode": "voice"}),
             transport: Some(CallTransport {
                 prefer_relay: false,
-                udp_candidates: vec![TransportCandidate {
+                candidates: vec![TransportCandidate {
                     address: "203.0.113.10".to_string(),
                     port: 3478,
                     protocol: TransportProtocol::Udp,
+                    foundation: Some("foundation-1".to_string()),
+                    component: Some(1),
+                    priority: Some(1_234_567),
+                    candidate_type: Some(IceCandidateType::Srflx),
+                    related_address: Some("10.0.0.5".to_string()),
+                    related_port: Some(52_333),
+                    tcp_type: None,
+                    sdp_mid: Some("0".to_string()),
+                    sdp_mline_index: Some(0),
+                    url: Some("stun:stun.commucat".to_string()),
                 }],
                 fingerprints: vec!["abc123".to_string()],
+                ice_credentials: Some(IceCredentials {
+                    username_fragment: "ufrag".to_string(),
+                    password: "secret".to_string(),
+                    expires_at: Some(1_700_000_600),
+                }),
+                trickle: true,
+                consent_interval_secs: Some(20),
             }),
             expires_at: Some(1_700_000_000),
             ephemeral_key: Some("feedface".to_string()),
@@ -392,7 +508,16 @@ mod tests {
         let envelope: ControlEnvelope = (&offer).try_into().expect("encode");
         let decoded = CallOffer::try_from(&envelope).expect("decode");
         assert_eq!(decoded.call_id, offer.call_id);
-        assert_eq!(decoded.transport.as_ref().unwrap().udp_candidates.len(), 1);
+        let transport = decoded.transport.as_ref().expect("transport");
+        assert_eq!(transport.candidates.len(), 1);
+        assert_eq!(
+            transport
+                .ice_credentials
+                .as_ref()
+                .expect("credentials")
+                .username_fragment,
+            "ufrag"
+        );
         assert_eq!(
             decoded
                 .media
@@ -403,6 +528,85 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(decoded.media.audio.preferred_codecs[0], AudioCodec::Opus);
+        assert_eq!(
+            decoded
+                .media
+                .video
+                .as_ref()
+                .and_then(|video| video.preferred_codecs.first())
+                .copied(),
+            Some(VideoCodec::Vp8)
+        );
+    }
+
+    #[test]
+    fn transport_update_roundtrip() {
+        let candidate = TransportCandidate {
+            address: "198.51.100.12".to_string(),
+            port: 60_000,
+            protocol: TransportProtocol::Udp,
+            foundation: Some("f1".to_string()),
+            component: Some(1),
+            priority: Some(12_345_678),
+            candidate_type: Some(IceCandidateType::Srflx),
+            related_address: Some("10.0.0.5".to_string()),
+            related_port: Some(52_333),
+            tcp_type: None,
+            sdp_mid: Some("0".to_string()),
+            sdp_mline_index: Some(0),
+            url: None,
+        };
+        let update = CallTransportUpdate {
+            call_id: "call-xyz".to_string(),
+            payload: TransportUpdatePayload::Candidate {
+                candidate: candidate.clone(),
+            },
+        };
+        let envelope: ControlEnvelope = (&update).try_into().expect("encode");
+        let decoded = CallTransportUpdate::try_from(&envelope).expect("decode");
+        assert_eq!(decoded.call_id, update.call_id);
+        match decoded.payload {
+            TransportUpdatePayload::Candidate {
+                candidate: ref decoded_candidate,
+            } => {
+                assert_eq!(decoded_candidate.address, candidate.address);
+                assert_eq!(decoded_candidate.priority, candidate.priority);
+            }
+            other => panic!("unexpected payload: {:?}", other),
+        }
+
+        let selected = CallTransportUpdate {
+            call_id: "call-xyz".to_string(),
+            payload: TransportUpdatePayload::SelectedCandidatePair {
+                local: TransportCandidateRef {
+                    address: "10.0.0.5".to_string(),
+                    port: 52_333,
+                    protocol: TransportProtocol::Udp,
+                    candidate_type: Some(IceCandidateType::Srflx),
+                    foundation: Some("f1".to_string()),
+                    priority: Some(7_654_321),
+                },
+                remote: TransportCandidateRef {
+                    address: "203.0.113.4".to_string(),
+                    port: 60_000,
+                    protocol: TransportProtocol::Udp,
+                    candidate_type: Some(IceCandidateType::Srflx),
+                    foundation: Some("f2".to_string()),
+                    priority: Some(9_999_999),
+                },
+                rtt_ms: Some(22),
+            },
+        };
+        let envelope: ControlEnvelope = (&selected).try_into().expect("encode selected");
+        let decoded = CallTransportUpdate::try_from(&envelope).expect("decode selected");
+        assert_eq!(decoded.call_id, selected.call_id);
+        match decoded.payload {
+            TransportUpdatePayload::SelectedCandidatePair { rtt_ms, .. } => {
+                assert_eq!(rtt_ms, Some(22));
+            }
+            _ => panic!("unexpected payload kind"),
+        }
     }
 
     #[test]
