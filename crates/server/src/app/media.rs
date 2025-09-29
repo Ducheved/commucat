@@ -1,12 +1,15 @@
 use super::ServerError;
 use commucat_media::audio::{VoiceEncoder, VoiceEncoderConfig};
-use commucat_media::video::{I420Borrowed, VideoEncoder, VideoEncoderConfig};
+use commucat_media::video::{
+    I420Borrowed, VideoDecoder, VideoEncoder, VideoEncoderConfig, VideoFrame,
+};
 use commucat_media::{AudioCodec, MediaError, MediaSourceMode, VideoCodec};
 use commucat_proto::call::{AudioParameters, CallMediaProfile, VideoParameters};
 use std::convert::TryFrom;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tracing::warn;
 
 const MEDIA_PACKET_VERSION: u8 = 1;
 const MEDIA_HEADER_LEN: usize = 3;
@@ -76,7 +79,21 @@ impl CallMediaTranscoder {
                     &encoded,
                 ))
             }
-            MediaSourceMode::Encoded | MediaSourceMode::Hybrid => Ok(packet),
+            MediaSourceMode::Encoded | MediaSourceMode::Hybrid => {
+                let Some(transcoder) = self.video.as_mut() else {
+                    return Ok(packet);
+                };
+                if parsed.codec == transcoder.target_codec {
+                    return Ok(packet);
+                }
+                match transcoder.transcode_encoded(parsed.codec, parsed.payload) {
+                    Ok(converted) => Ok(converted),
+                    Err(err) => {
+                        warn!(error = %err, "video transcoding failed for encoded payload");
+                        Err(err)
+                    }
+                }
+            }
         }
     }
 }
@@ -114,6 +131,7 @@ impl AudioTranscoder {
 struct VideoTranscoder {
     encoder: VideoEncoder,
     target_codec: VideoCodec,
+    decoder: Option<VideoDecoder>,
     width: u32,
     height: u32,
     uv_width: usize,
@@ -152,6 +170,50 @@ impl VideoTranscoder {
             .next()
             .ok_or_else(|| MediaTranscoderError::Codec("empty video packet".to_string()))?;
         Ok(encoded.data)
+    }
+
+    fn transcode_encoded(
+        &mut self,
+        source_codec: VideoCodec,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, MediaTranscoderError> {
+        if source_codec == self.target_codec {
+            return Ok(build_video_packet(
+                MediaSourceMode::Encoded,
+                source_codec,
+                payload,
+            ));
+        }
+        if self.decoder.is_none() {
+            self.decoder = Some(VideoDecoder::new().map_err(MediaTranscoderError::from)?);
+        }
+        let decoder = self.decoder.as_mut().ok_or(MediaTranscoderError::Codec(
+            "video decoder unavailable".to_string(),
+        ))?;
+        let encoded_frame = VideoFrame {
+            timestamp: self.next_pts,
+            keyframe: false,
+            codec: source_codec,
+            width: self.width,
+            height: self.height,
+            data: payload.to_vec(),
+        };
+        let decoded = decoder
+            .decode(&encoded_frame)
+            .map_err(MediaTranscoderError::from)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| MediaTranscoderError::Codec("decoder produced no frame".to_string()))?;
+        if decoded.width != self.width || decoded.height != self.height {
+            return Err(MediaTranscoderError::Invalid("decoder resolution mismatch"));
+        }
+        let raw = decoded.data;
+        let encoded_payload = self.encode_raw(raw.as_slice())?;
+        Ok(build_video_packet(
+            MediaSourceMode::Encoded,
+            self.target_codec,
+            &encoded_payload,
+        ))
     }
 
     fn expected_i420_len(&self) -> usize {
@@ -196,6 +258,7 @@ impl<'a> ParsedAudioPacket<'a> {
 
 struct ParsedVideoPacket<'a> {
     pub source: MediaSourceMode,
+    pub codec: VideoCodec,
     pub payload: &'a [u8],
 }
 
@@ -212,10 +275,11 @@ impl<'a> ParsedVideoPacket<'a> {
         }
         let source = MediaSourceMode::try_from(data[1])
             .map_err(|_| MediaTranscoderError::Invalid("unknown video source"))?;
-        VideoCodec::try_from(data[2])
+        let codec = VideoCodec::try_from(data[2])
             .map_err(|_| MediaTranscoderError::Invalid("unknown video codec"))?;
         Ok(Self {
             source,
+            codec,
             payload: &data[MEDIA_HEADER_LEN..],
         })
     }
@@ -337,6 +401,7 @@ fn build_video_transcoder(
             Ok(Some(VideoTranscoder {
                 encoder,
                 target_codec: target,
+                decoder: None,
                 width,
                 height,
                 uv_width,
@@ -368,6 +433,7 @@ fn build_video_transcoder(
                 return Ok(Some(VideoTranscoder {
                     encoder,
                     target_codec: VideoCodec::Av1Main,
+                    decoder: None,
                     width,
                     height,
                     uv_width,

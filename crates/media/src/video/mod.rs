@@ -25,6 +25,11 @@ use std::os::raw::{c_int, c_long, c_ulong};
 use std::ptr;
 use std::slice;
 
+#[inline]
+const fn vpx_flag(flag: u32) -> c_long {
+    flag as c_long
+}
+
 #[derive(Debug, Clone)]
 pub struct VideoEncoderConfig {
     pub codec: VideoCodec,
@@ -599,7 +604,7 @@ impl VpxEncoder {
                 .map_err(|_| MediaError::InvalidConfig("timestamp exceeds encoder range"))?;
             let duration: c_ulong = 1;
             let flags: c_long = if force_keyframe {
-                c_long::from(vpx::VPX_EFLAG_FORCE_KF)
+                vpx_flag(vpx::VPX_EFLAG_FORCE_KF)
             } else {
                 0
             };
