@@ -92,6 +92,15 @@ components:
     
     UserProfile:
       type: object
+      description: |
+        Профиль пользователя. 
+        
+        **Идентификация пользователей:**
+        - `user_id` - уникальный внутренний идентификатор (например, `user-abc123`)
+        - `handle` - читаемое имя пользователя (например, `alice`)
+        
+        API-эндпоинты, принимающие параметр `{user_id}` в пути, могут работать как с `user_id`, 
+        так и с `handle`. Сервер автоматически определит тип идентификатора.
       required:
         - user_id
         - handle
@@ -101,17 +110,21 @@ components:
           description: Alias для user_id
         user_id:
           type: string
+          description: Уникальный внутренний идентификатор пользователя
           example: user-abc123
         handle:
           type: string
+          description: Читаемое имя пользователя (уникальное)
           example: alice
         display_name:
           type: string
           nullable: true
+          description: Отображаемое имя пользователя
           example: Alice Wonderland
         avatar_url:
           type: string
           nullable: true
+          description: URL аватара пользователя
           example: https://cdn.example.org/avatars/alice.jpg
     
     # ============= Server Info =============
@@ -581,6 +594,12 @@ components:
       properties:
         request:
           $ref: '#/components/schemas/FriendRequest'
+        to_user:
+          $ref: '#/components/schemas/UserProfile'
+          description: Информация о пользователе, которому отправлен запрос (возвращается при создании запроса)
+        from_user:
+          $ref: '#/components/schemas/UserProfile'
+          description: Информация о пользователе, от которого пришёл запрос (возвращается при accept/reject)
     
     # ============= P2P Assist =============
     
@@ -1170,13 +1189,23 @@ paths:
         Отправить запрос в друзья указанному пользователю.
         После принятия оба пользователя будут автоматически добавлены
         в списки друзей друг друга.
+        
+        **Примечание:** Параметр `user_id` может быть как `user_id`, так и `handle` пользователя.
+        Сервер автоматически определит тип идентификатора.
       parameters:
         - name: user_id
           in: path
           required: true
           schema:
             type: string
-          description: ID пользователя, которому отправляется запрос
+          description: ID или handle пользователя, которому отправляется запрос
+          examples:
+            user_id:
+              value: user-abc123
+              summary: Использование user_id
+            handle:
+              value: alice
+              summary: Использование handle
       requestBody:
         content:
           application/json:

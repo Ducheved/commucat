@@ -1557,6 +1557,12 @@ impl CommuCatApp {
                 "message": friend_request.message,
                 "created_at": friend_request.created_at.to_rfc3339(),
                 "updated_at": friend_request.updated_at.to_rfc3339(),
+            },
+            "to_user": {
+                "user_id": to_user.user_id,
+                "handle": to_user.handle,
+                "display_name": to_user.display_name,
+                "avatar_url": to_user.avatar_url,
             }
         });
         self.respond_json(session, 201, payload, "application/json")
@@ -1632,8 +1638,8 @@ impl CommuCatApp {
         let context = self.authenticate_session(session).await?;
 
         // Преобразуем from_user_id (может быть handle или user_id) в актуальный user_id
-        let actual_from_user_id = match self.state.storage.load_user(from_user_id).await {
-            Ok(user) => user.user_id,
+        let from_user = match self.state.storage.load_user(from_user_id).await {
+            Ok(user) => user,
             Err(_) => {
                 // Если не найден по user_id, пробуем по handle
                 self.state
@@ -1644,15 +1650,15 @@ impl CommuCatApp {
                         StorageError::Missing => ApiError::NotFound,
                         _ => ApiError::Internal,
                     })?
-                    .user_id
             }
         };
+        let actual_from_user_id = &from_user.user_id;
 
         // Находим запрос от from_user_id к текущему пользователю
         let existing = self
             .state
             .storage
-            .friend_request_exists(&actual_from_user_id, &context.user.user_id)
+            .friend_request_exists(actual_from_user_id, &context.user.user_id)
             .await
             .map_err(|_| ApiError::Internal)?
             .ok_or(ApiError::NotFound)?;
@@ -1742,6 +1748,12 @@ impl CommuCatApp {
                 "message": accepted.message,
                 "created_at": accepted.created_at.to_rfc3339(),
                 "updated_at": accepted.updated_at.to_rfc3339(),
+            },
+            "from_user": {
+                "user_id": from_user.user_id,
+                "handle": from_user.handle,
+                "display_name": from_user.display_name,
+                "avatar_url": from_user.avatar_url,
             }
         });
 
@@ -1803,6 +1815,12 @@ impl CommuCatApp {
                 "message": rejected.message,
                 "created_at": rejected.created_at.to_rfc3339(),
                 "updated_at": rejected.updated_at.to_rfc3339(),
+            },
+            "from_user": {
+                "user_id": from_user.user_id,
+                "handle": from_user.handle,
+                "display_name": from_user.display_name,
+                "avatar_url": from_user.avatar_url,
             }
         });
 
