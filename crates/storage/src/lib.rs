@@ -16,6 +16,7 @@ const USER_BLOB_SQL: &str = include_str!("../migrations/003_user_blob.sql");
 const SERVER_SECRET_SQL: &str = include_str!("../migrations/004_server_secrets.sql");
 const DEVICE_ROTATION_SQL: &str = include_str!("../migrations/005_device_rotation.sql");
 const FEDERATION_OUTBOX_SQL: &str = include_str!("../migrations/006_federation_outbox.sql");
+const FRIEND_REQUESTS_SQL: &str = include_str!("../migrations/007_friend_requests.sql");
 const PAIRING_MAX_ATTEMPTS: i32 = 5;
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -198,6 +199,17 @@ pub struct DeviceKeyEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendRequest {
+    pub id: String,
+    pub from_user_id: String,
+    pub to_user_id: String,
+    pub status: String, // 'pending', 'accepted', 'rejected'
+    pub message: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceRotationAudit {
     pub rotation_id: String,
     pub device_id: String,
@@ -375,6 +387,10 @@ impl Storage {
             .map_err(|_| StorageError::Postgres)?;
         self.client
             .batch_execute(FEDERATION_OUTBOX_SQL)
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(FRIEND_REQUESTS_SQL)
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(())
@@ -1481,6 +1497,193 @@ impl Storage {
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(row.is_some())
+    }
+
+    /// Creates a friend request
+    pub async fn create_friend_request(
+        &self,
+        id: &str,
+        from_user_id: &str,
+        to_user_id: &str,
+        message: Option<&str>,
+    ) -> Result<FriendRequest, StorageError> {
+        let query = "INSERT INTO friend_requests (id, from_user_id, to_user_id, message, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, NOW(), NOW())
+            ON CONFLICT (from_user_id, to_user_id) DO UPDATE
+            SET status = 'pending', message = EXCLUDED.message, updated_at = NOW()
+            RETURNING id, from_user_id, to_user_id, status, message, created_at, updated_at";
+        let row = self
+            .client
+            .query_one(query, &[&id, &from_user_id, &to_user_id, &message])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(FriendRequest {
+            id: row.get(0),
+            from_user_id: row.get(1),
+            to_user_id: row.get(2),
+            status: row.get(3),
+            message: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
+        })
+    }
+
+    /// Gets a friend request by ID
+    pub async fn get_friend_request(&self, id: &str) -> Result<FriendRequest, StorageError> {
+        let query = "SELECT id, from_user_id, to_user_id, status, message, created_at, updated_at
+            FROM friend_requests WHERE id = $1";
+        let row = self
+            .client
+            .query_opt(query, &[&id])
+            .await
+            .map_err(|_| StorageError::Postgres)?
+            .ok_or(StorageError::Missing)?;
+        Ok(FriendRequest {
+            id: row.get(0),
+            from_user_id: row.get(1),
+            to_user_id: row.get(2),
+            status: row.get(3),
+            message: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
+        })
+    }
+
+    /// Lists incoming friend requests for a user
+    pub async fn list_incoming_friend_requests(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<FriendRequest>, StorageError> {
+        let query = "SELECT id, from_user_id, to_user_id, status, message, created_at, updated_at
+            FROM friend_requests
+            WHERE to_user_id = $1 AND status = 'pending'
+            ORDER BY created_at DESC";
+        let rows = self
+            .client
+            .query(query, &[&user_id])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(rows
+            .iter()
+            .map(|row| FriendRequest {
+                id: row.get(0),
+                from_user_id: row.get(1),
+                to_user_id: row.get(2),
+                status: row.get(3),
+                message: row.get(4),
+                created_at: row.get(5),
+                updated_at: row.get(6),
+            })
+            .collect())
+    }
+
+    /// Lists outgoing friend requests from a user
+    pub async fn list_outgoing_friend_requests(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<FriendRequest>, StorageError> {
+        let query = "SELECT id, from_user_id, to_user_id, status, message, created_at, updated_at
+            FROM friend_requests
+            WHERE from_user_id = $1
+            ORDER BY created_at DESC";
+        let rows = self
+            .client
+            .query(query, &[&user_id])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(rows
+            .iter()
+            .map(|row| FriendRequest {
+                id: row.get(0),
+                from_user_id: row.get(1),
+                to_user_id: row.get(2),
+                status: row.get(3),
+                message: row.get(4),
+                created_at: row.get(5),
+                updated_at: row.get(6),
+            })
+            .collect())
+    }
+
+    /// Accepts a friend request
+    pub async fn accept_friend_request(&self, id: &str) -> Result<FriendRequest, StorageError> {
+        let query = "UPDATE friend_requests
+            SET status = 'accepted', updated_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING id, from_user_id, to_user_id, status, message, created_at, updated_at";
+        let row = self
+            .client
+            .query_opt(query, &[&id])
+            .await
+            .map_err(|_| StorageError::Postgres)?
+            .ok_or(StorageError::Missing)?;
+        Ok(FriendRequest {
+            id: row.get(0),
+            from_user_id: row.get(1),
+            to_user_id: row.get(2),
+            status: row.get(3),
+            message: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
+        })
+    }
+
+    /// Rejects a friend request
+    pub async fn reject_friend_request(&self, id: &str) -> Result<FriendRequest, StorageError> {
+        let query = "UPDATE friend_requests
+            SET status = 'rejected', updated_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING id, from_user_id, to_user_id, status, message, created_at, updated_at";
+        let row = self
+            .client
+            .query_opt(query, &[&id])
+            .await
+            .map_err(|_| StorageError::Postgres)?
+            .ok_or(StorageError::Missing)?;
+        Ok(FriendRequest {
+            id: row.get(0),
+            from_user_id: row.get(1),
+            to_user_id: row.get(2),
+            status: row.get(3),
+            message: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
+        })
+    }
+
+    /// Deletes a friend request
+    pub async fn delete_friend_request(&self, id: &str) -> Result<(), StorageError> {
+        let query = "DELETE FROM friend_requests WHERE id = $1";
+        self.client
+            .execute(query, &[&id])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Checks if a friend request exists between two users
+    pub async fn friend_request_exists(
+        &self,
+        from_user_id: &str,
+        to_user_id: &str,
+    ) -> Result<Option<FriendRequest>, StorageError> {
+        let query = "SELECT id, from_user_id, to_user_id, status, message, created_at, updated_at
+            FROM friend_requests
+            WHERE from_user_id = $1 AND to_user_id = $2";
+        let row = self
+            .client
+            .query_opt(query, &[&from_user_id, &to_user_id])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(row.map(|row| FriendRequest {
+            id: row.get(0),
+            from_user_id: row.get(1),
+            to_user_id: row.get(2),
+            status: row.get(3),
+            message: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
+        }))
     }
 
     /// Publishes local presence information into Redis.

@@ -40,3 +40,4 @@ async-trait = "0.1"
 raptorq = { workspace = true }
 ml-kem = { workspace = true }
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+utoipa = { version = "4.2" }

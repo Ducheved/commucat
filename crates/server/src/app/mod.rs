@@ -11,6 +11,7 @@ use self::rotation::{
 };
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
+use crate::openapi;
 use crate::security::limiter::{RateLimiter, RateScope};
 use crate::security::secrets::{NoiseKey, SecretManager};
 use crate::transport::{Endpoint, RealityConfig, TransportManager, default_manager};
@@ -223,6 +224,24 @@ mod tests {
             Err(_) => panic!("unexpected error variant"),
             Ok(_) => panic!("duplicate friend user_id must be rejected"),
         }
+    }
+
+    #[test]
+    fn friend_user_id_percent_decoding() {
+        let decoded = decode_friend_user_id("alice%2Fbob").expect("percent decoding succeeds");
+        assert_eq!(decoded, "alice/bob");
+        let plain = decode_friend_user_id("user-123").expect("plain id is unchanged");
+        assert_eq!(plain, "user-123");
+    }
+
+    #[test]
+    fn friend_user_id_rejects_invalid_percent_sequences() {
+        let err = decode_friend_user_id("bad%2").expect_err("truncated escape rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        let err = decode_friend_user_id("%zz").expect_err("non-hex escape rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)));
+        let err = decode_friend_user_id("%ff").expect_err("invalid utf-8 rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)));
     }
 
     #[test]
@@ -744,6 +763,51 @@ fn parse_friends_request(root: &Value) -> Result<Vec<FriendEntryPayload>, ApiErr
     Ok(entries)
 }
 
+fn decode_friend_user_id(segment: &str) -> Result<String, ApiError> {
+    if segment.is_empty() {
+        return Err(ApiError::BadRequest("missing friend user id".to_string()));
+    }
+    if !segment.contains('%') {
+        return Ok(segment.to_string());
+    }
+    let mut buffer = Vec::with_capacity(segment.len());
+    let bytes = segment.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                if index + 2 >= bytes.len() {
+                    return Err(ApiError::BadRequest(
+                        "invalid percent-encoding in friend user id".to_string(),
+                    ));
+                }
+                let hex = &segment[index + 1..index + 3];
+                let decoded = decode_hex(hex).map_err(|_| {
+                    ApiError::BadRequest("invalid percent-encoding in friend user id".to_string())
+                })?;
+                if decoded.is_empty() {
+                    return Err(ApiError::BadRequest(
+                        "invalid percent-encoding in friend user id".to_string(),
+                    ));
+                }
+                buffer.extend_from_slice(&decoded);
+                index += 3;
+            }
+            byte => {
+                buffer.push(byte);
+                index += 1;
+            }
+        }
+    }
+    if buffer.is_empty() {
+        return Err(ApiError::BadRequest(
+            "friend user id must not be empty".to_string(),
+        ));
+    }
+    String::from_utf8(buffer)
+        .map_err(|_| ApiError::BadRequest("friend user id must be valid UTF-8".to_string()))
+}
+
 impl CommuCatApp {
     async fn handle_session(
         self: &Arc<Self>,
@@ -870,6 +934,13 @@ impl CommuCatApp {
             }
             _ => {}
         }
+        if path == "/openapi.json" && method == "GET" {
+            self.state.metrics.mark_ingress();
+            if let Err(err) = self.handle_openapi_spec(&mut session).await {
+                error!("openapi spec response failed: {}", err);
+            }
+            return None;
+        }
         if path == "/api/server-info" && method == "GET" {
             self.state.metrics.mark_ingress();
             if let Err(err) = self.handle_server_info(&mut session).await {
@@ -902,8 +973,8 @@ impl CommuCatApp {
             && rest.ends_with("/devices")
             && let Some(friend_id) = rest.strip_suffix("/devices")
         {
-            let friend_user_id = friend_id.trim_end_matches('/');
-            if friend_user_id.is_empty() {
+            let friend_user_id_raw = friend_id.trim_end_matches('/');
+            if friend_user_id_raw.is_empty() {
                 let _ = self
                     .respond_api_error(
                         &mut session,
@@ -912,9 +983,129 @@ impl CommuCatApp {
                     .await;
                 return None;
             }
+            let friend_user_id = match decode_friend_user_id(friend_user_id_raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                    return None;
+                }
+            };
             self.state.metrics.mark_ingress();
             match self
-                .handle_friend_devices_get(&mut session, friend_user_id)
+                .handle_friend_devices_get(&mut session, &friend_user_id)
+                .await
+            {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        // GET /api/friends/requests - список запросов в друзья
+        if path == "/api/friends/requests" && method == "GET" {
+            self.state.metrics.mark_ingress();
+            match self.handle_friend_requests_list(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+        // POST /api/friends/requests/{user_id} - создать запрос в друзья
+        // POST /api/friends/requests/{user_id}/accept - принять запрос
+        // POST /api/friends/requests/{user_id}/reject - отклонить запрос
+        if let Some(rest) = path.strip_prefix("/api/friends/requests/")
+            && method == "POST"
+        {
+            let parts: Vec<&str> = rest.trim_end_matches('/').split('/').collect();
+            if parts.is_empty() || parts[0].is_empty() {
+                let _ = self
+                    .respond_api_error(
+                        &mut session,
+                        ApiError::BadRequest("missing user id".to_string()),
+                    )
+                    .await;
+                return None;
+            }
+
+            let user_id_raw = parts[0];
+            let user_id = match decode_friend_user_id(user_id_raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                    return None;
+                }
+            };
+
+            self.state.metrics.mark_ingress();
+
+            if parts.len() == 1 {
+                // POST /api/friends/requests/{user_id} - создать запрос
+                match self
+                    .handle_friend_request_create(&mut session, &user_id)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let _ = self.respond_api_error(&mut session, err).await;
+                    }
+                }
+            } else if parts.len() == 2 && parts[1] == "accept" {
+                // POST /api/friends/requests/{user_id}/accept
+                match self
+                    .handle_friend_request_accept(&mut session, &user_id)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let _ = self.respond_api_error(&mut session, err).await;
+                    }
+                }
+            } else if parts.len() == 2 && parts[1] == "reject" {
+                // POST /api/friends/requests/{user_id}/reject
+                match self
+                    .handle_friend_request_reject(&mut session, &user_id)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let _ = self.respond_api_error(&mut session, err).await;
+                    }
+                }
+            } else {
+                let _ = self
+                    .respond_api_error(&mut session, ApiError::NotFound)
+                    .await;
+            }
+            return None;
+        }
+        // DELETE /api/friends/{user_id} - удалить друга
+        if let Some(rest) = path.strip_prefix("/api/friends/")
+            && method == "DELETE"
+            && !rest.contains('/')
+        {
+            let friend_user_id_raw = rest.trim_end_matches('/');
+            if friend_user_id_raw.is_empty() {
+                let _ = self
+                    .respond_api_error(
+                        &mut session,
+                        ApiError::BadRequest("missing friend user id".to_string()),
+                    )
+                    .await;
+                return None;
+            }
+            let friend_user_id = match decode_friend_user_id(friend_user_id_raw) {
+                Ok(value) => value,
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                    return None;
+                }
+            };
+            self.state.metrics.mark_ingress();
+            match self
+                .handle_friend_delete(&mut session, &friend_user_id)
                 .await
             {
                 Ok(()) => {}
@@ -1089,6 +1280,31 @@ impl CommuCatApp {
         None
     }
 
+    async fn handle_openapi_spec(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ServerError> {
+        let spec = openapi::openapi_json();
+        let mut response =
+            ResponseHeader::build_no_case(200, None).map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("content-type", "application/json")
+            .map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("cache-control", "no-store")
+            .map_err(|_| ServerError::Invalid)?;
+        session
+            .write_response_header(Box::new(response))
+            .await
+            .map_err(|_| ServerError::Io)?;
+        session
+            .write_response_body(spec.as_bytes().to_vec().into(), true)
+            .await
+            .map_err(|_| ServerError::Io)?;
+        self.state.metrics.mark_egress();
+        Ok(())
+    }
+
     async fn handle_server_info(
         self: &Arc<Self>,
         session: &mut ServerSession,
@@ -1220,8 +1436,9 @@ impl CommuCatApp {
         if !friends.iter().any(|entry| entry.user_id == friend_user_id) {
             return Err(ApiError::NotFound);
         }
+        let friend_ids = vec![friend_user_id.to_string()];
         let device_snapshots = self
-            .collect_friend_device_snapshots(&[friend_user_id.to_string()])
+            .collect_friend_device_snapshots(&friend_ids)
             .await
             .map_err(|_| ApiError::Internal)?;
         let snapshots = device_snapshots
@@ -1235,6 +1452,343 @@ impl CommuCatApp {
         self.respond_json(session, 200, payload, "application/json")
             .await
             .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_friend_request_create(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        to_user_id: &str,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+
+        // Нельзя отправить запрос самому себе
+        if context.user.user_id == to_user_id {
+            return Err(ApiError::BadRequest(
+                "cannot send friend request to yourself".to_string(),
+            ));
+        }
+
+        // Проверяем существование целевого пользователя
+        let _to_user = self
+            .state
+            .storage
+            .load_user(to_user_id)
+            .await
+            .map_err(|err| match err {
+                StorageError::Missing => ApiError::NotFound,
+                _ => ApiError::Internal,
+            })?;
+
+        // Проверяем, не существует ли уже запрос
+        let existing = self
+            .state
+            .storage
+            .friend_request_exists(&context.user.user_id, to_user_id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        if let Some(req) = existing
+            && req.status == "pending"
+        {
+            return Err(ApiError::Conflict(
+                "friend request already exists".to_string(),
+            ));
+        }
+
+        let body = Self::read_body(session).await?;
+        let message = if body.is_empty() {
+            None
+        } else {
+            let req: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?;
+            req.get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+
+        let request_id = generate_id("friend-request");
+        let friend_request = self
+            .state
+            .storage
+            .create_friend_request(
+                &request_id,
+                &context.user.user_id,
+                to_user_id,
+                message.as_deref(),
+            )
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let payload = json!({
+            "request": {
+                "id": friend_request.id,
+                "from_user_id": friend_request.from_user_id,
+                "to_user_id": friend_request.to_user_id,
+                "status": friend_request.status,
+                "message": friend_request.message,
+                "created_at": friend_request.created_at.to_rfc3339(),
+                "updated_at": friend_request.updated_at.to_rfc3339(),
+            }
+        });
+        self.respond_json(session, 201, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_friend_requests_list(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+
+        let incoming = self
+            .state
+            .storage
+            .list_incoming_friend_requests(&context.user.user_id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let outgoing = self
+            .state
+            .storage
+            .list_outgoing_friend_requests(&context.user.user_id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let incoming_json: Vec<_> = incoming
+            .iter()
+            .map(|req| {
+                json!({
+                    "id": req.id,
+                    "from_user_id": req.from_user_id,
+                    "to_user_id": req.to_user_id,
+                    "status": req.status,
+                    "message": req.message,
+                    "created_at": req.created_at.to_rfc3339(),
+                    "updated_at": req.updated_at.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        let outgoing_json: Vec<_> = outgoing
+            .iter()
+            .map(|req| {
+                json!({
+                    "id": req.id,
+                    "from_user_id": req.from_user_id,
+                    "to_user_id": req.to_user_id,
+                    "status": req.status,
+                    "message": req.message,
+                    "created_at": req.created_at.to_rfc3339(),
+                    "updated_at": req.updated_at.to_rfc3339(),
+                })
+            })
+            .collect();
+
+        let payload = json!({
+            "incoming": incoming_json,
+            "outgoing": outgoing_json,
+        });
+
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_friend_request_accept(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        from_user_id: &str,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+
+        // Находим запрос от from_user_id к текущему пользователю
+        let existing = self
+            .state
+            .storage
+            .friend_request_exists(from_user_id, &context.user.user_id)
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .ok_or(ApiError::NotFound)?;
+
+        if existing.status != "pending" {
+            return Err(ApiError::BadRequest("request is not pending".to_string()));
+        }
+
+        // Принимаем запрос
+        let accepted = self
+            .state
+            .storage
+            .accept_friend_request(&existing.id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        // Автоматически добавляем друг друга в списки друзей
+        // Загружаем текущие списки обоих пользователей
+        let requester_blob = self
+            .state
+            .storage
+            .read_user_blob(from_user_id, FRIENDS_BLOB_KEY)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let accepter_blob = self
+            .state
+            .storage
+            .read_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let mut requester_friends = match requester_blob {
+            Some(data) => parse_friends_blob(&data)?,
+            None => Vec::new(),
+        };
+
+        let mut accepter_friends = match accepter_blob {
+            Some(data) => parse_friends_blob(&data)?,
+            None => Vec::new(),
+        };
+
+        // Добавляем друг друга, если ещё нет
+        if !requester_friends
+            .iter()
+            .any(|f| f.user_id == context.user.user_id)
+        {
+            requester_friends.push(FriendEntryPayload {
+                user_id: context.user.user_id.clone(),
+                alias: None,
+            });
+        }
+
+        if !accepter_friends.iter().any(|f| f.user_id == from_user_id) {
+            accepter_friends.push(FriendEntryPayload {
+                user_id: from_user_id.to_string(),
+                alias: None,
+            });
+        }
+
+        // Сохраняем обновлённые списки
+        let requester_json =
+            serde_json::to_string(&requester_friends).map_err(|_| ApiError::Internal)?;
+        self.state
+            .storage
+            .write_user_blob(from_user_id, FRIENDS_BLOB_KEY, &requester_json)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let accepter_json =
+            serde_json::to_string(&accepter_friends).map_err(|_| ApiError::Internal)?;
+        self.state
+            .storage
+            .write_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY, &accepter_json)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let payload = json!({
+            "request": {
+                "id": accepted.id,
+                "from_user_id": accepted.from_user_id,
+                "to_user_id": accepted.to_user_id,
+                "status": accepted.status,
+                "message": accepted.message,
+                "created_at": accepted.created_at.to_rfc3339(),
+                "updated_at": accepted.updated_at.to_rfc3339(),
+            }
+        });
+
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_friend_request_reject(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        from_user_id: &str,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+
+        // Находим запрос от from_user_id к текущему пользователю
+        let existing = self
+            .state
+            .storage
+            .friend_request_exists(from_user_id, &context.user.user_id)
+            .await
+            .map_err(|_| ApiError::Internal)?
+            .ok_or(ApiError::NotFound)?;
+
+        if existing.status != "pending" {
+            return Err(ApiError::BadRequest("request is not pending".to_string()));
+        }
+
+        let rejected = self
+            .state
+            .storage
+            .reject_friend_request(&existing.id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let payload = json!({
+            "request": {
+                "id": rejected.id,
+                "from_user_id": rejected.from_user_id,
+                "to_user_id": rejected.to_user_id,
+                "status": rejected.status,
+                "message": rejected.message,
+                "created_at": rejected.created_at.to_rfc3339(),
+                "updated_at": rejected.updated_at.to_rfc3339(),
+            }
+        });
+
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_friend_delete(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        friend_user_id: &str,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+
+        let blob = self
+            .state
+            .storage
+            .read_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        let mut friends = match blob {
+            Some(data) => parse_friends_blob(&data)?,
+            None => Vec::new(),
+        };
+
+        let original_len = friends.len();
+        friends.retain(|f| f.user_id != friend_user_id);
+
+        if friends.len() == original_len {
+            return Err(ApiError::NotFound);
+        }
+
+        let serialized = serde_json::to_string(&friends).map_err(|_| ApiError::Internal)?;
+        self.state
+            .storage
+            .write_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY, &serialized)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        // Возвращаем 204 No Content
+        let mut response =
+            ResponseHeader::build_no_case(204, None).map_err(|_| ApiError::Internal)?;
+        response
+            .append_header("cache-control", "no-store")
+            .map_err(|_| ApiError::Internal)?;
+        session
+            .write_response_header(Box::new(response))
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        Ok(())
     }
 
     async fn handle_pair_create(
@@ -1631,12 +2185,16 @@ impl CommuCatApp {
             .headers
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-            .ok_or(ApiError::Unauthorized)?;
+            .ok_or_else(|| {
+                debug!("authentication failed: missing authorization header");
+                ApiError::Unauthorized
+            })?;
         let token = header
             .trim()
             .strip_prefix("Bearer ")
             .unwrap_or(header.trim());
         if token.is_empty() {
+            debug!("authentication failed: empty token");
             return Err(ApiError::Unauthorized);
         }
         let session_record =
@@ -1645,11 +2203,21 @@ impl CommuCatApp {
                 .load_session(token)
                 .await
                 .map_err(|err| match err {
-                    StorageError::Missing => ApiError::Unauthorized,
-                    _ => ApiError::Internal,
+                    StorageError::Missing => {
+                        debug!("authentication failed: session not found");
+                        ApiError::Unauthorized
+                    }
+                    _ => {
+                        error!("authentication failed: storage error loading session");
+                        ApiError::Internal
+                    }
                 })?;
         let expiry = session_record.created_at + Duration::seconds(session_record.ttl_seconds);
         if expiry <= Utc::now() {
+            debug!(
+                session_id = %session_record.session_id,
+                "authentication failed: session expired"
+            );
             return Err(ApiError::Unauthorized);
         }
         let device = self
@@ -1658,10 +2226,24 @@ impl CommuCatApp {
             .load_device(&session_record.device_id)
             .await
             .map_err(|err| match err {
-                StorageError::Missing => ApiError::Unauthorized,
-                _ => ApiError::Internal,
+                StorageError::Missing => {
+                    debug!(
+                        device_id = %session_record.device_id,
+                        "authentication failed: device not found"
+                    );
+                    ApiError::Unauthorized
+                }
+                _ => {
+                    error!("authentication failed: storage error loading device");
+                    ApiError::Internal
+                }
             })?;
         if device.status != "active" {
+            debug!(
+                device_id = %device.device_id,
+                status = %device.status,
+                "authentication failed: device not active"
+            );
             return Err(ApiError::Forbidden);
         }
         let user = self
@@ -1670,8 +2252,17 @@ impl CommuCatApp {
             .load_user(&session_record.user_id)
             .await
             .map_err(|err| match err {
-                StorageError::Missing => ApiError::Unauthorized,
-                _ => ApiError::Internal,
+                StorageError::Missing => {
+                    debug!(
+                        user_id = %session_record.user_id,
+                        "authentication failed: user not found"
+                    );
+                    ApiError::Unauthorized
+                }
+                _ => {
+                    error!("authentication failed: storage error loading user");
+                    ApiError::Internal
+                }
             })?;
         Ok(SessionContext { user, device })
     }
