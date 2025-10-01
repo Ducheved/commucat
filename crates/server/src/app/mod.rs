@@ -1,7 +1,9 @@
+mod federation;
 mod media;
 mod p2p;
 mod rotation;
 
+use self::federation::spawn_dispatcher;
 use self::media::{CallMediaTranscoder, SharedCallMediaTranscoder};
 use self::rotation::{
     DecodedRotationRequest, DeviceRotationRequest, RotationNotification, RotationRequestError,
@@ -18,9 +20,11 @@ use chrono::{Duration, Utc};
 use commucat_crypto::zkp::{self, KnowledgeProof};
 use commucat_crypto::{
     CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair, EventSigner,
-    HandshakePattern, NoiseConfig, NoiseHandshake, NoiseTransport, build_handshake,
+    EventVerifier, HandshakePattern, NoiseConfig, NoiseHandshake, NoiseTransport, build_handshake,
 };
-use commucat_federation::{FederationError, FederationEvent, sign_event};
+use commucat_federation::{
+    FederationError, FederationEvent, SignedEvent, sign_event, verify_event,
+};
 use commucat_ledger::{
     DebugLedgerAdapter, FileLedgerAdapter, LedgerAdapter as LedgerAdapterTrait, LedgerError,
     LedgerRecord, NullLedger,
@@ -35,9 +39,9 @@ use commucat_proto::{
     is_supported_protocol_version, negotiate_protocol_version,
 };
 use commucat_storage::{
-    ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederationPeerStatus,
-    GroupMember, GroupRole, InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope,
-    SessionRecord, Storage, StorageError, UserProfile, connect,
+    ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederationOutboxInsert,
+    FederationPeerStatus, GroupMember, GroupRole, IdempotencyKey, InboxOffset, NewUserProfile,
+    PresenceSnapshot, RelayEnvelope, SessionRecord, Storage, StorageError, UserProfile, connect,
 };
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
@@ -354,6 +358,16 @@ struct FriendEntryPayload {
     alias: Option<String>,
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+struct FriendDeviceSnapshot {
+    device_id: String,
+    public_key: String,
+    status: String,
+    created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_rotated_at: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct PairCreateRequest {
     ttl: Option<i64>,
@@ -368,6 +382,18 @@ struct PairClaimRequest {
 #[derive(Deserialize)]
 struct DeviceRevokeRequest {
     device_id: String,
+}
+
+#[derive(Deserialize)]
+struct FederationRelayPayload {
+    #[serde(rename = "channel", default)]
+    _channel: Option<u64>,
+    payload: String,
+    #[serde(rename = "sender", default)]
+    _sender: Option<String>,
+    target: String,
+    #[serde(default)]
+    _sequence: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -653,6 +679,7 @@ impl CommuCatApp {
                 }
             }
         });
+        spawn_dispatcher(Arc::clone(&state));
         Ok(state)
     }
 }
@@ -870,6 +897,33 @@ impl CommuCatApp {
             }
             return None;
         }
+        if let Some(rest) = path.strip_prefix("/api/friends/")
+            && method == "GET"
+            && rest.ends_with("/devices")
+            && let Some(friend_id) = rest.strip_suffix("/devices")
+        {
+            let friend_user_id = friend_id.trim_end_matches('/');
+            if friend_user_id.is_empty() {
+                let _ = self
+                    .respond_api_error(
+                        &mut session,
+                        ApiError::BadRequest("missing friend user id".to_string()),
+                    )
+                    .await;
+                return None;
+            }
+            self.state.metrics.mark_ingress();
+            match self
+                .handle_friend_devices_get(&mut session, friend_user_id)
+                .await
+            {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
         if path == "/api/pair" && method == "POST" {
             self.state.metrics.mark_ingress();
             match self.handle_pair_create(&mut session).await {
@@ -1003,6 +1057,13 @@ impl CommuCatApp {
             }
             return None;
         }
+        if path == "/federation/events" && method == "POST" {
+            match self.handle_federation_event(&mut session).await {
+                Ok(()) => {}
+                Err(err) => warn!(error = %err, "federation event processing failed"),
+            }
+            return None;
+        }
         if path == "/connect" && method == "POST" {
             return self.process_connect(session, shutdown).await;
         }
@@ -1082,7 +1143,21 @@ impl CommuCatApp {
             Some(data) => parse_friends_blob(&data)?,
             None => Vec::new(),
         };
-        let payload = json!({ "friends": friends });
+        let friend_ids = friends
+            .iter()
+            .map(|entry| entry.user_id.clone())
+            .collect::<Vec<_>>();
+        let device_snapshots = self
+            .collect_friend_device_snapshots(&friend_ids)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let devices_value = self
+            .build_friend_devices_value(&friends, device_snapshots)
+            .map_err(|_| ApiError::Internal)?;
+        let payload = json!({
+            "friends": friends,
+            "devices": devices_value,
+        });
         self.respond_json(session, 200, payload, "application/json")
             .await
             .map_err(|_| ApiError::Internal)
@@ -1106,8 +1181,56 @@ impl CommuCatApp {
             .write_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY, &serialized)
             .await
             .map_err(|_| ApiError::Internal)?;
+        let friend_ids = friends
+            .iter()
+            .map(|entry| entry.user_id.clone())
+            .collect::<Vec<_>>();
+        let device_snapshots = self
+            .collect_friend_device_snapshots(&friend_ids)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let devices_value = self
+            .build_friend_devices_value(&friends, device_snapshots)
+            .map_err(|_| ApiError::Internal)?;
         let payload = json!({
             "friends": friends,
+            "devices": devices_value,
+        });
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_friend_devices_get(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        friend_user_id: &str,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+        let blob = self
+            .state
+            .storage
+            .read_user_blob(&context.user.user_id, FRIENDS_BLOB_KEY)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let friends = match blob {
+            Some(data) => parse_friends_blob(&data)?,
+            None => Vec::new(),
+        };
+        if !friends.iter().any(|entry| entry.user_id == friend_user_id) {
+            return Err(ApiError::NotFound);
+        }
+        let device_snapshots = self
+            .collect_friend_device_snapshots(&[friend_user_id.to_string()])
+            .await
+            .map_err(|_| ApiError::Internal)?;
+        let snapshots = device_snapshots
+            .get(friend_user_id)
+            .cloned()
+            .unwrap_or_default();
+        let payload = json!({
+            "friend": friend_user_id,
+            "devices": snapshots,
         });
         self.respond_json(session, 200, payload, "application/json")
             .await
@@ -1609,6 +1732,27 @@ impl CommuCatApp {
             .await
     }
 
+    async fn respond_problem(
+        &self,
+        session: &mut ServerSession,
+        status: u16,
+        title: &str,
+        detail: Option<&str>,
+    ) -> Result<(), ServerError> {
+        let mut body = json!({
+            "type": "about:blank",
+            "title": title,
+            "status": status,
+        });
+        if let Some(message) = detail
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.insert("detail".to_string(), json!(message));
+        }
+        self.respond_json(session, status, body, "application/problem+json")
+            .await
+    }
+
     async fn notify_device_key_rotation(&self, device_id: &str, payload: Value) {
         let (sender, sequence) = {
             let connections = self.state.connections.read().await;
@@ -1633,6 +1777,268 @@ impl CommuCatApp {
         }
     }
 
+    async fn collect_friend_device_snapshots(
+        &self,
+        friend_ids: &[String],
+    ) -> Result<HashMap<String, Vec<FriendDeviceSnapshot>>, ServerError> {
+        let mut map = HashMap::new();
+        for friend_id in friend_ids {
+            let devices = self.state.storage.list_devices_for_user(friend_id).await?;
+            let mut snapshots = Vec::with_capacity(devices.len());
+            for device in devices {
+                let rotation = self
+                    .state
+                    .storage
+                    .latest_device_key_event(&device.device_id)
+                    .await?;
+                let last_rotated_at = rotation.map(|event| event.recorded_at.to_rfc3339());
+                let DeviceRecord {
+                    device_id,
+                    user_id: _,
+                    public_key,
+                    status,
+                    created_at,
+                } = device;
+                snapshots.push(FriendDeviceSnapshot {
+                    device_id,
+                    public_key: encode_hex(&public_key),
+                    status,
+                    created_at: created_at.to_rfc3339(),
+                    last_rotated_at,
+                });
+            }
+            map.insert(friend_id.clone(), snapshots);
+        }
+        Ok(map)
+    }
+
+    fn build_friend_devices_value(
+        &self,
+        friends: &[FriendEntryPayload],
+        snapshots: HashMap<String, Vec<FriendDeviceSnapshot>>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let mut map_value = serde_json::Map::new();
+        for entry in friends {
+            let devices = snapshots
+                .get(&entry.user_id)
+                .cloned()
+                .unwrap_or_else(Vec::new);
+            map_value.insert(entry.user_id.clone(), serde_json::to_value(devices)?);
+        }
+        Ok(serde_json::Value::Object(map_value))
+    }
+
+    async fn handle_federation_event(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ServerError> {
+        let body = match Self::read_body(session).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.state.metrics.mark_federation_inbound_rejected();
+                return self
+                    .respond_problem(
+                        session,
+                        500,
+                        "ReadFailure",
+                        Some("failed to read request body"),
+                    )
+                    .await;
+            }
+        };
+        if body.is_empty() {
+            self.state.metrics.mark_federation_inbound_rejected();
+            return self
+                .respond_problem(
+                    session,
+                    400,
+                    "InvalidRequest",
+                    Some("request body required"),
+                )
+                .await;
+        }
+        let signed = match serde_json::from_slice::<SignedEvent>(&body) {
+            Ok(event) => event,
+            Err(_) => {
+                self.state.metrics.mark_federation_inbound_rejected();
+                return self
+                    .respond_problem(session, 400, "InvalidRequest", Some("invalid JSON payload"))
+                    .await;
+            }
+        };
+        let origin = signed.event.origin.to_ascii_lowercase();
+        let peer = match self.fetch_peer_config(&origin).await {
+            Some(peer) => peer,
+            None => {
+                self.state.metrics.mark_federation_inbound_rejected();
+                return self
+                    .respond_problem(session, 403, "UnknownPeer", Some("origin not allowed"))
+                    .await;
+            }
+        };
+        let verifier = EventVerifier {
+            public: peer.public_key,
+        };
+        if verify_event(&signed, &verifier).is_err() {
+            self.state.metrics.mark_federation_inbound_rejected();
+            return self
+                .respond_problem(
+                    session,
+                    403,
+                    "InvalidSignature",
+                    Some("signature verification failed"),
+                )
+                .await;
+        }
+        let idempotency = IdempotencyKey {
+            key: format!("federation:{}:{}", origin, signed.event.event_id),
+            scope: "federation-inbox".to_string(),
+            created_at: Utc::now(),
+        };
+        if !self.state.storage.store_idempotency(&idempotency).await? {
+            let payload = json!({
+                "status": "duplicate",
+            });
+            return self
+                .respond_json(session, 200, payload, "application/json")
+                .await;
+        }
+        let relay_payload =
+            match serde_json::from_value::<FederationRelayPayload>(signed.event.payload.clone()) {
+                Ok(value) => value,
+                Err(_) => {
+                    self.state.metrics.mark_federation_inbound_rejected();
+                    return self
+                        .respond_problem(
+                            session,
+                            400,
+                            "InvalidPayload",
+                            Some("unsupported federation payload"),
+                        )
+                        .await;
+                }
+            };
+        let (device_id, domain) = match relay_payload.target.split_once('@') {
+            Some((dev, dom)) => (dev.trim(), Some(dom.trim())),
+            None => (relay_payload.target.trim(), None),
+        };
+        if let Some(domain) = domain
+            && domain != self.state.config.domain
+        {
+            self.state.metrics.mark_federation_inbound_rejected();
+            return self
+                .respond_problem(
+                    session,
+                    400,
+                    "InvalidTarget",
+                    Some("target domain mismatch"),
+                )
+                .await;
+        }
+        if device_id.is_empty() {
+            self.state.metrics.mark_federation_inbound_rejected();
+            return self
+                .respond_problem(session, 400, "InvalidTarget", Some("missing target device"))
+                .await;
+        }
+        match self.state.storage.load_device(device_id).await {
+            Ok(_) => {}
+            Err(StorageError::Missing) => {
+                self.state.metrics.mark_federation_inbound_rejected();
+                return self
+                    .respond_problem(session, 404, "UnknownDevice", Some("device not found"))
+                    .await;
+            }
+            Err(err) => return Err(err.into()),
+        }
+        let payload_bytes = match decode_hex(&relay_payload.payload) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                self.state.metrics.mark_federation_inbound_rejected();
+                return self
+                    .respond_problem(
+                        session,
+                        400,
+                        "InvalidPayload",
+                        Some("payload hex decode failed"),
+                    )
+                    .await;
+            }
+        };
+        let (frame, _) = match Frame::decode(&payload_bytes) {
+            Ok(pair) => pair,
+            Err(err) => {
+                self.state.metrics.mark_federation_inbound_rejected();
+                return self
+                    .respond_problem(
+                        session,
+                        400,
+                        "InvalidFrame",
+                        Some(&format!("frame decode failed: {err}")),
+                    )
+                    .await;
+            }
+        };
+        if let Err(err) = self.deliver_federation_frame(device_id, frame).await {
+            self.state.metrics.mark_federation_inbound_rejected();
+            return self
+                .respond_problem(session, 500, "DeliveryFailed", Some(&format!("{}", err)))
+                .await;
+        }
+        self.state.metrics.mark_federation_inbound_processed();
+        let response = json!({
+            "status": "accepted",
+        });
+        self.respond_json(session, 202, response, "application/json")
+            .await
+    }
+
+    async fn deliver_federation_frame(
+        &self,
+        device_id: &str,
+        mut frame: Frame,
+    ) -> Result<(), ServerError> {
+        let now = Utc::now();
+        if let Some((sender, sequence)) = {
+            let connections = self.state.connections.read().await;
+            connections
+                .get(device_id)
+                .map(|entry| (entry.sender.clone(), entry.next_sequence()))
+        } {
+            frame.sequence = sequence;
+            if sender.send(frame).await.is_err() {
+                warn!(
+                    device = device_id,
+                    "failed to deliver federation frame to online target"
+                );
+            }
+            return Ok(());
+        }
+        let encoded = frame.encode()?;
+        let inbox_key = format!("inbox:{}", device_id);
+        let envelope = RelayEnvelope {
+            envelope_id: generate_id(&format!(
+                "federation:{}:{}",
+                device_id,
+                now.timestamp_nanos_opt().unwrap_or_default()
+            )),
+            channel_id: inbox_key.clone(),
+            payload: encoded,
+            deliver_after: now,
+            expires_at: now + Duration::seconds(self.state.relay_ttl),
+        };
+        self.state.storage.enqueue_relay(&envelope).await?;
+        let offset = InboxOffset {
+            entity_id: device_id.to_string(),
+            channel_id: inbox_key,
+            last_envelope_id: Some(envelope.envelope_id.clone()),
+            updated_at: now,
+        };
+        self.state.storage.store_inbox_offset(&offset).await?;
+        self.state.metrics.mark_relay();
+        Ok(())
+    }
+
     async fn ensure_pairing_limit(&self, user_id: &str) -> Result<(), ServerError> {
         if !self.state.config.auto_approve_devices {
             return Err(ServerError::PairingRequired);
@@ -1646,6 +2052,50 @@ impl CommuCatApp {
             return Err(ServerError::PairingRequired);
         }
         Ok(())
+    }
+
+    async fn fetch_peer_config(&self, domain: &str) -> Option<PeerConfig> {
+        let normalized = domain.to_ascii_lowercase();
+        if let Some(peer) = self.state.allowed_peers.get(&normalized) {
+            return Some(peer.clone());
+        }
+        if let Some(peer) = self
+            .state
+            .dynamic_peers
+            .read()
+            .await
+            .get(&normalized)
+            .cloned()
+        {
+            return Some(peer);
+        }
+        match self.state.storage.load_federation_peer(&normalized).await {
+            Ok(record)
+                if matches!(
+                    record.status,
+                    FederationPeerStatus::Active | FederationPeerStatus::Pending
+                ) =>
+            {
+                let peer = PeerConfig {
+                    domain: record.domain.clone(),
+                    endpoint: record.endpoint.clone(),
+                    public_key: record.public_key,
+                };
+                {
+                    let mut peers = self.state.dynamic_peers.write().await;
+                    peers.insert(normalized.clone(), peer.clone());
+                }
+                if matches!(record.status, FederationPeerStatus::Pending) {
+                    let _ = self
+                        .state
+                        .storage
+                        .set_federation_peer_status(&record.domain, FederationPeerStatus::Active)
+                        .await;
+                }
+                Some(peer)
+            }
+            _ => None,
+        }
     }
 
     fn issue_device_certificate(
@@ -3662,56 +4112,7 @@ impl CommuCatApp {
                     if let Some(pos) = target.find('@') {
                         let domain = &target[pos + 1..];
                         if domain != self.state.config.domain {
-                            let normalized = domain.to_ascii_lowercase();
-                            let peer = if let Some(peer) = self.state.allowed_peers.get(&normalized)
-                            {
-                                Some(peer.clone())
-                            } else {
-                                let cached = {
-                                    let peers = self.state.dynamic_peers.read().await;
-                                    peers.get(&normalized).cloned()
-                                };
-                                if let Some(peer) = cached {
-                                    Some(peer)
-                                } else {
-                                    match self.state.storage.load_federation_peer(&normalized).await
-                                    {
-                                        Ok(record)
-                                            if matches!(
-                                                record.status,
-                                                FederationPeerStatus::Active
-                                                    | FederationPeerStatus::Pending
-                                            ) =>
-                                        {
-                                            let peer = PeerConfig {
-                                                domain: record.domain.clone(),
-                                                endpoint: record.endpoint.clone(),
-                                                public_key: record.public_key,
-                                            };
-                                            {
-                                                let mut peers =
-                                                    self.state.dynamic_peers.write().await;
-                                                peers.insert(normalized.clone(), peer.clone());
-                                            }
-                                            if matches!(
-                                                record.status,
-                                                FederationPeerStatus::Pending
-                                            ) {
-                                                let _ = self
-                                                    .state
-                                                    .storage
-                                                    .set_federation_peer_status(
-                                                        &record.domain,
-                                                        FederationPeerStatus::Active,
-                                                    )
-                                                    .await;
-                                            }
-                                            Some(peer)
-                                        }
-                                        _ => None,
-                                    }
-                                }
-                            };
+                            let peer = self.fetch_peer_config(domain).await;
                             if let Some(peer) = peer {
                                 let event = FederationEvent {
                                     event_id: generate_id(target),
@@ -3729,12 +4130,50 @@ impl CommuCatApp {
                                     scope: domain.to_string(),
                                 };
                                 let signed = sign_event(event, &self.state.federation_signer);
-                                info!(
-                                    peer = %domain,
-                                    endpoint = %peer.endpoint,
-                                    event = %signed.event.event_id,
-                                    "federation event queued"
-                                );
+                                match serde_json::to_value(&signed) {
+                                    Ok(serialized) => {
+                                        let outbox_id = generate_id(&format!(
+                                            "federation:{}:{}",
+                                            domain, signed.event.event_id
+                                        ));
+                                        let insert = FederationOutboxInsert {
+                                            outbox_id: &outbox_id,
+                                            destination: &peer.domain,
+                                            endpoint: &peer.endpoint,
+                                            payload: &serialized,
+                                            public_key: &peer.public_key,
+                                            next_attempt_at: now,
+                                        };
+                                        match self
+                                            .state
+                                            .storage
+                                            .enqueue_federation_outbox(&insert)
+                                            .await
+                                        {
+                                            Ok(()) => {
+                                                self.state
+                                                    .metrics
+                                                    .mark_federation_outbox_enqueued();
+                                                info!(
+                                                    peer = %domain,
+                                                    endpoint = %peer.endpoint,
+                                                    event = %signed.event.event_id,
+                                                    "federation event enqueued"
+                                                );
+                                            }
+                                            Err(err) => warn!(
+                                                peer = %domain,
+                                                error = %err,
+                                                "failed to enqueue federation event"
+                                            ),
+                                        }
+                                    }
+                                    Err(err) => warn!(
+                                        peer = %domain,
+                                        error = %err,
+                                        "failed to serialize federation event"
+                                    ),
+                                }
                             } else {
                                 warn!(peer = %domain, "federation peer not allowed");
                             }

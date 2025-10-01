@@ -15,6 +15,7 @@ const PAIRING_SQL: &str = include_str!("../migrations/002_pairing.sql");
 const USER_BLOB_SQL: &str = include_str!("../migrations/003_user_blob.sql");
 const SERVER_SECRET_SQL: &str = include_str!("../migrations/004_server_secrets.sql");
 const DEVICE_ROTATION_SQL: &str = include_str!("../migrations/005_device_rotation.sql");
+const FEDERATION_OUTBOX_SQL: &str = include_str!("../migrations/006_federation_outbox.sql");
 const PAIRING_MAX_ATTEMPTS: i32 = 5;
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -112,6 +113,28 @@ pub struct IdempotencyKey {
     pub key: String,
     pub scope: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FederationOutboxInsert<'a> {
+    pub outbox_id: &'a str,
+    pub destination: &'a str,
+    pub endpoint: &'a str,
+    pub payload: &'a serde_json::Value,
+    pub public_key: &'a [u8; 32],
+    pub next_attempt_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationOutboxMessage {
+    pub outbox_id: String,
+    pub destination: String,
+    pub endpoint: String,
+    pub payload: serde_json::Value,
+    pub public_key: [u8; 32],
+    pub attempts: i32,
+    pub next_attempt_at: DateTime<Utc>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -348,6 +371,10 @@ impl Storage {
             .map_err(|_| StorageError::Postgres)?;
         self.client
             .batch_execute(DEVICE_ROTATION_SQL)
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(FEDERATION_OUTBOX_SQL)
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(())
@@ -1287,6 +1314,121 @@ impl Storage {
             .collect())
     }
 
+    /// Registers a federation event for outbound delivery.
+    pub async fn enqueue_federation_outbox(
+        &self,
+        record: &FederationOutboxInsert<'_>,
+    ) -> Result<(), StorageError> {
+        self.client
+            .execute(
+                "INSERT INTO federation_outbox (outbox_id, destination_domain, endpoint, payload, public_key, next_attempt_at)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (outbox_id) DO NOTHING",
+                &[
+                    &record.outbox_id,
+                    &record.destination,
+                    &record.endpoint,
+                    &record.payload,
+                    &&record.public_key[..],
+                    &record.next_attempt_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Claims due federation events and leases them for processing.
+    pub async fn claim_federation_outbox(
+        &self,
+        limit: i64,
+        lease: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<FederationOutboxMessage>, StorageError> {
+        let lease_deadline = now + lease;
+        let query = "WITH due AS (
+                SELECT outbox_id
+                FROM federation_outbox
+                WHERE next_attempt_at <= $1
+                ORDER BY created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT $2
+            ),
+            updated AS (
+                UPDATE federation_outbox f
+                SET next_attempt_at = $3,
+                    attempts = f.attempts + 1,
+                    last_error = NULL
+                FROM due
+                WHERE f.outbox_id = due.outbox_id
+                RETURNING f.outbox_id, f.destination_domain, f.endpoint, f.payload, f.public_key, f.attempts, f.next_attempt_at, f.last_error
+            )
+            SELECT * FROM updated";
+        let rows = self
+            .client
+            .query(query, &[&now, &limit, &lease_deadline])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        rows.into_iter()
+            .map(|row| {
+                let key: Vec<u8> = row.get(4);
+                let public_key: [u8; 32] = key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| StorageError::Serialization)?;
+                Ok(FederationOutboxMessage {
+                    outbox_id: row.get(0),
+                    destination: row.get(1),
+                    endpoint: row.get(2),
+                    payload: row.get(3),
+                    public_key,
+                    attempts: row.get(5),
+                    next_attempt_at: row.get(6),
+                    last_error: row.get(7),
+                })
+            })
+            .collect()
+    }
+
+    /// Removes a federation outbox entry once delivery succeeds.
+    pub async fn delete_federation_outbox(&self, outbox_id: &str) -> Result<(), StorageError> {
+        let affected = self
+            .client
+            .execute(
+                "DELETE FROM federation_outbox WHERE outbox_id = $1",
+                &[&outbox_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
+    }
+
+    /// Reschedules a federation outbox entry after a failed attempt.
+    pub async fn reschedule_federation_outbox(
+        &self,
+        outbox_id: &str,
+        delay: Duration,
+        now: DateTime<Utc>,
+        error: Option<&str>,
+    ) -> Result<(), StorageError> {
+        let next_attempt = now + delay;
+        let affected = self
+            .client
+            .execute(
+                "UPDATE federation_outbox SET next_attempt_at = $2, last_error = $3 WHERE outbox_id = $1",
+                &[&outbox_id, &next_attempt, &error],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
+    }
+
     /// Stores the last delivered envelope reference for an entity/channel pair.
     pub async fn store_inbox_offset(&self, offset: &InboxOffset) -> Result<(), StorageError> {
         let query = "INSERT INTO inbox_offset (entity_id, channel_id, last_envelope_id, updated_at)
@@ -1330,14 +1472,15 @@ impl Storage {
     }
 
     /// Records an idempotency key for deduplication.
-    pub async fn store_idempotency(&self, key: &IdempotencyKey) -> Result<(), StorageError> {
+    pub async fn store_idempotency(&self, key: &IdempotencyKey) -> Result<bool, StorageError> {
         let query = "INSERT INTO idempotency (key, scope, created_at) VALUES ($1, $2, $3)
-            ON CONFLICT (key, scope) DO NOTHING";
-        self.client
-            .execute(query, &[&key.key, &key.scope, &key.created_at])
+            ON CONFLICT (key, scope) DO NOTHING RETURNING 1";
+        let row = self
+            .client
+            .query_opt(query, &[&key.key, &key.scope, &key.created_at])
             .await
             .map_err(|_| StorageError::Postgres)?;
-        Ok(())
+        Ok(row.is_some())
     }
 
     /// Publishes local presence information into Redis.
@@ -1655,6 +1798,47 @@ mod tests {
         let fetched = storage.load_federation_peer(&peer.domain).await?;
         assert_eq!(fetched.endpoint, peer.endpoint);
 
+        let event_json = serde_json::json!({
+            "event": {
+                "event_id": format!("fed-{}", suffix),
+                "origin": "remote.example",
+                "created_at": Utc::now().to_rfc3339(),
+                "payload": serde_json::json!({"channel": 1, "payload": "00"}),
+                "scope": "relay",
+            },
+            "signature": vec![0u8; 64],
+            "digest": vec![0u8; 32],
+        });
+        let outbox_id = format!("outbox-{}", suffix);
+        let outbox_insert = FederationOutboxInsert {
+            outbox_id: &outbox_id,
+            destination: &peer.domain,
+            endpoint: &peer.endpoint,
+            payload: &event_json,
+            public_key: &peer.public_key,
+            next_attempt_at: Utc::now(),
+        };
+        storage.enqueue_federation_outbox(&outbox_insert).await?;
+        let claimed = storage
+            .claim_federation_outbox(8, Duration::seconds(30), Utc::now())
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].outbox_id, outbox_id);
+        storage
+            .reschedule_federation_outbox(
+                &outbox_id,
+                Duration::seconds(5),
+                Utc::now(),
+                Some("boom"),
+            )
+            .await?;
+        let after_delay = storage
+            .claim_federation_outbox(8, Duration::seconds(30), Utc::now() + Duration::seconds(6))
+            .await?;
+        assert_eq!(after_delay.len(), 1);
+        assert_eq!(after_delay[0].outbox_id, outbox_id);
+        storage.delete_federation_outbox(&outbox_id).await?;
+
         let offset = InboxOffset {
             entity_id: device_id.clone(),
             channel_id: format!("inbox:{}", device_id),
@@ -1720,6 +1904,15 @@ mod tests {
             .delete_expired_server_secrets(&secret_name, now + Duration::hours(3))
             .await?;
         assert_eq!(removed, 1);
+
+        let idempotency_key = IdempotencyKey {
+            key: format!("key-{}", suffix),
+            scope: "federation-test".to_string(),
+            created_at: Utc::now(),
+        };
+        assert!(storage.store_idempotency(&idempotency_key).await?);
+        assert!(!storage.store_idempotency(&idempotency_key).await?);
+
         Ok(())
     }
 }

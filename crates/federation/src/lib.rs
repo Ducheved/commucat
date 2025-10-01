@@ -1,6 +1,7 @@
 use blake3::Hasher;
 use chrono::{DateTime, Utc};
 use commucat_crypto::{EventSigner, EventVerifier};
+use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
@@ -21,7 +22,7 @@ impl Display for FederationError {
 
 impl Error for FederationError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationEvent {
     pub event_id: String,
     pub origin: String,
@@ -30,14 +31,14 @@ pub struct FederationEvent {
     pub scope: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedEvent {
     pub event: FederationEvent,
-    pub signature: [u8; 64],
-    pub digest: [u8; 32],
+    pub signature: Vec<u8>,
+    pub digest: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerDescriptor {
     pub domain: String,
     pub endpoint: String,
@@ -66,19 +67,24 @@ pub fn sign_event(event: FederationEvent, signer: &EventSigner) -> SignedEvent {
     let signature = signer.sign(&digest);
     SignedEvent {
         event,
-        signature,
-        digest,
+        signature: signature.to_vec(),
+        digest: digest.to_vec(),
     }
 }
 
 /// Validates a signed event against a known peer descriptor.
 pub fn verify_event(signed: &SignedEvent, verifier: &EventVerifier) -> Result<(), FederationError> {
     let digest = digest_event(&signed.event);
-    if digest != signed.digest {
+    if signed.digest.as_slice() != digest {
         return Err(FederationError::DigestMismatch);
     }
+    if signed.signature.len() != 64 {
+        return Err(FederationError::Signature);
+    }
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(&signed.signature);
     verifier
-        .verify(&signed.digest, &signed.signature)
+        .verify(&digest, &sig)
         .map_err(|_| FederationError::Signature)
 }
 

@@ -33,7 +33,7 @@ _Last updated: 28 сентября 2025_
 | One-line installer | Скрипт “set-up.sh/ps1” (Postgres, Redis, миграции, генерация ключей, запуск службы). | DevOps (команда) |
 | Авто-ротация ключей устройств | ✅ Вершина закрыта (CSR API на сервере, `KeyUpdate` уведомления) | Done (Codex) |
 | CLI onboarding | Команда `commucat-cli autopair` — bootstrap устройства без пароля. | Rust контрибьюторы (Codex в работе) |
-| Документация Quick Start | Обновить `docs/quickstart.md` и пример конфигов. | Технический писатель/дизайнер |
+| Документация Quick Start | Обновить `docs/quickstart.md` и пример конфигов. | Done (Codex 2026-Q1) |
 
 ### 1.2 Медиа и протокол
 - Включить capability renegotiation: Opus/VP8 fallback vs RAW, запись в `CallSession`.
@@ -61,6 +61,7 @@ _Last updated: 28 сентября 2025_
 
 ### 2.3 Федерация и Mesh
 - API для обмена событиями между узлами (подпись + взаимная валидация).
+  - [In progress · Codex 2026-Q1] Очередь `federation_outbox` и HTTP `/federation/events` для двусторонней доставки; впереди подтверждения, ретраи и мониторинг.
 - Gossip-based discovery, авто-регистрация узлов.
 - Начало работы над mesh (QUIC + Multipath + NAT traversal).
 
