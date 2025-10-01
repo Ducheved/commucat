@@ -1334,6 +1334,18 @@ impl CommuCatApp {
             "device_ca_public": encode_hex(&self.state.device_ca_public),
             "supported_patterns": ["XK", "IK"],
             "supported_versions": SUPPORTED_PROTOCOL_VERSIONS,
+            "session": {
+                "ttl_seconds": self.state.config.connection_keepalive,
+                "keepalive_interval": self.state.config.connection_keepalive / 2,
+            },
+            "presence": {
+                "ttl_seconds": self.state.config.presence_ttl_seconds,
+            },
+            "device_rotation": {
+                "enabled": self.state.config.device_rotation.enabled,
+                "min_interval_seconds": self.state.config.device_rotation.min_interval.as_secs(),
+                "proof_ttl_seconds": self.state.config.device_rotation.proof_ttl.as_secs(),
+            },
             "pairing": {
                 "auto_approve": self.state.config.auto_approve_devices,
                 "pairing_ttl": self.state.config.pairing_ttl_seconds,
@@ -1680,7 +1692,7 @@ impl CommuCatApp {
         let requester_blob = self
             .state
             .storage
-            .read_user_blob(&actual_from_user_id, FRIENDS_BLOB_KEY)
+            .read_user_blob(actual_from_user_id, FRIENDS_BLOB_KEY)
             .await
             .map_err(|_| ApiError::Internal)?;
 
@@ -1714,7 +1726,7 @@ impl CommuCatApp {
 
         if !accepter_friends
             .iter()
-            .any(|f| f.user_id == actual_from_user_id)
+            .any(|f| f.user_id == *actual_from_user_id)
         {
             accepter_friends.push(FriendEntryPayload {
                 user_id: actual_from_user_id.clone(),
@@ -1727,7 +1739,7 @@ impl CommuCatApp {
             serde_json::to_string(&requester_friends).map_err(|_| ApiError::Internal)?;
         self.state
             .storage
-            .write_user_blob(&actual_from_user_id, FRIENDS_BLOB_KEY, &requester_json)
+            .write_user_blob(actual_from_user_id, FRIENDS_BLOB_KEY, &requester_json)
             .await
             .map_err(|_| ApiError::Internal)?;
 
@@ -1803,6 +1815,14 @@ impl CommuCatApp {
             .state
             .storage
             .reject_friend_request(&existing.id)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        // Загружаем информацию о пользователе, который отправил запрос
+        let from_user = self
+            .state
+            .storage
+            .load_user(&actual_from_user_id)
             .await
             .map_err(|_| ApiError::Internal)?;
 

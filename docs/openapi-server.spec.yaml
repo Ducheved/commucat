@@ -187,6 +187,43 @@ components:
           items:
             type: integer
           example: [1, 2]
+        session:
+          type: object
+          description: Настройки сессий и keepalive
+          properties:
+            ttl_seconds:
+              type: integer
+              description: TTL сессии (секунды). Клиент должен отправлять keepalive чаще этого интервала.
+              example: 60
+              minimum: 60
+              maximum: 3600
+            keepalive_interval:
+              type: integer
+              description: Рекомендуемый интервал отправки keepalive (секунды)
+              example: 30
+        presence:
+          type: object
+          description: Настройки presence (статус онлайн)
+          properties:
+            ttl_seconds:
+              type: integer
+              description: TTL presence записи (секунды). Клиент должен обновлять статус чаще этого интервала.
+              example: 30
+        device_rotation:
+          type: object
+          description: Настройки ротации ключей устройств
+          properties:
+            enabled:
+              type: boolean
+              description: Включена ли ротация ключей устройств
+            min_interval_seconds:
+              type: integer
+              description: Минимальный интервал между ротациями ключей (секунды)
+              example: 86400
+            proof_ttl_seconds:
+              type: integer
+              description: TTL для proof ротации ключей (секунды)
+              example: 300
         pairing:
           type: object
           properties:
