@@ -1423,6 +1423,24 @@ impl CommuCatApp {
         friend_user_id: &str,
     ) -> Result<(), ApiError> {
         let context = self.authenticate_session(session).await?;
+
+        // Преобразуем friend_user_id (может быть handle или user_id) в актуальный user_id
+        let actual_friend_user_id = match self.state.storage.load_user(friend_user_id).await {
+            Ok(user) => user.user_id,
+            Err(_) => {
+                // Если не найден по user_id, пробуем по handle
+                self.state
+                    .storage
+                    .load_user_by_handle(friend_user_id)
+                    .await
+                    .map_err(|err| match err {
+                        StorageError::Missing => ApiError::NotFound,
+                        _ => ApiError::Internal,
+                    })?
+                    .user_id
+            }
+        };
+
         let blob = self
             .state
             .storage
@@ -1433,20 +1451,23 @@ impl CommuCatApp {
             Some(data) => parse_friends_blob(&data)?,
             None => Vec::new(),
         };
-        if !friends.iter().any(|entry| entry.user_id == friend_user_id) {
+        if !friends
+            .iter()
+            .any(|entry| entry.user_id == actual_friend_user_id)
+        {
             return Err(ApiError::NotFound);
         }
-        let friend_ids = vec![friend_user_id.to_string()];
+        let friend_ids = vec![actual_friend_user_id.clone()];
         let device_snapshots = self
             .collect_friend_device_snapshots(&friend_ids)
             .await
             .map_err(|_| ApiError::Internal)?;
         let snapshots = device_snapshots
-            .get(friend_user_id)
+            .get(&actual_friend_user_id)
             .cloned()
             .unwrap_or_default();
         let payload = json!({
-            "friend": friend_user_id,
+            "friend": actual_friend_user_id,
             "devices": snapshots,
         });
         self.respond_json(session, 200, payload, "application/json")
@@ -1468,22 +1489,30 @@ impl CommuCatApp {
             ));
         }
 
-        // Проверяем существование целевого пользователя
-        let _to_user = self
-            .state
-            .storage
-            .load_user(to_user_id)
-            .await
-            .map_err(|err| match err {
-                StorageError::Missing => ApiError::NotFound,
-                _ => ApiError::Internal,
-            })?;
+        // Проверяем существование целевого пользователя (может быть user_id или handle)
+        let to_user = match self.state.storage.load_user(to_user_id).await {
+            Ok(user) => user,
+            Err(_) => {
+                // Если не найден по user_id, пробуем по handle
+                self.state
+                    .storage
+                    .load_user_by_handle(to_user_id)
+                    .await
+                    .map_err(|err| match err {
+                        StorageError::Missing => ApiError::NotFound,
+                        _ => ApiError::Internal,
+                    })?
+            }
+        };
+
+        // Используем фактический user_id из профиля
+        let actual_to_user_id = &to_user.user_id;
 
         // Проверяем, не существует ли уже запрос
         let existing = self
             .state
             .storage
-            .friend_request_exists(&context.user.user_id, to_user_id)
+            .friend_request_exists(&context.user.user_id, actual_to_user_id)
             .await
             .map_err(|_| ApiError::Internal)?;
 
@@ -1513,7 +1542,7 @@ impl CommuCatApp {
             .create_friend_request(
                 &request_id,
                 &context.user.user_id,
-                to_user_id,
+                actual_to_user_id,
                 message.as_deref(),
             )
             .await
@@ -1602,11 +1631,28 @@ impl CommuCatApp {
     ) -> Result<(), ApiError> {
         let context = self.authenticate_session(session).await?;
 
+        // Преобразуем from_user_id (может быть handle или user_id) в актуальный user_id
+        let actual_from_user_id = match self.state.storage.load_user(from_user_id).await {
+            Ok(user) => user.user_id,
+            Err(_) => {
+                // Если не найден по user_id, пробуем по handle
+                self.state
+                    .storage
+                    .load_user_by_handle(from_user_id)
+                    .await
+                    .map_err(|err| match err {
+                        StorageError::Missing => ApiError::NotFound,
+                        _ => ApiError::Internal,
+                    })?
+                    .user_id
+            }
+        };
+
         // Находим запрос от from_user_id к текущему пользователю
         let existing = self
             .state
             .storage
-            .friend_request_exists(from_user_id, &context.user.user_id)
+            .friend_request_exists(&actual_from_user_id, &context.user.user_id)
             .await
             .map_err(|_| ApiError::Internal)?
             .ok_or(ApiError::NotFound)?;
@@ -1628,7 +1674,7 @@ impl CommuCatApp {
         let requester_blob = self
             .state
             .storage
-            .read_user_blob(from_user_id, FRIENDS_BLOB_KEY)
+            .read_user_blob(&actual_from_user_id, FRIENDS_BLOB_KEY)
             .await
             .map_err(|_| ApiError::Internal)?;
 
@@ -1660,9 +1706,12 @@ impl CommuCatApp {
             });
         }
 
-        if !accepter_friends.iter().any(|f| f.user_id == from_user_id) {
+        if !accepter_friends
+            .iter()
+            .any(|f| f.user_id == actual_from_user_id)
+        {
             accepter_friends.push(FriendEntryPayload {
-                user_id: from_user_id.to_string(),
+                user_id: actual_from_user_id.clone(),
                 alias: None,
             });
         }
@@ -1672,7 +1721,7 @@ impl CommuCatApp {
             serde_json::to_string(&requester_friends).map_err(|_| ApiError::Internal)?;
         self.state
             .storage
-            .write_user_blob(from_user_id, FRIENDS_BLOB_KEY, &requester_json)
+            .write_user_blob(&actual_from_user_id, FRIENDS_BLOB_KEY, &requester_json)
             .await
             .map_err(|_| ApiError::Internal)?;
 
@@ -1708,11 +1757,28 @@ impl CommuCatApp {
     ) -> Result<(), ApiError> {
         let context = self.authenticate_session(session).await?;
 
+        // Преобразуем from_user_id (может быть handle или user_id) в актуальный user_id
+        let actual_from_user_id = match self.state.storage.load_user(from_user_id).await {
+            Ok(user) => user.user_id,
+            Err(_) => {
+                // Если не найден по user_id, пробуем по handle
+                self.state
+                    .storage
+                    .load_user_by_handle(from_user_id)
+                    .await
+                    .map_err(|err| match err {
+                        StorageError::Missing => ApiError::NotFound,
+                        _ => ApiError::Internal,
+                    })?
+                    .user_id
+            }
+        };
+
         // Находим запрос от from_user_id к текущему пользователю
         let existing = self
             .state
             .storage
-            .friend_request_exists(from_user_id, &context.user.user_id)
+            .friend_request_exists(&actual_from_user_id, &context.user.user_id)
             .await
             .map_err(|_| ApiError::Internal)?
             .ok_or(ApiError::NotFound)?;
@@ -1752,6 +1818,23 @@ impl CommuCatApp {
     ) -> Result<(), ApiError> {
         let context = self.authenticate_session(session).await?;
 
+        // Преобразуем friend_user_id (может быть handle или user_id) в актуальный user_id
+        let actual_friend_user_id = match self.state.storage.load_user(friend_user_id).await {
+            Ok(user) => user.user_id,
+            Err(_) => {
+                // Если не найден по user_id, пробуем по handle
+                self.state
+                    .storage
+                    .load_user_by_handle(friend_user_id)
+                    .await
+                    .map_err(|err| match err {
+                        StorageError::Missing => ApiError::NotFound,
+                        _ => ApiError::Internal,
+                    })?
+                    .user_id
+            }
+        };
+
         let blob = self
             .state
             .storage
@@ -1765,7 +1848,7 @@ impl CommuCatApp {
         };
 
         let original_len = friends.len();
-        friends.retain(|f| f.user_id != friend_user_id);
+        friends.retain(|f| f.user_id != actual_friend_user_id);
 
         if friends.len() == original_len {
             return Err(ApiError::NotFound);
