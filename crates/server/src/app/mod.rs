@@ -423,7 +423,7 @@ struct SessionContext {
 
 #[derive(Debug)]
 enum ApiError {
-    Unauthorized,
+    Unauthorized(Option<String>),
     Forbidden,
     BadRequest(String),
     NotFound,
@@ -434,7 +434,7 @@ enum ApiError {
 impl ApiError {
     fn status(&self) -> u16 {
         match self {
-            Self::Unauthorized => 401,
+            Self::Unauthorized(_) => 401,
             Self::Forbidden => 403,
             Self::BadRequest(_) => 400,
             Self::NotFound => 404,
@@ -445,7 +445,7 @@ impl ApiError {
 
     fn title(&self) -> &'static str {
         match self {
-            Self::Unauthorized => "Unauthorized",
+            Self::Unauthorized(_) => "Unauthorized",
             Self::Forbidden => "Forbidden",
             Self::BadRequest(_) => "BadRequest",
             Self::NotFound => "NotFound",
@@ -2187,7 +2187,7 @@ impl CommuCatApp {
             .and_then(|value| value.to_str().ok())
             .ok_or_else(|| {
                 debug!("authentication failed: missing authorization header");
-                ApiError::Unauthorized
+                ApiError::Unauthorized(Some("missing Authorization header".to_string()))
             })?;
         let token = header
             .trim()
@@ -2195,7 +2195,9 @@ impl CommuCatApp {
             .unwrap_or(header.trim());
         if token.is_empty() {
             debug!("authentication failed: empty token");
-            return Err(ApiError::Unauthorized);
+            return Err(ApiError::Unauthorized(Some(
+                "empty token provided".to_string(),
+            )));
         }
         let session_record =
             self.state
@@ -2205,7 +2207,7 @@ impl CommuCatApp {
                 .map_err(|err| match err {
                     StorageError::Missing => {
                         debug!("authentication failed: session not found");
-                        ApiError::Unauthorized
+                        ApiError::Unauthorized(Some("session not found or expired".to_string()))
                     }
                     _ => {
                         error!("authentication failed: storage error loading session");
@@ -2218,7 +2220,9 @@ impl CommuCatApp {
                 session_id = %session_record.session_id,
                 "authentication failed: session expired"
             );
-            return Err(ApiError::Unauthorized);
+            return Err(ApiError::Unauthorized(Some(
+                "session expired, please reconnect".to_string(),
+            )));
         }
         let device = self
             .state
@@ -2231,7 +2235,7 @@ impl CommuCatApp {
                         device_id = %session_record.device_id,
                         "authentication failed: device not found"
                     );
-                    ApiError::Unauthorized
+                    ApiError::Unauthorized(Some("device not found".to_string()))
                 }
                 _ => {
                     error!("authentication failed: storage error loading device");
@@ -2257,7 +2261,7 @@ impl CommuCatApp {
                         user_id = %session_record.user_id,
                         "authentication failed: user not found"
                     );
-                    ApiError::Unauthorized
+                    ApiError::Unauthorized(Some("user not found".to_string()))
                 }
                 _ => {
                     error!("authentication failed: storage error loading user");
@@ -2302,7 +2306,9 @@ impl CommuCatApp {
         let status = error.status();
         let title = error.title();
         let detail = match &error {
-            ApiError::Unauthorized => Some("authorization required"),
+            ApiError::Unauthorized(reason) => {
+                Some(reason.as_deref().unwrap_or("authorization required"))
+            }
             ApiError::Forbidden => Some("access denied"),
             ApiError::NotFound => Some("resource not found"),
             ApiError::Internal => Some("internal server error"),
