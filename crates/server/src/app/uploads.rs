@@ -2,6 +2,7 @@ use blake3::Hasher;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+use tracing;
 
 use crate::util::encode_hex;
 
@@ -67,13 +68,34 @@ pub fn generate_filename(data: &[u8], mime_type: &str) -> String {
 /// Saves uploaded file to disk
 pub async fn save_file(uploads_dir: &str, filename: &str, data: &[u8]) -> Result<(), UploadError> {
     // Ensure uploads directory exists
-    fs::create_dir_all(uploads_dir).await?;
+    fs::create_dir_all(uploads_dir).await.map_err(|e| {
+        tracing::error!(
+            "failed to create uploads directory '{}': {}",
+            uploads_dir,
+            e
+        );
+        UploadError::Io(e)
+    })?;
 
     let path = PathBuf::from(uploads_dir).join(filename);
-    let mut file = fs::File::create(&path).await?;
-    file.write_all(data).await?;
-    file.flush().await?;
+    tracing::debug!("saving file to: {}", path.display());
 
+    let mut file = fs::File::create(&path).await.map_err(|e| {
+        tracing::error!("failed to create file '{}': {}", path.display(), e);
+        UploadError::Io(e)
+    })?;
+
+    file.write_all(data).await.map_err(|e| {
+        tracing::error!("failed to write file '{}': {}", path.display(), e);
+        UploadError::Io(e)
+    })?;
+
+    file.flush().await.map_err(|e| {
+        tracing::error!("failed to flush file '{}': {}", path.display(), e);
+        UploadError::Io(e)
+    })?;
+
+    tracing::info!("file saved successfully: {}", path.display());
     Ok(())
 }
 

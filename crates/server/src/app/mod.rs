@@ -573,9 +573,20 @@ impl CommuCatApp {
             LedgerAdapter::Null => Box::new(NullLedger),
             LedgerAdapter::Debug => Box::new(DebugLedgerAdapter),
             LedgerAdapter::File => {
-                let target = config.ledger.target.as_ref().ok_or(ServerError::Invalid)?;
-                let adapter = FileLedgerAdapter::new(std::path::PathBuf::from(target))
-                    .map_err(|_| ServerError::Ledger)?;
+                let target = config.ledger.target.as_ref().ok_or_else(|| {
+                    tracing::error!("ledger mode is 'file' but ledger.target is not configured");
+                    ServerError::Invalid
+                })?;
+                tracing::info!("initializing file ledger adapter at: {}", target);
+                let adapter =
+                    FileLedgerAdapter::new(std::path::PathBuf::from(target)).map_err(|e| {
+                        tracing::error!(
+                            "failed to create file ledger adapter at '{}': {}",
+                            target,
+                            e
+                        );
+                        ServerError::Ledger
+                    })?;
                 Box::new(adapter)
             }
         };
@@ -1965,7 +1976,11 @@ impl CommuCatApp {
 
         // Извлекаем базовый MIME тип (без параметров вроде charset)
         let mime_type = if content_type.starts_with("image/") {
-            content_type.split(';').next().unwrap_or(content_type).trim()
+            content_type
+                .split(';')
+                .next()
+                .unwrap_or(content_type)
+                .trim()
         } else {
             "image/jpeg" // default
         };
@@ -1979,9 +1994,10 @@ impl CommuCatApp {
                 UploadError::TooLarge => {
                     ApiError::BadRequest("avatar file too large (max 5 MB)".to_string())
                 }
-                UploadError::InvalidMimeType => ApiError::BadRequest(
-                    format!("invalid image type '{}' (allowed: jpeg, png, webp, gif)", mime_type),
-                ),
+                UploadError::InvalidMimeType => ApiError::BadRequest(format!(
+                    "invalid image type '{}' (allowed: jpeg, png, webp, gif)",
+                    mime_type
+                )),
                 UploadError::Io(e) => {
                     tracing::error!("avatar I/O error: {}", e);
                     ApiError::Internal
