@@ -45,9 +45,9 @@ use commucat_proto::{
 };
 use commucat_storage::{
     ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederatedFriendRequest,
-    FederationOutboxInsert, FederationPeerStatus, GroupMember, GroupRole, IdempotencyKey,
-    InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
-    StorageError, UserProfile, connect,
+    FederationOutboxInsert, FederationOutboxMessage, FederationPeerStatus, GroupMember, GroupRole,
+    IdempotencyKey, InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord,
+    Storage, StorageError, UserProfile, connect,
 };
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
@@ -752,6 +752,13 @@ impl CommuCatApp {
             }
         });
         spawn_dispatcher(Arc::clone(&state));
+
+        // Запускаем federation outbox worker
+        let outbox_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            federation_outbox_worker(outbox_state).await;
+        });
+
         Ok(state)
     }
 }
@@ -1791,7 +1798,7 @@ impl CommuCatApp {
             })?;
 
         // Создаём задачу в federation_outbox для отправки
-        let _outbox_id = generate_id("fed-outbox");
+        let outbox_id = generate_id("fed-outbox");
         let payload = json!({
             "type": "friend_request",
             "request_id": request_id,
@@ -1801,13 +1808,30 @@ impl CommuCatApp {
             "timestamp": now.to_rfc3339(),
         });
 
-        // TODO: Добавить метод Storage::enqueue_federation_message
-        // Пока логируем
-        tracing::warn!(
-            "federation_outbox not yet implemented: would send to {} endpoint {} payload: {}",
+        // Ставим задачу в очередь federation_outbox
+        let outbox_insert = FederationOutboxInsert {
+            outbox_id: &outbox_id,
+            destination: &peer.domain,
+            endpoint: &peer.endpoint,
+            payload: &payload,
+            public_key: &peer.public_key,
+            next_attempt_at: now, // Отправляем сразу
+        };
+
+        self.state
+            .storage
+            .enqueue_federation_outbox(&outbox_insert)
+            .await
+            .map_err(|e| {
+                tracing::error!("failed to enqueue federation message: {}", e);
+                ApiError::Internal
+            })?;
+
+        tracing::info!(
+            "federation message queued: {} to {} endpoint {}",
+            outbox_id,
             peer.domain,
-            peer.endpoint,
-            payload
+            peer.endpoint
         );
 
         // Возвращаем успех клиенту
@@ -5592,4 +5616,115 @@ impl CommuCatApp {
         }
         self.state.metrics.decr_connections();
     }
+}
+
+/// Background worker for processing federation_outbox queue
+async fn federation_outbox_worker(state: Arc<AppState>) {
+    use tokio::time::{Duration as TokioDuration, interval};
+
+    let mut ticker = interval(TokioDuration::from_secs(10)); // Проверяем каждые 10 секунд
+
+    info!("federation outbox worker started");
+
+    loop {
+        ticker.tick().await;
+
+        // Забираем до 10 сообщений для отправки
+        let messages = match state
+            .storage
+            .claim_federation_outbox(10, Duration::seconds(300), Utc::now())
+            .await
+        {
+            Ok(msgs) => msgs,
+            Err(e) => {
+                warn!("failed to claim federation outbox messages: {}", e);
+                continue;
+            }
+        };
+
+        if messages.is_empty() {
+            continue;
+        }
+
+        info!("processing {} federation outbox messages", messages.len());
+
+        for msg in messages {
+            let result = send_federation_message(&state, &msg).await;
+
+            match result {
+                Ok(()) => {
+                    // Успешно отправлено - удаляем из очереди
+                    if let Err(e) = state.storage.delete_federation_outbox(&msg.outbox_id).await {
+                        warn!("failed to delete outbox message {}: {}", msg.outbox_id, e);
+                    }
+                    info!("federation message {} sent successfully", msg.outbox_id);
+                }
+                Err(e) => {
+                    // Ошибка - переносим на retry
+                    let delay = if msg.attempts < 5 {
+                        // Exponential backoff: 1min, 2min, 4min, 8min, 16min
+                        Duration::seconds(60 * (1 << msg.attempts))
+                    } else {
+                        // После 5 попыток - раз в час
+                        Duration::seconds(3600)
+                    };
+
+                    if let Err(reschedule_err) = state
+                        .storage
+                        .reschedule_federation_outbox(
+                            &msg.outbox_id,
+                            delay,
+                            Utc::now(),
+                            Some(&e.to_string()),
+                        )
+                        .await
+                    {
+                        warn!(
+                            "failed to reschedule outbox message {}: {}",
+                            msg.outbox_id, reschedule_err
+                        );
+                    }
+
+                    warn!(
+                        "federation message {} failed (attempt {}): {}",
+                        msg.outbox_id,
+                        msg.attempts + 1,
+                        e
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Sends a single federation message via HTTP POST
+async fn send_federation_message(
+    _state: &Arc<AppState>,
+    msg: &FederationOutboxMessage,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use reqwest::Client;
+    use tokio::time::Duration as TokioDuration;
+
+    let client = Client::builder()
+        .timeout(TokioDuration::from_secs(30))
+        .build()?;
+
+    // Используем уже имеющийся payload из очереди
+    // (он был подписан при создании записи в handle_federated_friend_request)
+
+    // Отправляем POST запрос
+    let full_url = format!("{}/federation/friend-request", msg.endpoint);
+
+    tracing::debug!("sending federation message to {}", full_url);
+
+    let response = client.post(&full_url).json(&msg.payload).send().await?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("HTTP {}: {}", status, body).into());
+    }
+
+    Ok(())
 }
