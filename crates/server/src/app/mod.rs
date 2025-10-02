@@ -1957,41 +1957,65 @@ impl CommuCatApp {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
 
-        // Для простоты, если Content-Type: image/*, то сохраняем напрямую
-        let mime_type = if content_type.starts_with("image/") {
+        tracing::info!(
+            "avatar upload: size={} bytes, content_type='{}'",
+            body.len(),
             content_type
+        );
+
+        // Извлекаем базовый MIME тип (без параметров вроде charset)
+        let mime_type = if content_type.starts_with("image/") {
+            content_type.split(';').next().unwrap_or(content_type).trim()
         } else {
             "image/jpeg" // default
         };
 
+        tracing::info!("parsed mime_type: '{}'", mime_type);
+
         // Валидация
-        validate_avatar(&body, mime_type).map_err(|err| match err {
-            UploadError::TooLarge => {
-                ApiError::BadRequest("avatar file too large (max 5 MB)".to_string())
+        validate_avatar(&body, mime_type).map_err(|err| {
+            tracing::error!("avatar validation failed: {}", err);
+            match err {
+                UploadError::TooLarge => {
+                    ApiError::BadRequest("avatar file too large (max 5 MB)".to_string())
+                }
+                UploadError::InvalidMimeType => ApiError::BadRequest(
+                    format!("invalid image type '{}' (allowed: jpeg, png, webp, gif)", mime_type),
+                ),
+                UploadError::Io(e) => {
+                    tracing::error!("avatar I/O error: {}", e);
+                    ApiError::Internal
+                }
             }
-            UploadError::InvalidMimeType => ApiError::BadRequest(
-                "invalid image type (allowed: jpeg, png, webp, gif)".to_string(),
-            ),
-            UploadError::Io(_) => ApiError::Internal,
         })?;
 
         // Генерируем уникальное имя файла
         let filename = generate_filename(&body, mime_type);
+        tracing::info!("generated filename: {}", filename);
 
         // Сохраняем файл
         save_file(&self.state.config.uploads_dir, &filename, &body)
             .await
-            .map_err(|_| ApiError::Internal)?;
+            .map_err(|e| {
+                tracing::error!("failed to save avatar file: {}", e);
+                ApiError::Internal
+            })?;
 
         // Генерируем URL
         let avatar_url = format!("{}/{}", self.state.config.uploads_base_url, filename);
+        tracing::info!("avatar URL: {}", avatar_url);
 
         // Обновляем профиль пользователя
         self.state
             .storage
             .update_user_avatar(&context.user.user_id, &avatar_url)
             .await
-            .map_err(|_| ApiError::Internal)?;
+            .map_err(|e| {
+                tracing::error!("failed to update user avatar in DB: {}", e);
+                ApiError::Internal
+            })?;
+
+        tracing::info!("avatar upload successful for user {}", context.user.user_id);
 
         // Возвращаем ответ
         let payload = json!({
