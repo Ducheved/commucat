@@ -44,9 +44,10 @@ use commucat_proto::{
     is_supported_protocol_version, negotiate_protocol_version,
 };
 use commucat_storage::{
-    ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederationOutboxInsert,
-    FederationPeerStatus, GroupMember, GroupRole, IdempotencyKey, InboxOffset, NewUserProfile,
-    PresenceSnapshot, RelayEnvelope, SessionRecord, Storage, StorageError, UserProfile, connect,
+    ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederatedFriendRequest,
+    FederationOutboxInsert, FederationPeerStatus, GroupMember, GroupRole, IdempotencyKey,
+    InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord, Storage,
+    StorageError, UserProfile, connect,
 };
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
@@ -247,6 +248,35 @@ mod tests {
         assert!(matches!(err, ApiError::BadRequest(_)));
         let err = decode_friend_user_id("%ff").expect_err("invalid utf-8 rejected");
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn parse_federated_id_local() {
+        let (id, domain) = parse_federated_id("user-123");
+        assert_eq!(id, "user-123");
+        assert_eq!(domain, None);
+    }
+
+    #[test]
+    fn parse_federated_id_remote() {
+        let (handle, domain) = parse_federated_id("alice@example.org");
+        assert_eq!(handle, "alice");
+        assert_eq!(domain, Some("example.org".to_string()));
+    }
+
+    #[test]
+    fn parse_federated_id_multiple_at_signs() {
+        // Берём последний @ как разделитель
+        let (handle, domain) = parse_federated_id("alice@test@example.org");
+        assert_eq!(handle, "alice@test");
+        assert_eq!(domain, Some("example.org".to_string()));
+    }
+
+    #[test]
+    fn parse_federated_id_trailing_at() {
+        let (id, domain) = parse_federated_id("alice@");
+        assert_eq!(id, "alice@");
+        assert_eq!(domain, None); // Пустой домен = локальный
     }
 
     #[test]
@@ -560,11 +590,18 @@ struct HandshakeContext {
 
 pub struct CommuCatApp {
     pub state: Arc<AppState>,
+    http_server_options: HttpServerOptions,
 }
 
 impl CommuCatApp {
     pub fn new(state: Arc<AppState>) -> Self {
-        CommuCatApp { state }
+        // Настройки HTTP сервера (используем дефолтные настройки)
+        let http_server_options = HttpServerOptions::default();
+
+        CommuCatApp {
+            state,
+            http_server_options,
+        }
     }
 
     pub async fn init(config: ServerConfig) -> Result<Arc<AppState>, ServerError> {
@@ -738,7 +775,7 @@ impl HttpServerApp for CommuCatApp {
     }
 
     fn server_options(&self) -> Option<&HttpServerOptions> {
-        None
+        Some(&self.http_server_options)
     }
 }
 
@@ -777,6 +814,19 @@ fn parse_friends_request(root: &Value) -> Result<Vec<FriendEntryPayload>, ApiErr
         entries.push(entry);
     }
     Ok(entries)
+}
+
+/// Parses federated user ID in format "handle@domain" or plain "user_id"
+/// Returns (identifier, domain) where domain is None for local users
+fn parse_federated_id(input: &str) -> (String, Option<String>) {
+    if let Some(at_pos) = input.rfind('@') {
+        let handle = input[..at_pos].to_string();
+        let domain = input[at_pos + 1..].to_string();
+        if !domain.is_empty() {
+            return (handle, Some(domain));
+        }
+    }
+    (input.to_string(), None)
 }
 
 fn decode_friend_user_id(segment: &str) -> Result<String, ApiError> {
@@ -1296,6 +1346,17 @@ impl CommuCatApp {
             }
             return None;
         }
+        // POST /federation/friend-request - межсерверный запрос в друзья
+        if path == "/federation/friend-request" && method == "POST" {
+            match self.handle_federation_friend_request(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    warn!("federation friend request failed: {:?}", err);
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
         if path == "/connect" && method == "POST" {
             return self.process_connect(session, shutdown).await;
         }
@@ -1535,8 +1596,46 @@ impl CommuCatApp {
     ) -> Result<(), ApiError> {
         let context = self.authenticate_session(session).await?;
 
+        // Парсим federated ID (может быть "handle@domain" или просто "user_id")
+        let (target_identifier, target_domain) = parse_federated_id(to_user_id);
+
+        tracing::info!(
+            "friend request from {} to target '{}' (domain: {:?})",
+            context.user.user_id,
+            target_identifier,
+            target_domain
+        );
+
+        // Проверяем domain: локальный или удалённый?
+        let is_local =
+            target_domain.is_none() || target_domain.as_ref() == Some(&self.state.config.domain);
+
+        if is_local {
+            // Локальный пользователь - существующая логика
+            self.handle_local_friend_request(session, &context.user.user_id, &target_identifier)
+                .await
+        } else {
+            // Удалённый пользователь - отправляем через federation
+            let remote_domain = target_domain.unwrap();
+            self.handle_federated_friend_request(
+                session,
+                &context.user.handle,
+                &target_identifier,
+                &remote_domain,
+            )
+            .await
+        }
+    }
+
+    /// Handles friend request to local user (existing logic)
+    async fn handle_local_friend_request(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        from_user_id: &str,
+        to_user_id: &str,
+    ) -> Result<(), ApiError> {
         // Нельзя отправить запрос самому себе
-        if context.user.user_id == to_user_id {
+        if from_user_id == to_user_id {
             return Err(ApiError::BadRequest(
                 "cannot send friend request to yourself".to_string(),
             ));
@@ -1565,7 +1664,7 @@ impl CommuCatApp {
         let existing = self
             .state
             .storage
-            .friend_request_exists(&context.user.user_id, actual_to_user_id)
+            .friend_request_exists(from_user_id, actual_to_user_id)
             .await
             .map_err(|_| ApiError::Internal)?;
 
@@ -1594,7 +1693,7 @@ impl CommuCatApp {
             .storage
             .create_friend_request(
                 &request_id,
-                &context.user.user_id,
+                from_user_id,
                 actual_to_user_id,
                 message.as_deref(),
             )
@@ -1619,6 +1718,265 @@ impl CommuCatApp {
             }
         });
         self.respond_json(session, 201, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    /// Handles friend request to remote user (federated)
+    async fn handle_federated_friend_request(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        from_user_handle: &str,
+        target_handle: &str,
+        target_domain: &str,
+    ) -> Result<(), ApiError> {
+        // Формируем полные federated IDs
+        let from_federated_id = format!("{}@{}", from_user_handle, self.state.config.domain);
+        let to_federated_id = format!("{}@{}", target_handle, target_domain);
+
+        tracing::info!(
+            "creating federated friend request from {} to {}",
+            from_federated_id,
+            to_federated_id
+        );
+
+        // Проверяем, есть ли peer в конфигурации
+        let peer = self
+            .state
+            .config
+            .peers
+            .iter()
+            .find(|p| p.domain == target_domain)
+            .ok_or_else(|| {
+                tracing::error!("unknown federation peer domain: {}", target_domain);
+                ApiError::BadRequest(format!("unknown domain: {}", target_domain))
+            })?;
+
+        // Читаем message из body
+        let body = Self::read_body(session).await?;
+        let message = if body.is_empty() {
+            None
+        } else {
+            let req: serde_json::Value = serde_json::from_slice(&body)
+                .map_err(|_| ApiError::BadRequest("invalid JSON payload".to_string()))?;
+            req.get("message")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        };
+
+        // Создаём запись в federated_friend_requests
+        let request_id = generate_id("fed-friend-req");
+        let now = chrono::Utc::now();
+
+        let federated_request = FederatedFriendRequest {
+            request_id: request_id.clone(),
+            from_user_id: from_federated_id.clone(),
+            to_user_id: to_federated_id.clone(),
+            from_domain: self.state.config.domain.clone(),
+            to_domain: target_domain.to_string(),
+            message: message.clone(),
+            status: "pending".to_string(),
+            federation_event_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.state
+            .storage
+            .create_federated_friend_request(&federated_request)
+            .await
+            .map_err(|e| {
+                tracing::error!("failed to create federated friend request: {}", e);
+                ApiError::Internal
+            })?;
+
+        // Создаём задачу в federation_outbox для отправки
+        let _outbox_id = generate_id("fed-outbox");
+        let payload = json!({
+            "type": "friend_request",
+            "request_id": request_id,
+            "from": from_federated_id,
+            "to": to_federated_id,
+            "message": message,
+            "timestamp": now.to_rfc3339(),
+        });
+
+        // TODO: Добавить метод Storage::enqueue_federation_message
+        // Пока логируем
+        tracing::warn!(
+            "federation_outbox not yet implemented: would send to {} endpoint {} payload: {}",
+            peer.domain,
+            peer.endpoint,
+            payload
+        );
+
+        // Возвращаем успех клиенту
+        let response_payload = json!({
+            "request": {
+                "id": request_id,
+                "from": from_federated_id,
+                "to": to_federated_id,
+                "status": "pending",
+                "message": message,
+                "created_at": now.to_rfc3339(),
+            },
+            "federation": {
+                "domain": target_domain,
+                "status": "queued"
+            }
+        });
+
+        self.respond_json(session, 202, response_payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    /// Handles incoming federated friend request from another server
+    async fn handle_federation_friend_request(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        tracing::info!("received federation friend request");
+
+        // Читаем и парсим body
+        let body = Self::read_body(session).await?;
+        let payload: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
+            tracing::error!("invalid JSON in federation friend request: {}", e);
+            ApiError::BadRequest("invalid JSON payload".to_string())
+        })?;
+
+        // Извлекаем поля
+        let event_type = payload
+            .get("type")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::BadRequest("missing 'type' field".to_string()))?;
+
+        if event_type != "friend_request" {
+            return Err(ApiError::BadRequest(format!(
+                "unsupported event type: {}",
+                event_type
+            )));
+        }
+
+        let request_id = payload
+            .get("request_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::BadRequest("missing 'request_id'".to_string()))?;
+
+        let from_federated_id = payload
+            .get("from")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::BadRequest("missing 'from' field".to_string()))?;
+
+        let to_federated_id = payload
+            .get("to")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::BadRequest("missing 'to' field".to_string()))?;
+
+        let message = payload
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let _signature = payload
+            .get("signature")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::BadRequest("missing 'signature' field".to_string()))?;
+
+        tracing::info!(
+            "federation friend request: {} -> {}, request_id: {}",
+            from_federated_id,
+            to_federated_id,
+            request_id
+        );
+
+        // Парсим домены
+        let (_from_handle, from_domain) = parse_federated_id(from_federated_id);
+        let (to_handle, to_domain) = parse_federated_id(to_federated_id);
+
+        let from_domain = from_domain.ok_or_else(|| {
+            tracing::error!("'from' must be federated ID with domain");
+            ApiError::BadRequest("'from' must include domain".to_string())
+        })?;
+
+        // Проверяем, что 'to' относится к нашему домену
+        if to_domain.as_ref() != Some(&self.state.config.domain) {
+            return Err(ApiError::BadRequest(format!(
+                "target domain '{}' does not match server domain '{}'",
+                to_domain.unwrap_or_default(),
+                self.state.config.domain
+            )));
+        }
+
+        // Проверяем, что отправитель - известный peer
+        let _peer = self
+            .state
+            .config
+            .peers
+            .iter()
+            .find(|p| p.domain == from_domain)
+            .ok_or_else(|| {
+                tracing::error!("unknown peer domain: {}", from_domain);
+                ApiError::BadRequest(format!("unknown peer: {}", from_domain))
+            })?;
+
+        // TODO: Проверить подпись запроса
+        tracing::warn!("signature verification not yet implemented");
+
+        // Проверяем, существует ли локальный пользователь 'to_handle'
+        let to_user = self
+            .state
+            .storage
+            .load_user_by_handle(&to_handle)
+            .await
+            .map_err(|err| match err {
+                StorageError::Missing => {
+                    tracing::warn!("target user '{}' not found", to_handle);
+                    ApiError::NotFound
+                }
+                _ => ApiError::Internal,
+            })?;
+
+        // Создаём запись в federated_friend_requests
+        let now = chrono::Utc::now();
+        let federated_request = FederatedFriendRequest {
+            request_id: request_id.to_string(),
+            from_user_id: from_federated_id.to_string(),
+            to_user_id: to_federated_id.to_string(),
+            from_domain: from_domain.clone(),
+            to_domain: self.state.config.domain.clone(),
+            message,
+            status: "pending".to_string(),
+            federation_event_id: Some(request_id.to_string()),
+            created_at: now,
+            updated_at: now,
+        };
+
+        self.state
+            .storage
+            .create_federated_friend_request(&federated_request)
+            .await
+            .map_err(|e| {
+                tracing::error!("failed to create federated friend request: {}", e);
+                ApiError::Internal
+            })?;
+
+        tracing::info!(
+            "federated friend request stored: {} from {} to {}",
+            request_id,
+            from_federated_id,
+            to_user.user_id
+        );
+
+        // TODO: Уведомить локального пользователя (push notification, websocket, etc.)
+
+        // Возвращаем успех
+        let response = json!({
+            "status": "accepted",
+            "request_id": request_id,
+        });
+
+        self.respond_json(session, 200, response, "application/json")
             .await
             .map_err(|_| ApiError::Internal)
     }
@@ -3044,12 +3402,30 @@ impl CommuCatApp {
     }
 
     async fn read_body(session: &mut ServerSession) -> Result<Vec<u8>, ApiError> {
+        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024; // 10 MB
         let mut body = Vec::new();
         loop {
             match session.read_request_body().await {
-                Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+                Ok(Some(chunk)) => {
+                    // Проверяем размер ДО добавления chunk
+                    if body.len() + chunk.len() > MAX_BODY_SIZE {
+                        tracing::error!(
+                            "request body too large: {} bytes (max {} bytes)",
+                            body.len() + chunk.len(),
+                            MAX_BODY_SIZE
+                        );
+                        return Err(ApiError::BadRequest(format!(
+                            "request body too large (max {} MB)",
+                            MAX_BODY_SIZE / (1024 * 1024)
+                        )));
+                    }
+                    body.extend_from_slice(&chunk);
+                }
                 Ok(None) => break,
-                Err(_) => return Err(ApiError::Internal),
+                Err(e) => {
+                    tracing::error!("error reading request body: {}", e);
+                    return Err(ApiError::Internal);
+                }
             }
         }
         Ok(body)
