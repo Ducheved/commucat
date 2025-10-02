@@ -171,6 +171,7 @@ mod tests {
         let profile = UserProfile {
             user_id: "user-123".to_string(),
             handle: "alice".to_string(),
+            domain: "local".to_string(),
             display_name: Some("Alice".to_string()),
             avatar_url: None,
             created_at: now,
@@ -3740,6 +3741,7 @@ impl CommuCatApp {
                                         let new_profile = NewUserProfile {
                                             user_id: generate_id(handle),
                                             handle: handle.clone(),
+                                            domain: self.state.config.domain.clone(),
                                             display_name: display_hint.clone(),
                                             avatar_url: avatar_hint.clone(),
                                         };

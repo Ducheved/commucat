@@ -119,9 +119,11 @@ async fn command_register_user(mut args: Vec<String>) -> Result<(), String> {
         return Err("unexpected arguments".to_string());
     }
     let storage = storage_connect().await?;
+    let domain = env::var("COMMUCAT_DOMAIN").unwrap_or_else(|_| "local".to_string());
     let profile = NewUserProfile {
         user_id: generate_id(&handle),
         handle: handle.clone(),
+        domain,
         display_name,
         avatar_url,
     };
@@ -305,9 +307,11 @@ async fn ensure_user(
     match storage.load_user_by_handle(handle).await {
         Ok(profile) => Ok(profile),
         Err(StorageError::Missing) => {
+            let domain = env::var("COMMUCAT_DOMAIN").unwrap_or_else(|_| "local".to_string());
             let profile = NewUserProfile {
                 user_id: generate_id(handle),
                 handle: handle.to_string(),
+                domain,
                 display_name: Some(display_name.to_string()),
                 avatar_url: None,
             };

@@ -17,6 +17,7 @@ const SERVER_SECRET_SQL: &str = include_str!("../migrations/004_server_secrets.s
 const DEVICE_ROTATION_SQL: &str = include_str!("../migrations/005_device_rotation.sql");
 const FEDERATION_OUTBOX_SQL: &str = include_str!("../migrations/006_federation_outbox.sql");
 const FRIEND_REQUESTS_SQL: &str = include_str!("../migrations/007_friend_requests.sql");
+const FEDERATED_IDENTIFIERS_SQL: &str = include_str!("../migrations/008_federated_identifiers.sql");
 const PAIRING_MAX_ATTEMPTS: i32 = 5;
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -54,6 +55,7 @@ pub struct Storage {
 pub struct NewUserProfile {
     pub user_id: String,
     pub handle: String,
+    pub domain: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
 }
@@ -62,6 +64,7 @@ pub struct NewUserProfile {
 pub struct UserProfile {
     pub user_id: String,
     pub handle: String,
+    pub domain: String,
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -248,6 +251,49 @@ pub struct PairingClaimResult {
     pub issuer_device_id: String,
 }
 
+/// Remote user profile cached from another server
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteUserProfile {
+    pub user_id: String,
+    pub domain: String,
+    pub handle: String,
+    pub display_name: Option<String>,
+    pub avatar_url: Option<String>,
+    pub profile_data: serde_json::Value,
+    pub cached_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub last_fetched_at: DateTime<Utc>,
+}
+
+/// Federation peer connection status tracking
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederationPeerConnectionStatus {
+    pub domain: String,
+    pub endpoint: String,
+    pub public_key: Vec<u8>,
+    pub last_seen_at: Option<DateTime<Utc>>,
+    pub last_error: Option<String>,
+    pub error_count: i32,
+    pub status: String, // unknown, online, offline, unreachable
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Federated friend request (cross-server)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FederatedFriendRequest {
+    pub request_id: String,
+    pub from_user_id: String, // full ID: user@domain
+    pub to_user_id: String,   // full ID: user@domain
+    pub from_domain: String,
+    pub to_domain: String,
+    pub message: Option<String>,
+    pub status: String, // pending, accepted, rejected, cancelled
+    pub federation_event_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatGroup {
     pub group_id: String,
@@ -391,6 +437,10 @@ impl Storage {
             .map_err(|_| StorageError::Postgres)?;
         self.client
             .batch_execute(FRIEND_REQUESTS_SQL)
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(FEDERATED_IDENTIFIERS_SQL)
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(())
@@ -951,12 +1001,13 @@ impl Storage {
         let row = self
             .client
             .query_one(
-                "INSERT INTO app_user (user_id, handle, display_name, avatar_url, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $5)
-                RETURNING user_id, handle, display_name, avatar_url, created_at, updated_at",
+                "INSERT INTO app_user (user_id, handle, domain, display_name, avatar_url, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $6)
+                RETURNING user_id, handle, domain, display_name, avatar_url, created_at, updated_at",
                 &[
                     &profile.user_id,
                     &profile.handle,
+                    &profile.domain,
                     &profile.display_name,
                     &profile.avatar_url,
                     &now,
@@ -967,10 +1018,11 @@ impl Storage {
         Ok(UserProfile {
             user_id: row.get(0),
             handle: row.get(1),
-            display_name: row.get(2),
-            avatar_url: row.get(3),
-            created_at: row.get(4),
-            updated_at: row.get(5),
+            domain: row.get(2),
+            display_name: row.get(3),
+            avatar_url: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
         })
     }
 
@@ -979,7 +1031,7 @@ impl Storage {
         let row = self
             .client
             .query_opt(
-                "SELECT user_id, handle, display_name, avatar_url, created_at, updated_at FROM app_user WHERE user_id = $1",
+                "SELECT user_id, handle, domain, display_name, avatar_url, created_at, updated_at FROM app_user WHERE user_id = $1",
                 &[&user_id],
             )
             .await
@@ -988,10 +1040,11 @@ impl Storage {
         Ok(UserProfile {
             user_id: row.get(0),
             handle: row.get(1),
-            display_name: row.get(2),
-            avatar_url: row.get(3),
-            created_at: row.get(4),
-            updated_at: row.get(5),
+            domain: row.get(2),
+            display_name: row.get(3),
+            avatar_url: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
         })
     }
 
@@ -1000,7 +1053,7 @@ impl Storage {
         let row = self
             .client
             .query_opt(
-                "SELECT user_id, handle, display_name, avatar_url, created_at, updated_at FROM app_user WHERE handle = $1",
+                "SELECT user_id, handle, domain, display_name, avatar_url, created_at, updated_at FROM app_user WHERE handle = $1",
                 &[&handle],
             )
             .await
@@ -1009,10 +1062,11 @@ impl Storage {
         Ok(UserProfile {
             user_id: row.get(0),
             handle: row.get(1),
-            display_name: row.get(2),
-            avatar_url: row.get(3),
-            created_at: row.get(4),
-            updated_at: row.get(5),
+            domain: row.get(2),
+            display_name: row.get(3),
+            avatar_url: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
         })
     }
 
@@ -1057,6 +1111,213 @@ impl Storage {
             return Err(StorageError::Missing);
         }
         Ok(())
+    }
+
+    /// Loads user by handle@domain
+    pub async fn load_user_by_federated_id(
+        &self,
+        handle: &str,
+        domain: &str,
+    ) -> Result<UserProfile, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT user_id, handle, domain, display_name, avatar_url, created_at, updated_at 
+                FROM app_user WHERE handle = $1 AND domain = $2",
+                &[&handle, &domain],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        let row = row.ok_or(StorageError::Missing)?;
+        Ok(UserProfile {
+            user_id: row.get(0),
+            handle: row.get(1),
+            domain: row.get(2),
+            display_name: row.get(3),
+            avatar_url: row.get(4),
+            created_at: row.get(5),
+            updated_at: row.get(6),
+        })
+    }
+
+    /// Caches remote user profile
+    pub async fn cache_remote_user(&self, profile: &RemoteUserProfile) -> Result<(), StorageError> {
+        self.client
+            .execute(
+                "INSERT INTO remote_user_cache 
+                (user_id, domain, handle, display_name, avatar_url, profile_data, cached_at, expires_at, last_fetched_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    display_name = EXCLUDED.display_name,
+                    avatar_url = EXCLUDED.avatar_url,
+                    profile_data = EXCLUDED.profile_data,
+                    last_fetched_at = EXCLUDED.last_fetched_at,
+                    expires_at = EXCLUDED.expires_at",
+                &[
+                    &profile.user_id,
+                    &profile.domain,
+                    &profile.handle,
+                    &profile.display_name,
+                    &profile.avatar_url,
+                    &profile.profile_data,
+                    &profile.cached_at,
+                    &profile.expires_at,
+                    &profile.last_fetched_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Loads cached remote user profile
+    pub async fn load_remote_user_cache(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<RemoteUserProfile>, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT user_id, domain, handle, display_name, avatar_url, profile_data, 
+                cached_at, expires_at, last_fetched_at
+                FROM remote_user_cache WHERE user_id = $1 AND expires_at > now()",
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+
+        Ok(row.map(|row| RemoteUserProfile {
+            user_id: row.get(0),
+            domain: row.get(1),
+            handle: row.get(2),
+            display_name: row.get(3),
+            avatar_url: row.get(4),
+            profile_data: row.get(5),
+            cached_at: row.get(6),
+            expires_at: row.get(7),
+            last_fetched_at: row.get(8),
+        }))
+    }
+
+    /// Updates federation peer status
+    pub async fn update_federation_peer_status(
+        &self,
+        status: &FederationPeerConnectionStatus,
+    ) -> Result<(), StorageError> {
+        self.client
+            .execute(
+                "INSERT INTO federation_peer_status 
+                (domain, endpoint, public_key, last_seen_at, last_error, error_count, status, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (domain) DO UPDATE SET
+                    endpoint = EXCLUDED.endpoint,
+                    public_key = EXCLUDED.public_key,
+                    last_seen_at = EXCLUDED.last_seen_at,
+                    last_error = EXCLUDED.last_error,
+                    error_count = EXCLUDED.error_count,
+                    status = EXCLUDED.status,
+                    updated_at = EXCLUDED.updated_at",
+                &[
+                    &status.domain,
+                    &status.endpoint,
+                    &status.public_key,
+                    &status.last_seen_at,
+                    &status.last_error,
+                    &status.error_count,
+                    &status.status,
+                    &status.created_at,
+                    &status.updated_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Creates federated friend request
+    pub async fn create_federated_friend_request(
+        &self,
+        request: &FederatedFriendRequest,
+    ) -> Result<(), StorageError> {
+        self.client
+            .execute(
+                "INSERT INTO federated_friend_requests 
+                (request_id, from_user_id, to_user_id, from_domain, to_domain, message, status, federation_event_id, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &request.request_id,
+                    &request.from_user_id,
+                    &request.to_user_id,
+                    &request.from_domain,
+                    &request.to_domain,
+                    &request.message,
+                    &request.status,
+                    &request.federation_event_id,
+                    &request.created_at,
+                    &request.updated_at,
+                ],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
+    }
+
+    /// Updates federated friend request status
+    pub async fn update_federated_friend_request_status(
+        &self,
+        request_id: &str,
+        status: &str,
+    ) -> Result<(), StorageError> {
+        let now = Utc::now();
+        let affected = self
+            .client
+            .execute(
+                "UPDATE federated_friend_requests SET status = $2, updated_at = $3 WHERE request_id = $1",
+                &[&request_id, &status, &now],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
+    }
+
+    /// Lists federated friend requests for user
+    pub async fn list_federated_friend_requests(
+        &self,
+        user_id: &str,
+        incoming: bool,
+    ) -> Result<Vec<FederatedFriendRequest>, StorageError> {
+        let query = if incoming {
+            "SELECT request_id, from_user_id, to_user_id, from_domain, to_domain, message, status, federation_event_id, created_at, updated_at
+            FROM federated_friend_requests WHERE to_user_id = $1 ORDER BY created_at DESC"
+        } else {
+            "SELECT request_id, from_user_id, to_user_id, from_domain, to_domain, message, status, federation_event_id, created_at, updated_at
+            FROM federated_friend_requests WHERE from_user_id = $1 ORDER BY created_at DESC"
+        };
+
+        let rows = self
+            .client
+            .query(query, &[&user_id])
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| FederatedFriendRequest {
+                request_id: row.get(0),
+                from_user_id: row.get(1),
+                to_user_id: row.get(2),
+                from_domain: row.get(3),
+                to_domain: row.get(4),
+                message: row.get(5),
+                status: row.get(6),
+                federation_event_id: row.get(7),
+                created_at: row.get(8),
+                updated_at: row.get(9),
+            })
+            .collect())
     }
 
     /// Creates a chat group entry and enrolls the owner as a member.
@@ -1923,6 +2184,7 @@ mod tests {
         let user_profile = NewUserProfile {
             user_id: format!("test-user-{}", suffix),
             handle: format!("tester{}", suffix),
+            domain: "local".to_string(),
             display_name: Some("Tester".to_string()),
             avatar_url: None,
         };
