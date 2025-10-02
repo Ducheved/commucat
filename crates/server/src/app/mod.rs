@@ -5709,13 +5709,26 @@ async fn send_federation_message(
         .timeout(TokioDuration::from_secs(30))
         .build()?;
 
-    // Используем уже имеющийся payload из очереди
-    // (он был подписан при создании записи в handle_federated_friend_request)
+    // Определяем тип сообщения по структуре payload
+    // Если есть поле "event" - это SignedEvent для /federation/events (MSG relay)
+    // Иначе - это friend-request для /federation/friend-request
+    let path = if msg.payload.get("event").is_some() {
+        "/federation/events"
+    } else {
+        "/federation/friend-request"
+    };
 
-    // Отправляем POST запрос
-    let full_url = format!("{}/federation/friend-request", msg.endpoint);
+    let full_url = format!("{}{}", msg.endpoint, path);
 
-    tracing::debug!("sending federation message to {}", full_url);
+    tracing::debug!(
+        "sending federation message to {} (type: {})",
+        full_url,
+        if path.contains("events") {
+            "relay"
+        } else {
+            "friend-request"
+        }
+    );
 
     let response = client.post(&full_url).json(&msg.payload).send().await?;
 
