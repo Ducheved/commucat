@@ -52,18 +52,18 @@ impl FileLedgerAdapter {
     /// Creates a file based ledger adapter storing newline-delimited JSON.
     pub fn new(path: PathBuf) -> Result<Self, LedgerError> {
         tracing::debug!("creating file ledger adapter at: {}", path.display());
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                tracing::debug!("ensuring parent directory exists: {}", parent.display());
-                create_dir_all(parent).map_err(|e| {
-                    tracing::error!(
-                        "failed to create ledger parent directory '{}': {}",
-                        parent.display(),
-                        e
-                    );
-                    LedgerError::Io
-                })?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            tracing::debug!("ensuring parent directory exists: {}", parent.display());
+            create_dir_all(parent).map_err(|e| {
+                tracing::error!(
+                    "failed to create ledger parent directory '{}': {}",
+                    parent.display(),
+                    e
+                );
+                LedgerError::Io
+            })?;
         }
         tracing::info!("file ledger adapter initialized at: {}", path.display());
         Ok(Self { path })

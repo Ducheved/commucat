@@ -2,7 +2,6 @@ use blake3::Hasher;
 use std::path::PathBuf;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tracing;
 
 use crate::util::encode_hex;
 
