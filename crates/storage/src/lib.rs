@@ -1038,6 +1038,27 @@ impl Storage {
         Ok(())
     }
 
+    /// Updates user avatar URL
+    pub async fn update_user_avatar(
+        &self,
+        user_id: &str,
+        avatar_url: &str,
+    ) -> Result<(), StorageError> {
+        let now = Utc::now();
+        let affected = self
+            .client
+            .execute(
+                "UPDATE app_user SET avatar_url = $2, updated_at = $3 WHERE user_id = $1",
+                &[&user_id, &avatar_url, &now],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        if affected == 0 {
+            return Err(StorageError::Missing);
+        }
+        Ok(())
+    }
+
     /// Creates a chat group entry and enrolls the owner as a member.
     pub async fn create_group(&self, group: &ChatGroup) -> Result<(), StorageError> {
         self.client

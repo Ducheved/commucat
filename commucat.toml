@@ -48,6 +48,12 @@ relay_ttl = 86400
 # Pairing token lifetime (seconds)
 pairing_ttl = 300
 
+[uploads]
+# Directory for uploaded files (avatars, etc.)
+dir = "var/uploads"
+# Base URL for uploaded files (optional, defaults to https://{domain}/uploads)
+# base_url = "https://cdn.example.org/uploads"
+
 [security.rate_limit]
 # Burst size for generic HTTP endpoints
 http_burst = 60

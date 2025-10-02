@@ -2,12 +2,16 @@ mod federation;
 mod media;
 mod p2p;
 mod rotation;
+mod uploads;
 
 use self::federation::spawn_dispatcher;
 use self::media::{CallMediaTranscoder, SharedCallMediaTranscoder};
 use self::rotation::{
     DecodedRotationRequest, DeviceRotationRequest, RotationNotification, RotationRequestError,
     rotation_proof_message,
+};
+use self::uploads::{
+    UploadError, generate_filename, mime_type_from_filename, read_file, save_file, validate_avatar,
 };
 use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
 use crate::metrics::Metrics;
@@ -948,6 +952,18 @@ impl CommuCatApp {
             }
             return None;
         }
+
+        // GET /uploads/{filename} - отдача загруженных файлов
+        if let Some(filename) = path.strip_prefix("/uploads/")
+            && method == "GET"
+        {
+            self.state.metrics.mark_ingress();
+            if let Err(err) = self.handle_uploads_get(&mut session, filename).await {
+                error!("uploads get failed: {}", err);
+            }
+            return None;
+        }
+
         if path == "/api/friends" && method == "GET" {
             self.state.metrics.mark_ingress();
             match self.handle_friends_get(&mut session).await {
@@ -1002,6 +1018,19 @@ impl CommuCatApp {
             }
             return None;
         }
+
+        // POST /api/users/me/avatar - загрузка аватарки
+        if path == "/api/users/me/avatar" && method == "POST" {
+            self.state.metrics.mark_ingress();
+            match self.handle_avatar_upload(&mut session).await {
+                Ok(()) => {}
+                Err(err) => {
+                    let _ = self.respond_api_error(&mut session, err).await;
+                }
+            }
+            return None;
+        }
+
         // GET /api/friends/requests - список запросов в друзья
         if path == "/api/friends/requests" && method == "GET" {
             self.state.metrics.mark_ingress();
@@ -1909,6 +1938,139 @@ impl CommuCatApp {
             .write_response_header(Box::new(response))
             .await
             .map_err(|_| ApiError::Internal)?;
+        Ok(())
+    }
+
+    async fn handle_avatar_upload(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+    ) -> Result<(), ApiError> {
+        let context = self.authenticate_session(session).await?;
+        let body = Self::read_body(session).await?;
+
+        // Простой парсинг multipart (ищем boundary)
+        let content_type = session
+            .req_header()
+            .headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        // Для простоты, если Content-Type: image/*, то сохраняем напрямую
+        let mime_type = if content_type.starts_with("image/") {
+            content_type
+        } else {
+            "image/jpeg" // default
+        };
+
+        // Валидация
+        validate_avatar(&body, mime_type).map_err(|err| match err {
+            UploadError::TooLarge => {
+                ApiError::BadRequest("avatar file too large (max 5 MB)".to_string())
+            }
+            UploadError::InvalidMimeType => ApiError::BadRequest(
+                "invalid image type (allowed: jpeg, png, webp, gif)".to_string(),
+            ),
+            UploadError::Io(_) => ApiError::Internal,
+        })?;
+
+        // Генерируем уникальное имя файла
+        let filename = generate_filename(&body, mime_type);
+
+        // Сохраняем файл
+        save_file(&self.state.config.uploads_dir, &filename, &body)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        // Генерируем URL
+        let avatar_url = format!("{}/{}", self.state.config.uploads_base_url, filename);
+
+        // Обновляем профиль пользователя
+        self.state
+            .storage
+            .update_user_avatar(&context.user.user_id, &avatar_url)
+            .await
+            .map_err(|_| ApiError::Internal)?;
+
+        // Возвращаем ответ
+        let payload = json!({
+            "avatar_url": avatar_url,
+            "filename": filename,
+        });
+
+        self.respond_json(session, 200, payload, "application/json")
+            .await
+            .map_err(|_| ApiError::Internal)
+    }
+
+    async fn handle_uploads_get(
+        self: &Arc<Self>,
+        session: &mut ServerSession,
+        filename: &str,
+    ) -> Result<(), ServerError> {
+        // Security: validate filename (no path traversal)
+        if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+            let mut response =
+                ResponseHeader::build_no_case(403, None).map_err(|_| ServerError::Invalid)?;
+            response
+                .append_header("content-type", "text/plain")
+                .map_err(|_| ServerError::Invalid)?;
+            session
+                .write_response_header(Box::new(response))
+                .await
+                .map_err(|_| ServerError::Io)?;
+            session
+                .write_response_body(b"forbidden".to_vec().into(), true)
+                .await
+                .map_err(|_| ServerError::Io)?;
+            return Ok(());
+        }
+
+        // Читаем файл
+        let data = match read_file(&self.state.config.uploads_dir, filename).await {
+            Ok(data) => data,
+            Err(_) => {
+                let mut response =
+                    ResponseHeader::build_no_case(404, None).map_err(|_| ServerError::Invalid)?;
+                response
+                    .append_header("content-type", "text/plain")
+                    .map_err(|_| ServerError::Invalid)?;
+                session
+                    .write_response_header(Box::new(response))
+                    .await
+                    .map_err(|_| ServerError::Io)?;
+                session
+                    .write_response_body(b"not found".to_vec().into(), true)
+                    .await
+                    .map_err(|_| ServerError::Io)?;
+                return Ok(());
+            }
+        };
+
+        // Определяем MIME type
+        let mime_type = mime_type_from_filename(filename);
+
+        // Отдаём файл
+        let mut response =
+            ResponseHeader::build_no_case(200, None).map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("content-type", mime_type)
+            .map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("cache-control", "public, max-age=31536000, immutable")
+            .map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("content-length", data.len().to_string())
+            .map_err(|_| ServerError::Invalid)?;
+        session
+            .write_response_header(Box::new(response))
+            .await
+            .map_err(|_| ServerError::Io)?;
+        session
+            .write_response_body(data.into(), true)
+            .await
+            .map_err(|_| ServerError::Io)?;
+        self.state.metrics.mark_egress();
         Ok(())
     }
 

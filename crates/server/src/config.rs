@@ -128,6 +128,8 @@ pub struct ServerConfig {
     pub rotation: SecretRotationConfig,
     pub device_rotation: DeviceRotationConfig,
     pub transport: TransportConfig,
+    pub uploads_dir: String,
+    pub uploads_base_url: String,
 }
 
 /// Loads CommuCat server configuration from filesystem and environment overrides.
@@ -491,6 +493,13 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         notify_channel: device_rotation_notify_channel,
     };
 
+    let uploads_dir = override_env("COMMUCAT_UPLOADS_DIR", map.remove("uploads.dir"))?
+        .unwrap_or_else(|| "var/uploads".to_string());
+
+    let uploads_base_url =
+        override_env("COMMUCAT_UPLOADS_BASE_URL", map.remove("uploads.base_url"))?
+            .unwrap_or_else(|| format!("https://{}/uploads", domain));
+
     Ok(ServerConfig {
         bind: required(bind)?,
         tls_cert,
@@ -518,6 +527,8 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         rotation,
         device_rotation,
         transport,
+        uploads_dir,
+        uploads_base_url,
     })
 }
 

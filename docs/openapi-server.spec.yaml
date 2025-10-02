@@ -1134,6 +1134,109 @@ paths:
   
   # ============= Friends =============
   
+  /api/users/me/avatar:
+    post:
+      summary: Upload user avatar
+      tags: [Users]
+      security:
+        - BearerAuth: []
+      description: |
+        Загрузить аватарку пользователя. Принимает изображение напрямую в теле запроса.
+        
+        **Ограничения:**
+        - Максимальный размер: 5 MB
+        - Допустимые форматы: JPEG, PNG, WebP, GIF
+        
+        После успешной загрузки профиль пользователя автоматически обновляется с новым avatar_url.
+      requestBody:
+        required: true
+        content:
+          image/jpeg:
+            schema:
+              type: string
+              format: binary
+          image/png:
+            schema:
+              type: string
+              format: binary
+          image/webp:
+            schema:
+              type: string
+              format: binary
+          image/gif:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Avatar uploaded successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - avatar_url
+                  - filename
+                properties:
+                  avatar_url:
+                    type: string
+                    description: Полный URL загруженной аватарки
+                    example: https://commucat.example.org/uploads/a1b2c3d4e5f6g7h8.jpg
+                  filename:
+                    type: string
+                    description: Имя сохранённого файла
+                    example: a1b2c3d4e5f6g7h8.jpg
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+  
+  /uploads/{filename}:
+    get:
+      summary: Get uploaded file
+      tags: [Users]
+      security: []
+      description: |
+        Отдаёт загруженный файл (аватарки и т.д.).
+        Файлы кешируются навсегда (immutable).
+      parameters:
+        - name: filename
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Имя файла
+          example: a1b2c3d4e5f6g7h8.jpg
+      responses:
+        '200':
+          description: File content
+          headers:
+            Cache-Control:
+              schema:
+                type: string
+                example: public, max-age=31536000, immutable
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+            image/gif:
+              schema:
+                type: string
+                format: binary
+        '403':
+          description: Forbidden (path traversal detected)
+        '404':
+          description: File not found
+  
   /api/friends:
     get:
       summary: Get friends list

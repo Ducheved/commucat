@@ -276,6 +276,41 @@ pub fn friends_put_endpoint() {}
 
 #[allow(dead_code)]
 #[utoipa::path(
+    post,
+    path = "/api/users/me/avatar",
+    tag = "Users",
+    security(("BearerAuth" = [])),
+    request_body(
+        content = String,
+        content_type = "image/jpeg",
+        description = "Image file (JPEG, PNG, WebP, or GIF, max 5 MB)"
+    ),
+    responses(
+        (status = 200, description = "Avatar uploaded", content_type = "application/json"),
+        (status = 400, description = "Bad request", body = ProblemDetails, content_type = "application/problem+json"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails, content_type = "application/problem+json")
+    )
+)]
+pub fn upload_avatar_endpoint() {}
+
+#[allow(dead_code)]
+#[utoipa::path(
+    get,
+    path = "/uploads/{filename}",
+    tag = "Users",
+    params(
+        ("filename" = String, Path, description = "Filename")
+    ),
+    responses(
+        (status = 200, description = "File content", content_type = "image/jpeg"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Not found")
+    )
+)]
+pub fn get_upload_endpoint() {}
+
+#[allow(dead_code)]
+#[utoipa::path(
     get,
     path = "/api/friends/{user_id}/devices",
     tag = "Friends",
