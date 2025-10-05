@@ -12,8 +12,9 @@ domain = "example.org"
 auto_approve_devices = true
 # Max devices per user when auto-approval is enabled (0 disables auto-approval)
 max_auto_devices_per_user = 5
-# TCP keep-alive interval in seconds
-keepalive = 60
+# Session TTL in seconds (applies to HTTP API and WebSocket connections)
+# Recommended: 3600 (1 hour) for mobile clients, 300-600 for development
+keepalive = 3600
 
 [storage]
 # PostgreSQL connection string

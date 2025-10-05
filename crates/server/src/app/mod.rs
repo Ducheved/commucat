@@ -3727,8 +3727,10 @@ impl CommuCatApp {
                         ApiError::Internal
                     }
                 })?;
+        let now = Utc::now();
         let expiry = session_record.created_at + Duration::seconds(session_record.ttl_seconds);
-        if expiry <= Utc::now() {
+
+        if expiry <= now {
             debug!(
                 session_id = %session_record.session_id,
                 "authentication failed: session expired"
@@ -3737,6 +3739,30 @@ impl CommuCatApp {
                 "session expired, please reconnect".to_string(),
             )));
         }
+
+        // Автоматически обновляем сессию если осталось менее 50% времени
+        let time_remaining = (expiry - now).num_seconds();
+        let refresh_threshold = session_record.ttl_seconds / 2;
+
+        if time_remaining < refresh_threshold {
+            let updated_session = SessionRecord {
+                session_id: session_record.session_id.clone(),
+                user_id: session_record.user_id.clone(),
+                device_id: session_record.device_id.clone(),
+                tls_fingerprint: session_record.tls_fingerprint.clone(),
+                created_at: now,
+                ttl_seconds: session_record.ttl_seconds,
+            };
+
+            // Обновляем сессию в фоне (не блокируем запрос)
+            let storage = self.state.storage.clone();
+            tokio::spawn(async move {
+                if let Err(err) = storage.record_session(&updated_session).await {
+                    debug!("session auto-refresh failed: {}", err);
+                }
+            });
+        }
+
         let device = self
             .state
             .storage
