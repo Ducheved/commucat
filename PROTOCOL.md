@@ -1,307 +1,152 @@
-# Спецификация CommuCat CCP-1 (редакция 2024-10)
+# CommuCat CCP-1 Protocol (2025-10 draft)
 
-Документ описывает всю транспортную и сервисную архитектуру CommuCat, а также состояние реализованных и запланированных компонентов. Все примеры приведены на основе актуального исходного кода из каталога `h:\commucat`. Актуальный список задач и статусов ведётся в [`docs/todo.md`](docs/todo.md).
+This document describes the current control-plane protocol spoken between CommuCat clients and the server ("CCP-1"). The code lives primarily in `crates/server`, `crates/proto`, and `crates/crypto`.
 
-## 1. Архитектура репозитория
-
-| Crate | Назначение | Реализация | Ограничения/заглушки |
-|-------|------------|------------|-----------------------|
-| `crates/server` | Основное приложение (HTTP/2, Noise-туннель, REST, SFU) | Работает | Нет медиамикшера, нет PQ-гибрида, нет обфускации, AV1/H264 не поддерживаются |
-| `crates/proto` | CCP-1: кадры, сериализация, структуры звонков, черновик обфускации | Работает | Capability-поля расширены, но сервер использует только профиль Opus/VP8 |
-| `crates/media` | Кодеки и пайплайны (Opus/VP8, RAW PCM/I420) | Используется сервером для перекодирования RAW→Opus/VP8 | Бэкенды AV1/H264/GPU возвращают `MediaError::Unsupported` |
-| `crates/media-types` | Общие enum/descriptor для кодеков | Работает | - |
-| `crates/crypto` | Noise XK/IK, сертификаты устройств, PQ-хелперы | Работает | PQ-гибрид применяется только в `/api/p2p/assist` |
-| `crates/storage` | PostgreSQL + Redis (профили, presence, relay-очередь, pairing) | Работает | Требует предварительных миграций |
-| `crates/federation` | Подпись междоменных событий | Работает | Реальная федерация пока не включена |
-| `crates/ledger` | Аудит ключей устройств | Работает | - |
-| `crates/cli` | Служебные команды: миграции, регистрация пользователя, ротация ключей, диагностика | Работает | Использует те же DSN/URL, что сервер |
-
-## 2. Конфигурация и запуск
-
-### 2.1 Файл `commucat.toml`
-Минимальные ключи (секция `server`):
-```
-[server]
-bind = "0.0.0.0:9443"
-domain = "commucat.local"
-tls_cert = "certs/server.crt"
-tls_key = "certs/server.key"
-
-[storage]
-postgres_dsn = "postgres://..."
-redis_url = "redis://localhost:6379"
-
-[crypto]
-noise_private = "<hex32>"
-noise_public = "<hex32>"
-federation_seed = "<hex64>"
-prologue = "commucat"
-
-[admin]
-token = "optional-manual-token"
-
-[presence]
-ttl_seconds = 60
-
-[pairing]
-ttl_seconds = 600
-
-[server]
-max_auto_devices_per_user = 5
-connection_keepalive = 30
-```
-
-Любой ключ может быть переопределён переменными окружения (см. `load_configuration`):
-- `COMMUCAT_BIND`, `COMMUCAT_TLS_CERT`, `COMMUCAT_TLS_KEY`
-- `COMMUCAT_PG_DSN`, `COMMUCAT_REDIS_URL`, `COMMUCAT_DOMAIN`
-- `COMMUCAT_NOISE_PRIVATE`, `COMMUCAT_NOISE_PUBLIC`, `COMMUCAT_FEDERATION_SEED`
-- `COMMUCAT_ADMIN_TOKEN`, `COMMUCAT_NOISE_PROLOGUE`
-
-### 2.2 Ротация секретов
-`SecretManager` (`crates/server/src/security/secrets.rs`) управляет:
-- Noise static key (с интервалом `rotation.noise.interval`).
-- Административным токеном (если `rotation.admin.enabled = true`).
-Ротация хранится в таблицах Postgres, поддерживаются несколько версий, grace-период задаётся в конфиге.
-
-CLI команда `commucat-cli rotate-keys [--user <id>|--handle <handle>] [--device <id>]`:
-1. Генерирует новый ключ устройства (`DeviceKeyPair`).
-2. Выпускает сертификат с помощью `commucat_crypto::EventSigner` (сертификат действует 30 дней).
-3. Записывает событие в Postgres/ledger.
-
-### 2.3 Миграции и регистрация пользователей
-- `commucat-cli migrate` — применяет SQL миграции.
-- `commucat-cli register-user <handle> [display_name] [avatar_url]` — создаёт профиль пользователя.
-
-## 3. Хранилища и фоновые задачи
-
-| Компонент | Назначение |
-|-----------|------------|
-| PostgreSQL (`Storage`) | `users`, `devices`, `relay_queue`, `session`, `group_member`, `pairing_code`, `device_key_event`, `admin_token`, `noise_key`, `federation_peer` |
-| Redis | Presence (`presence:{device}`), кеш друзей |
-| `call_sessions` (в памяти) | Активные звонки: участники, профиль медиа, статистика |
-| `media_transcoders` (в памяти) | Транскодеры Opus/VP8 для текущих звонков |
-| Фоновые задачи | миграция pairing-кодов, транспортные пробы, ротация секретов |
-
-## 4. Транспортный слой
-
-### 4.1 HTTP/TLS
-- Сервер построен на Pingora, слушает `bind` (TLS 1.3).
-- Для обслуживания веб-страницы `/` возвращает статический landing page.
-- `POST /connect` — основной долгоживущий поток, используемый CCP-1.
-- Keep-alive отправляется каждые `connection_keepalive` секунд.
-
-### 4.2 Rate limiting (`security::limiter`)
-- Три зоны: HTTP (REST), CONNECT, pairing-claim.
-- Параметры считываются из `RateLimitConfig` (burst, window, penalty).
-- При превышении сервер отвечает 429 + `retry-after`.
-
-### 4.3 Noise туннель
-Handshake реализован в `app::handle_session`:
-1. Клиент отправляет `HELLO` (`FrameType::Hello`) с полями:
-   - `pattern`: `XK` или `IK`.
-   - `device_id` / статический ключ устройства.
-   - `supported_versions` (по умолчанию `[1]`).
-   - `user` (создание/привязка профиля).
-   - `capabilities` — массив строк (например, `"media.raw-audio"`).
-2. Сервер отвечает `AUTH` с:
-   - `session` (идентификатор подключения),
-   - `server_static`,
-   - `protocol_version`,
-   - `accepted_capabilities` (фактически `["media.opus","media.vp8"]`).
-3. Клиент завершает Noise (`AUTH` с третьим сообщением).
-4. Сервер отправляет `ACK {"handshake":"ok", ...}`.
-
-> **Ограничения:**
-> - PQ-гибрид (`pq-hybrid`) и адаптивная обфускация проигнорированы.
-> - Проверка capability сводится к записи в лог, медиапрофили выбираются статически.
-
-## 5. Протокол CCP-1
-
-### 5.1 Кадры
-```
-frame        = frame_len (varint) || frame_body
-frame_body   = frame_type (u8) || channel_id (varint) || sequence (varint) || payload_len (varint) || payload
-```
-Ограничения: `frame_len ≤ 16 MiB`, JSON ≤ 256 KiB, `channel_id`/`sequence ≤ 2^32-1`.
-
-### 5.2 Типы кадров
-- Управляющие: `HELLO`, `AUTH`, `JOIN`, `LEAVE`, `ACK`, `ERROR`, `CALL_*`, `PRESENCE`, `CALL_STATS`, `TRANSPORT_UPDATE`.
-- Контент: `MSG`, `TYPING`, `KEY_UPDATE`, `GROUP_EVENT`, `VOICE_FRAME`, `VIDEO_FRAME`.
-
-`FramePayload::Control` содержит JSON (serde), `FramePayload::Opaque` — произвольные байты.
-
-### 5.3 ACK/Sequencing
-- Каждое приложение ведёт локальный `sequence` (u32). Сервер проверяет монотонность.
-- На каждое входящее сообщение сервер отвечает `ACK` с `{"ack": <sequence>}`.
-- Для `TRANSPORT_UPDATE` дополнительно возвращаются `call_id` и `update` (`candidate`, `selected_candidate_pair`, `consent_keepalive`).
-
-### 5.4 Ошибки
-`ERROR` следует [RFC 9457]. Типичные ошибки: `Invalid Frame Type`, `Protocol Version Mismatch`, `PairingRequired`, `Varint Overflow`, `Frame Too Large`.
-
-## 6. Обработка каналов и сообщений
-
-- `JOIN`: обновляет `channel_routes` (список участников, `relay` flag).
-- `LEAVE`: удаляет участника; при пустом канале сервер чистит `channel_routes`.
-- `KEY_UPDATE`: JSON-уведомление, рассылаемое сервером при выпуске нового сертификата устройства. Поля: `type` (`"device-key-rotated"`), `rotation_id`, `event_id`, `public_key`, `old_public_key`, `certificate`, `issued_at`, `expires_at`.
-
-### Device Key Rotation Service
-
-Устройства могут запускать ротацию собственных ключей без участия оператора:
-
-1. Авторизованный клиент отправляет `POST /api/device/csr` с JSON:
-   ```json
-   {
-     "public_key": "<hex32>",
-     "signature": "<hex64>",
-     "expires_at": "2025-09-27T12:00:00Z",
-     "nonce": "<hex16...>"
-   }
-   ```
-2. `signature` — Ed25519-подпись текущим ключом устройства от сообщения
-   ```
-   blake3("commucat:device-rotation:v1" || device_id || new_public_key || expires_at || nonce)
-   ```
-   где `new_public_key` и `nonce` представлены в бинарном виде.
-3. Сервер проверяет минимальный интервал (`rotation.device.min_interval`), валидирует подпись, хранит событие в `device_rotation_audit`, выпускает сертификат и записывает его в Ledger.
-4. HTTP-ответ содержит новый сертификат и метаданные (`rotation_id`, `event_id`).
-5. Если устройство онлайн, сервер отправляет CCP `KeyUpdate` кадр на канал `rotation.device.notify_channel` (по умолчанию `0`). Оффлайн-устройства получают уведомление при следующем подключении в виде релэй-контента.
-- `MSG` (и аналогичные) ретранслируются во все активные подключения (`broadcast_frame`).
-- Оффлайн-клиентам кадры сохраняются в `relay_queue` (Postgres) c новым `sequence`.
-
-### Presence
-- Каждое подключение публикует `PRESENCE {"state":"online"}`.
-- Сервер записывает `PresenceSnapshot` в Redis, TTL задаётся конфигом.
-- При обрыве соединения состояние переводится в `offline` и активные звонки завершаются.
-
-## 7. Звонки и медиа
-
-### 7.1 Сигнализация
-- `CALL_OFFER`: создаёт `CallSession` (канал, инициатор, профиль медиа, участники), запускает транскодер (`ensure_call_transcoder`).
-- `CALL_ANSWER`: добавляет устройство в `accepted`, при необходимости обновляет профиль медиа (`update_call_transcoder`).
-- `CALL_END`: удаляет `CallSession`, останавливает транскодер, пишет событие в метрики.
-- `CALL_STATS`: сохраняются в `session.stats` без автоматической обратной связи.
-
-### 7.2 Формат медиа-пакета
-Каждый `VOICE_FRAME`/`VIDEO_FRAME` имеет 3-байтовый заголовок:
-```
-byte 0: версия (сейчас 1)
-byte 1: источник (MediaSourceMode — 0 encoded, 1 raw, 2 hybrid)
-byte 2: кодек (AudioCodec либо VideoCodec)
-```
-Дальше следует полезная нагрузка:
-- RAW аудио — PCM `i16` (20 мс, mono/stereo по профилю).
-- RAW видео — I420 (Y plane, затем U, V).
-- Закодированное аудио — Opus пакет.
-- Закодированное видео — VP8 кадр.
-
-### 7.3 Серверное транскодирование
-`media::CallMediaTranscoder` хранит опциональные энкодеры Opus/VP8.
-- При получении RAW пакета выполняется перекодирование и пакет заменяется на закодированную версию.
-- Уже закодированные пакеты проходят транзитом.
-- Для видео используется libvpx (`VideoEncoder`/`VideoDecoder`). AV1/H264 отсутствуют.
-- Состояние транскодера помещено в `Arc<Mutex<...>>`, связанное с `call_id`.
-- Ошибки кодека конвертируются в `ServerError::Codec` (кадр отбрасывается, пишется warning).
-
-### 7.4 Ограничения
-- Нет адаптивного битрейта, нет SVC, нет FEC.
-- `MediaSourceMode::Hybrid` пока не имеет особенной логики.
-- Сервер не выполняет синхронизацию RTP/таймингов — только монотонный `sequence`.
-
-### 7.5 ICE и trickle-кандидаты
-- `CallTransport` теперь содержит `candidates` (расширенные ICE-кандидаты с `foundation`, `component`, `priority`, `candidate_type`, `related_*`, `tcp_type`, `sdp_mid`, `sdp_mline_index`, `url`), `ice_credentials` (`username_fragment`, `password`, `expires_at`), флаг `trickle` и `consent_interval_secs` (рекомендуемый интервал STUN Binding-запросов).
-- Пример фрагмента `CallOffer`/`CallAnswer`:
-  ```json
-  {
-    "transport": {
-      "prefer_relay": false,
-      "trickle": true,
-      "consent_interval_secs": 20,
-      "ice_credentials": {
-        "username_fragment": "1f2e3d4c5b6a",
-        "password": "4e39d8...",
-        "expires_at": 1700000600
-      },
-      "candidates": [
-        {
-          "address": "198.51.100.12",
-          "port": 60000,
-          "protocol": "udp",
-          "foundation": "f1",
-          "component": 1,
-          "priority": 12345678,
-          "candidate_type": "srflx",
-          "related_address": "10.0.0.5",
-          "related_port": 52333,
-          "sdp_mid": "0",
-          "sdp_mline_index": 0
-        }
-      ],
-      "fingerprints": ["sha-256 01:23:..." ]
-    }
-  }
-  ```
-- При включённой фиче `media-av1` сервер транскодирует RAW I420 в AV1 (rav1e) и возвращает VP8/VP9 при отсутствии пересечения `preferred_codecs`.
-- Для incremental ICE используется `FrameType::TransportUpdate` (`CallTransportUpdate`). Сервер принимает JSON вида:
-  ```json
-  {"update":"candidate","call_id":"call-xyz","candidate":{...}}
-  {"update":"selected_candidate_pair","call_id":"call-xyz","local":{...},"remote":{...},"rtt_ms":22}
-  {"update":"consent_keepalive","call_id":"call-xyz","interval_secs":20}
-  ```
-  Проверяется принадлежность устройства звонку, обновляется `CallSession.transport_updates`, и в ответ приходит `ACK` с `{"ack":<seq>,"call_id":"call-xyz","update":"candidate"}`.
-- Метрики фиксируют количество кандидатов (`commucat_transport_candidates`), выбор пар (`commucat_transport_pairs`) и keepalive-события (`commucat_transport_keepalive`).
-
-## 8. P2P assist и дополнительные сервисы
-
-### 8.1 `POST /api/p2p/assist`
-Возвращает
-- рекомендации по Noise/PQ ключам (черновик для прямых каналов),
-- ICE-блок (`ice`): `username_fragment`, `password`, `ttl_secs`, `keepalive_interval_secs`, флаг `trickle`.
-- список транспортов (TOR/Reality/AmnesiaWG/Shadowsocks) — сейчас заглушки, базируются на `tokio::io::duplex`.
-- параметры FEC/Multi-path (только аналитика).
-
-> Реальные туннели должны реализовать клиенты. Сервер лишь выдаёт конфигурацию.
-
-### 8.2 Pluggable transports
-`TransportManager` содержит приоритеты и health-метрики, но единственный реально используемый путь — TLS-туннель Pingora. Остальные транспорты — заглушки и применяются только в диагностических заданиях.
-
-### 8.3 Федерация: outbox и HTTP-инбокс
-- Каждый междоменный фрейм подписывается (`SignedEvent`) и попадает в очередь `federation_outbox`. Фоновый диспетчер раз в 2 сек выбирает до 16 записей, резервирует их на 20 секунд и отправляет HTTP POST на `PeerConfig.endpoint`. Ответ `2xx` удаляет запись, остальные статусы приводят к экспоненциальному backoff (до 5 минут).
-- Входящий endpoint `/federation/events` принимает JSON-сериализованный `SignedEvent`, проверяет подпись по `PeerConfig.public_key`, отклоняет неизвестные домены и повторно использованные идентификаторы (таблица `idempotency`). Payload содержит hex-фрейм CCP‑1, который доставляется онлайн-подключению либо попадает в `relay_queue`.
-- TODO: подтверждения доставки, повторные попытки с jitter/trace-id, защита от перегрузки и полноценные ответы об ошибках.
-
-### 8.4 Друзья и устройства
-- `GET /api/friends` возвращает текущий список друзей (`friends`) и карту `devices`, где ключ — `user_id`, значение — массив устройств (`device_id`, `public_key` в hex, `status`, `created_at`, `last_rotated_at`).
-- `PUT /api/friends` принимает новый список друзей и возвращает его вместе с актуальными устройствами.
-- `GET /api/friends/{user_id}/devices` доступен только для существующих друзей и отдаёт структуру `{"friend": "...", "devices": [...]}`.
-- Сервер не раскрывает устройства чужих пользователей; при удалении дружбы endpoint возвращает 404.
-
-## 9. Безопасность и аудит
-
-- **SecretManager**: хранит активные и будущие Noise ключи, админ-токены; выполняет ротацию и удаление просроченных записей (`prune_noise`, `prune_admin`).
-- **Ledger**: записывает события изменения ключей (`DeviceKeyEvent`), интегрируется через `LedgerAdapter` (Null/File/Debug).
-- **Metrics**: `Metrics` фиксирует количество подключений, медиа-кадров, успешных/завершённых звонков, ротаций и т.п. Экспортируются через `/metrics` (Prometheus).
-- **CLI diagnose**: собирает сводную информацию (присутствие, очереди, счётчики).
-
-## 10. Ограничения и TODO
-
-1. **PQ-гибрид** — handshake описан, но в HTTP-туннеле capability игнорируется. Реально используется только в `/api/p2p/assist`.
-2. **Адаптивная обфускация** — код `commucat_proto::obfuscation` не задействован сервером.
-3. **Медиа** — только Opus/VP8. AV1/H264, GPU, SVC, FEC и автоматический renegotiation профилей не реализованы.
-4. **Transport** — альтернативные транспорты (Reality/AmnesiaWG/Onion) заглушечные.
-5. **Федерация** — события подписываются, но пересылка между доменами пока выключена.
-6. **REST API** — защита только rate-limiter; finer-grained ACL отсутствуют.
-7. **Ключи пользователей** — ротация через CLI, автоматического плана нет.
-8. **Тесты** — есть unit-тесты на кодек, транскодер, storage, но отсутствие end-to-end.
-
-## 11. Рекомендации по эксплуатации
-
-1. Выполнить `commucat-cli migrate` на подготовленной базе.
-2. Создать пользователя (`register-user`) и устройство (`rotate-keys`).
-3. Сконфигурировать TLS и Noise ключи, разместить `commucat.toml` и запустить `commucat-server`.
-4. Следить за `/metrics` и журналами (`commucat_security_*`, `commucat_call_*`).
-5. Периодически запускать `rotate-keys` и чистить устаревшие pairing-коды.
-6. Для медиаклиентов: отправлять либо готовые Opus/VP8, либо RAW (PCM/I420) в соответствии с описанным заголовком; в ответ можно ориентироваться на `CALL_STATS`.
+> **Status:** draft / pre-alpha. CCP-1 is still evolving; field names, framing, and timing rules may change. Post-quantum extensions, stealth transports, and multipath negotiation are not implemented yet.
 
 ---
 
-*Последнее обновление: март 2026. Если компонент помечен как заглушка, его необходимо доработать перед продакшн-развёртыванием.*
+## 1. Transport assumptions
+
+1. Clients establish a **TLS 1.3** session (Pingora listener). Default endpoints: `https://host:443` in production, `https://host:8443` for development.
+2. The bootstrap happens over **HTTP/2** (`h2` ALPN). Clients perform a **duplex POST** to `/connect`. The request body streams CCP-1 frames upstream; the response body streams frames downstream.
+   - Alternative delivery modes are available on `/connect`:
+     - **SSE (`mode=sse` or `Accept: text/event-stream`)** — downstream frames are emitted as `event: frame` entries with base64 payloads, upstream traffic remains the request body.
+     - **NDJSON long-poll (`mode=long-poll`)** — downstream frames are newline-delimited JSON objects carrying base64 payloads.
+     - **WebSocket (`mode=websocket` or standard `Upgrade` handshake)** — CCP-1 frames are exchanged as binary WebSocket messages after a RFC 6455 upgrade.
+   - Modes that rely on HTTP (SSE/long-poll) still require the client to stream upstream frames over the POST body.
+3. Every CCP-1 frame is length-prefixed with a **varint** and encoded/decoded with `commucat_proto::Frame::{encode,decode}`.
+4. If the client closes the HTTP/2 stream before the handshake completes, the server reports `reason="client-closed"` (ledger) and logs `handshake read failed` with stage `hello`.
+
+---
+
+## 2. Bootstrap sequence
+
+| Step | Direction | Payload | Description |
+|------|-----------|---------|-------------|
+| (pre-flight) | client → REST | `GET /api/server-info` | Fetch Noise catalog, supported protocol versions, session TTL, and the device CA public key. Optional but recommended. |
+| (pre-flight) | client → REST | `/api/pairing` / `/api/pairing/claim` | Issue or redeem pairing codes when auto-approval is disabled. Produces device seed, `device_ca_public`, and optional certificate. |
+| 1 | client → server | `FrameType::Hello` | Starts Noise XK or IK handshake. Includes ZK proof tied to `device_id` and the server domain. |
+| 2 | server → client | `FrameType::Auth` | Returns Noise message 2 plus bootstrap metadata (session id, server static key, supported versions). |
+| 3 | client → server | `FrameType::Auth` | Sends Noise message 3, finalising the handshake. |
+| 4 | server → client | `FrameType::Ack` | Confirms bootstrap, optionally pushes queued envelopes from storage. |
+
+Once step 3 succeeds the server:
+- marks the connection as `Established`;
+- publishes presence to Redis (TTL = `presence_ttl_seconds` from config);
+- persists the `SessionRecord` to PostgreSQL;
+- writes an audit record (`scope = "handshake"`, `result = "success"`) to the ledger.
+
+---
+
+## 3. Frame schema
+
+All frames contain the following fields:
+
+| Field | Meaning |
+|-------|---------|
+| `channel_id: u64` | Logical channel. Bootstrap always uses `0`.
+| `sequence: u64` | Per-channel monotonically increasing counter. Each side maintains its own counter.
+| `frame_type` | Enum (`Hello`, `Auth`, `Ack`, `Data`, `Error`, `Keepalive`, ...).
+| `payload` | For bootstrap: `FramePayload::Control` wrapping a JSON object. Data frames may carry binary payloads.
+
+### 3.1 `FrameType::Hello`
+
+JSON keys used today:
+
+| Key | Type | Required | Notes |
+|-----|------|----------|-------|
+| `pattern` | string | yes | `"XK"` or `"IK"`. The server currently accepts both.
+| `supported_versions` | array<number> | recommended | List of protocol versions (e.g. `[1]`). Server negotiates the highest supported version.
+| `protocol_version` | number | optional | Legacy single value if `supported_versions` omitted. Must match server support.
+| `device_id` | string | yes | Unique per device, e.g. `device-<epoch>-<suffix>`.
+| `handshake` | hex string | yes | Noise message 1 (client -> server). Encoded with `hex` lower-case.
+| `client_static` | hex string | yes | Client static Noise public key.
+| `device_public` | hex string | yes | Long-lived device public key (will be stored/rotated).
+| `capabilities` | array<string> | optional | Advertised feature flags (unused today).
+| `zkp` | object | yes | Zero-knowledge proof generated with `commucat_crypto::zkp::prove_handshake`.
+| `device_ca_public` | hex string | optional | Public key of device CA certificate used to sign device certificates.
+| `user` | object | optional | Hints about the user (`id`/`user_id`, `handle`, `display_name`, `avatar_url`).
+| `certificate` | object | optional | Serialized `DeviceCertificate`. Allows resuming known devices.
+
+### 3.2 Server processing of `Hello`
+
+1. **Protocol negotiation:** server inspects `supported_versions`/`protocol_version` and chooses a value present in `SUPPORTED_PROTOCOL_VERSIONS`. Otherwise returns `ServerError::ProtocolNegotiation`.
+2. **Pattern check:** only `XK`/`IK` are valid. Unknown patterns trigger `ServerError::Invalid`.
+3. **Proof verification:** server reconstructs the ZKP challenge using configured `domain`, `device_id`, `device_public`, `client_static`. Failures yield `ServerError::Invalid` (ledger `reason="invalid"`).
+4. **Noise candidate selection:** iterates over active Noise static keys (`SecretManager::active_noise_keys`), attempting to read message 1. Failure results in `ServerError::Invalid`.
+5. **User/device lookup:**
+   - If `device_id` already exists, verifies status `active`, matches hints, and rotates `public_key` if necessary (ledger action `rotate`).
+   - If missing and auto approval is enabled (or pairing provided a certificate), creates a `DeviceRecord` and optionally a `UserProfile` (ledger action `register`).
+   - If a certificate is provided, validates signature, expiry, and device/user binding.
+6. **Certificate issuance:** if no certificate provided, the server issues one signed by `device_ca_public`.
+7. **Context enrichment:** `HandshakeContext` stores `device_id`, `user_id`, `user_profile`, `certificate`, selected Noise key, and whether the device was known (`device_known`).
+
+### 3.3 Server → client `FrameType::Auth`
+
+Keys:
+
+| Key | Description |
+|-----|-------------|
+| `session` | Newly generated session id (string).
+| `device_id` | Echo of the client device id.
+| `handshake` | Noise message 2 (hex encoded).
+| `server_static` | Server static Noise public key (hex).
+| `protocol_version` | Negotiated version.
+| `supported_versions` | Array of versions still accepted (for future renegotiation).
+| `device_ca_public` | Hex-encoded certificate signer public key.
+| `user` | JSON snapshot of the user profile.
+| `certificate` | The finalized device certificate.
+
+### 3.4 Client → server `FrameType::Auth`
+
+Contains only `handshake` (Noise message 3). On success the server transitions `context.stage` to `Established`, creates a `NoiseTransport`, registers the session, and writes a ledger entry (`scope="handshake", result="success"`).
+
+---
+
+## 4. Post-bootstrap traffic
+
+Once established, the `/connect` stream is used for:
+
+- **Keepalive:** server enforces `connection_keepalive` seconds; clients should send `Keepalive` frames before the TTL/2 window.
+- **Presence:** the server publishes `PresenceSnapshot` with TTL `presence_ttl_seconds` in Redis.
+- **Relay delivery:** queued envelopes (`relay_queue`) are drained and re-framed with updated `sequence` numbers.
+- **Calls / media:** `FrameType::Data` with call control payloads (Opus/VP8 only) are relayed if enabled. Advanced SFU features are stubbed.
+- **Errors:** failures throw `FrameType::Error` with `properties` describing the cause (e.g. `{ "error": "handshake" }`).
+
+---
+
+## 5. Pairing API quick reference
+
+- `POST /api/pairing` (authenticated device) → issues a code, expiry, and a fresh `device_seed` plus `device_ca_public`.
+- `POST /api/pairing/claim` (unauthenticated) → consumes the code, generates a `device_id`, derives keys from `device_seed`, and returns `device_private/public`, `device_certificate`, and the target user profile.
+
+When auto approval is disabled, the claim path is mandatory; otherwise `Hello` without prior pairing will be rejected with `ServerError::Invalid`.
+
+---
+
+## 6. Ledger mapping
+
+Every handshake failure calls `emit_handshake_failure`, logging and recording structured metadata:
+
+- `scope = "handshake"`
+- `result = "failure"`
+- `reason` ∈ { `"read"`, `"decode"`, `"handshake"`, `"client-closed"`, ... }
+- `stage` ∈ { `"hello"`, `"await_client"`, `"established"` }
+- Additional fields: `remote_addr`, `device`, `user`, `device_known`, `noise_key_active`, `noise_key_version`, `has_user_profile`, `has_certificate`, `session`, `protocol_version`, `detail`
+
+Successful handshakes are logged separately (`info` level) but do not yet emit a ledger record; planned work will add `result="success"` entries.
+
+---
+
+## 7. Planned evolutions / stubs
+
+| Area | Current state | Planned work |
+|------|---------------|--------------|
+| **Stealth transports** | Catalog items exist (AmnesiaWg, QuicMasque, Onion, Reality) but return placeholder values. | Implement actual tunnelling, key material negotiation, failure propagation. |
+| **Post-quantum handshakes** | ML-KEM/ML-DSA deps compiled but not used during bootstrap. | Offer hybrid Noise handshake with PQ static keys and update server-info hints. |
+| **Federation events** | Federation signer/verifier exist; dispatch loop mostly mocked. | Complete outbound queue, deliver to remote peers, add authentication/ACL. |
+| **Media SFU** | Opus/VP8 encoders run locally; network forwarding is basic. | Add adaptive bitrate, AV1/H.264 codecs, GPU paths, per-call metrics. |
+| **Ledger coverage** | Handshake failures recorded; many success paths missing. | Emit `success` entries and per-channel delivery records. |
+
+Contributions are welcome—see [ROADMAP.md](ROADMAP.md) for prioritised tasks.

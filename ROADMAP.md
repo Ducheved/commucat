@@ -1,116 +1,104 @@
-# Дорожная карта CommuCat (2025–2026)
+# CommuCat Roadmap (2025–2026)
 
-_Last updated: 28 сентября 2025_
+_Last updated: 2025-10-05 — reflects the current repository state._
 
-## 0. Состояние проекта
-
-### Реализовано к сегодняшнему дню
-- TLS + Noise XK/IK туннель поверх HTTP/2 (`crates/server`).
-- Учетная модель “без паролей”: регистрация устройств, friends-список, REST pairing.
-- PostgreSQL + Redis хранилище, миграции и CLI (`commucat-cli`).
-- Серверное перекодирование RAW PCM/I420 → Opus/VP8; SFU-передача media-кадров.
-- Базовый CCP-1 протокол: ACK, оффлайн-доставка, Presence, CallStats, capability поля.
-- Ротация Noise static ключей и админ-токена; аудит через Ledger.
-- Авто-ротация ключей устройств (CSR API, CCP `KeyUpdate` уведомления).
-- Диагностика: `/metrics`, `commucat-cli diagnose`.
-- Roadmap на GitHub, документация (`README.md`, `PROTOCOL.md`).
-
-### Всё ещё отсутствует / в процессе
-- PQ-гибрид в основном туннеле.
-- Адаптивная обфускация (REALITY/XRay/VLESS, domain fronting, стеганография).
-- Pluggable transports, TOR/onion routing, AmnesiaWG.
-- AV1/H264/GPU, FEC, SVC, мультипутной медиапайплайн.
-- Полноценная федерация, auto-install (в один клик), клиенты.
-- Блокчейн-интеграция, криптообмен, ZKP.
+The project is pre-alpha. Items below describe intended milestones; delivery dates are aspirational and may shift as core functionality stabilises.
 
 ---
 
-## 1. Октябрь 2025 — декабрь 2025 (CommuCat 1.2)
+## 0. Completed foundations (2024–mid 2025)
 
-### 1.1 Пользовательский опыт
-| Задача | Описание | Ответственные |
-|--------|----------|---------------|
-| One-line installer | Скрипт “set-up.sh/ps1” (Postgres, Redis, миграции, генерация ключей, запуск службы). | DevOps (команда) |
-| Авто-ротация ключей устройств | ✅ Вершина закрыта (CSR API на сервере, `KeyUpdate` уведомления) | Done (Codex) |
-| CLI onboarding | Команда `commucat-cli autopair` — bootstrap устройства без пароля. | Rust контрибьюторы (Codex в работе) |
-| Документация Quick Start | Обновить `docs/quickstart.md` и пример конфигов. | Done (Codex 2026-Q1) |
-
-### 1.2 Медиа и протокол
-- Включить capability renegotiation: Opus/VP8 fallback vs RAW, запись в `CallSession`.
-- Поддержка H.264 (libopenh264). Режим “software only”.
-- Подготовить черновик CCP-2: форматы, capability negotiation, мультипут.
-
-**Ресурсы**: нужен Rust-медиа разработчик.
+- ✅ TLS 1.3 + Noise XK/IK bootstrap over HTTP/2 (`/connect`).
+- ✅ PostgreSQL + Redis integration, CLI migrations (`commucat-cli migrate`).
+- ✅ Pairing API (`/api/pairing`, `/api/pairing/claim`) and auto-approval toggle.
+- ✅ JSONL ledger with file/debug/null adapters.
+- ✅ Basic Opus/VP8 media pipeline (no SFU yet).
+- ✅ Prometheus metrics, `/healthz`, `/readyz`, `/metrics`.
 
 ---
 
-## 2. Январь 2026 — Июнь 2026 (CommuCat 1.5)
+## 1. Remainder of 2025 (CommuCat 1.1 / 1.2)
 
-### 2.1 Транспорт и цензура
-- Реализовать pluggable transports: Reality, AmnesiaWG, Shadowsocks, VLESS, onion routing.
-- Интеграция TOR proxy + автоматический fallback (Traffic analysis resistance).
-- Прототип обфускации (AdaptiveObfuscator) с policy-файлом.
+### 1.1 Reliability & onboarding
 
-**Нужны**: сетевой инженер/специалист по обходу цензуры.
+| Item | Target | Status |
+|------|--------|--------|
+| Harden ledger success-path coverage (handshake, delivery, calls) | Q4 2025 | ⏳ In progress |
+| CLI onboarding helpers (`commucat-cli autopair`, diagnostics) | Q4 2025 | ⏳ Draft design |
+| Systemd packaging polish (tmpfiles, LogsDirectory, sandbox tuning) | Q4 2025 | ⏳ Needs work |
+| Quick start & protocol docs refresh | Q4 2025 | ✅ (this update) |
 
-### 2.2 PQ + ZKP
-- Полный PQ-гибрид (ML-KEM-768 + ML-DSA-65) в основном туннеле.
-- Минимальный ZKP: доказательство владения приватным ключом устройства (экспериментальная ветка).
+### 1.2 Protocol polish
 
-**Нужны**: криптограф (PQ), специалист по ZKP.
-
-### 2.3 Федерация и Mesh
-- API для обмена событиями между узлами (подпись + взаимная валидация).
-  - [In progress · Codex 2026-Q1] Очередь `federation_outbox` и HTTP `/federation/events` для двусторонней доставки; впереди подтверждения, ретраи и мониторинг.
-- Gossip-based discovery, авто-регистрация узлов.
-- Начало работы над mesh (QUIC + Multipath + NAT traversal).
-
-**Нужны**: Rust-разработчик, сетевой инженер.
+- Capability renegotiation (codec fallback, feature flags).
+- Error taxonomy for bootstrap (map common failures to stable codes).
+- Expand REST coverage in OpenAPI spec (`docs/openapi-server.spec.yaml`).
 
 ---
 
-## 3. Q3 2026 — Q4 2026 (CommuCat 2.0 – CCP-2 Draft)
+## 2. 2026 H1 (CommuCat 1.3 / 1.4)
 
-### 3.1 CCP-2
-- Протокол событий (CBOR/Protobuf), capability handshake, device bootstrap.
-- Встроенная обфускация, поддержка нескольких транспортов из коробки.
-- Режим “covert chat”: имитация популярных протоколов, padding, jitter.
+### 2.1 Transport & stealth experimentation
 
-### 3.2 Медиа
-- Полноценный транскодер c FEC и SVC; GPU-ускорение (NVENC/VAAPI/Metal).
-- Мультипут аудио/видео (MultipathTunnel) + адаптивный битрейт.
+| Item | Description | Status |
+|------|-------------|--------|
+| Reality / AmnesiaWG transport prototypes | Integrate proto definitions, minimal handshake | ☐ Not started |
+| Shadowsocks / Onion wrappers | Evaluate pluggable obfuscation layers | ☐ Not started |
+| Traffic-shaping / padding | Basic timing obfuscation on `/connect` stream | ☐ Not started |
 
-### 3.3 Zero passwords
-- Безпарольный UX: устройство ↔ профиль ↔ recovery через social recovery/SSS.
-- Веб/desktop/mobile клиенты: Flutter, Swift, C# (Avalonia/MAUI/WPF).
+### 2.2 Post-quantum bootstrap
 
-**Нужны**: Flutter/Swift/C# разработчики.
+- Hybrid Noise handshake (ML-KEM static, ML-DSA signatures).
+- Surfacing PQ capabilities through `/api/server-info`.
+- Benchmarks and size impact analysis.
 
-### 3.4 Блокчейн, криптообмен
-- Wallet API: хранение ключей (L2/ERC20/BTC/Ton TBD).
-- Интеграция с чатом (tip, escrow, micropayments).
-- Запись хэшей сообщений в блокчейн (опционально).
+### 2.3 Federation MVP
 
-**Нужны**: специалист по блокчейну.
+- Finish dispatcher loop (deliver `federation_outbox` to remote peers).
+- Signed event verification and retry/backoff.
+- Administrative tooling to manage peer allow-lists.
 
 ---
 
-## 4. Beyond 2026 (Vision)
-- Социальный сервис “все в одном” (XMPP/IRC/Discord/Telegram/Facebook).
-- Mesh по Wi-Fi Direct/BLE, offline synchronization, edge nodes.
-- Сравнительный анализ и bridge к Signal, Matrix, WireGuard.
-- Полная автоматизация: Helm chart, Operators, Cloud marketplace.
-- Трендовая экспертиза: traffic analysis resistance, steganography, AI-based detection avoidance.
+## 3. 2026 H2 (towards CommuCat 2.0)
+
+### 3.1 CCP-2 draft
+
+- Structured payloads (CBOR/Protobuf) for control messages.
+- Negotiable capability sets and application-level auth contexts.
+- Backwards-compatible migration path from CCP-1.
+
+### 3.2 Media & SFU upgrades
+
+- AV1 / H.264 codec support (software first, GPU optional).
+- Adaptive bitrate and simulcast/FEC experimentation.
+- Distributed SFU prototype for multi-party calls.
+
+### 3.3 Mesh & multipath
+
+- QUIC-based relay with multipath scheduling.
+- NAT traversal helpers (ICE-lite, TURN integration).
+- Offline/mesh sync research (Wi-Fi Direct/BLE).
 
 ---
 
-## 5. Команда и поиск коллег
-**Уже есть**: DevOps (команда). Еще нужен:
-- Дизайнер UI/UX и технический писатель.
-- Rust-разработчики (ядро, медиа, протоколы).
-- Сетевой инженер / специалист по цензуроустойчивости.
-- Криптограф (PQ, ZKP).
-- Блокчейн-разработчик.
-- Разработчики Flutter / Swift / C# (клиенты).
+## 4. Stretch goals / vision (post-2026)
 
-*Присоединяйтесь: issues/PR в GitHub или team@commucat.tech.*
+- Seamless bridges to other protocols (Matrix, Signal, XMPP).
+- Wallet / micropayment integrations for tipping and relaying.
+- Production deployment tooling (Helm charts, operators, cloud images).
+- Advanced traffic analysis resistance (steganography, ML-based evasion).
+
+---
+
+## 5. How to help
+
+We are especially interested in contributions around:
+
+- Rust development (server, crypto, storage, transports).
+- Security (Noise, PQ, ZKP audits).
+- Infrastructure & deployment automation.
+- Client implementations (Flutter, Swift, C#/MAUI, web).
+- Documentation & UX.
+
+Open an issue or reach out to `team@commucat.tech` before starting large tasks. Please align proposals with the roadmap above to avoid duplicate effort.

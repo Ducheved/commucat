@@ -1,124 +1,89 @@
-# CommuCat Server 🐾
+# CommuCat Secure Routing Server (pre‑alpha)
 
 [![CI](https://github.com/ducheved/commucat/actions/workflows/ci.yml/badge.svg)](https://github.com/ducheved/commucat/actions/workflows/ci.yml)
 [![Release](https://github.com/ducheved/commucat/actions/workflows/release.yml/badge.svg)](https://github.com/ducheved/commucat/actions/workflows/release.yml)
 [![Deploy](https://github.com/ducheved/commucat/actions/workflows/deploy.yml/badge.svg)](https://github.com/ducheved/commucat/actions/workflows/deploy.yml)
 [![License: MPL-2.0](https://img.shields.io/badge/License-MPL--2.0-orange.svg)](LICENSE)
 
-CommuCat — экспериментальный сервер защищённых звонков и сообщений. Он завершает TLS 1.3 (через [Pingora](https://github.com/cloudflare/pingora)), разворачивает Noise-туннель CCP‑1 и маршрутизирует медиаканалы между устройствами. Код ориентирован на прототипирование безопасной маршрутизации: проверка устройств, ротация ключей, трансляция медиапотоков и подготовка к федерации доменов.
+CommuCat is an experimental secure messaging relay built around TLS 1.3 (via [Pingora](https://github.com/cloudflare/pingora)) and a Noise-based CCP‑1 control protocol. The server multiplexes device sessions over HTTP/2, keeps durable state in PostgreSQL/Redis, and records audit events in a JSONL ledger.
 
-> ⚠️ **Проект ещё не готов для продакшена.** Альтернативные транспорты, антицензура, PQ-гибрид по умолчанию, capability renegotiation и операционный контур находятся в разработке. Ознакомьтесь с ограничениями и дорожной картой прежде чем планировать деплой.
-
----
-
-## Назначение и поток
-
-1. **Подключение клиента.** Клиент устанавливает TLS 1.3 (сертификат из `commucat.toml`), выполняет `POST /connect` и проходит Noise XK/IK handshake. На этом этапе сервер:
-   - валидирует Zero-Knowledge доказательство владения устройством (`commucat_crypto::zkp`),
-   - при необходимости создаёт профиль пользователя и устройство,
-   - выдаёт сертификат устройства и публикует Presence в Redis,
-   - возвращает активные Noise static ключи и сведения о ротации.
-2. **Фрейминг CCP‑1.** Все сообщения — кадры `Frame` (TIP: `crates/proto`). Сервер гарантирует монотонный `sequence`, ACK для управляющих событий и оффлайн-доставку через Postgres.
-3. **Маршрутизация.** Каналы (`JOIN/LEAVE`) описывают адресатов. Онлайн-участники получают сообщения через Web stream, оффлайн — через `relay_queue` (Postgres). Для групп используется `chat_group` и `group_member`.
-4. **Звонки и медиа.** Модуль `app::media` перекодирует RAW PCM/I420 в Opus/VP8. Кодек выбирается по профилю `CallMediaProfile`; поддержка AV1/H.264 пока опциональна и ограничена.
-5. **Идентичность и аудит.** Ротация Noise ключей/админ-токена (`SecretManager`) хранится в Postgres, журналируется через адаптеры Ledger. CLI покрывает миграции, регистрацию и выдачу сертификатов.
-6. **Операционный контур.** `/healthz`, `/readyz` и `/metrics` представлены, но наблюдаемость ограничена агрегированными счётчиками; trace-id и глубокие метрики не реализованы.
+> **Project status:** pre‑alpha. The codebase is under active development; several advertised features (stealth/multipath transports, post‑quantum handshakes, advanced federation, rich media pipeline) are still stubs. Expect breaking changes, missing validation, and incomplete observability.
 
 ---
 
-## Workspace и роли крейтов
+## What works today
 
-| Crate | Назначение | Ключевые элементы |
-|-------|------------|-------------------|
-| `crates/server` | Основной бинарь: TLS+HTTP/2, Noise handshake, REST API, CCP‑1 маршрутизация, медиатранскодер, ротация ключей | Pingora HTTP/2, `app::CommuCatApp`, `SecretManager`, `CallMediaTranscoder`, pluggable `TransportManager` (mock) |
-| `crates/proto` | Фрейминг CCP‑1, структуры звонков, валидация payload | Varint-кодек, JSON control envelopes, эксперименты с обфускацией |
-| `crates/media` | Кодеки Opus/VP8, I420↔encoded конвейер, опциональный захват аудио | `VoiceEncoder/Decoder`, `VideoEncoder`, адаптеры к `commucat-media-types` |
-| `crates/media-types` | Общие enum/descriptor медиа-профилей | `AudioCodec`, `VideoCodec`, `MediaSourceMode`, capability структуры |
-| `crates/crypto` | Noise XK/IK, сертификаты устройств, EventSigner, ZKP, PQ-хелперы | `DeviceKeyPair`, `EventSigner/Verifier`, `PqxdhBundle` (feature `pq`) |
-| `crates/storage` | DAL к Postgres/Redis, миграции, presence, pairing, relay | Таблицы `app_user`, `user_device`, `relay_queue`, `server_secret`; Redis `presence:*`, `route:*` |
-| `crates/federation` | Подпись и верификация междоменных событий | `FederationEvent`, `sign_event`, `verify_event` |
-| `crates/ledger` | Адаптеры журнала (Null/File/Debug) | Экспорт digest в JSON/файл/`tracing` |
-| `crates/cli` | Операционный CLI: миграции, регистрация, ротация ключей, диагностика, медиасимулятор | Команды `migrate`, `register-user`, `rotate-keys`, `diagnose`, `call-simulate` |
+- **Noise XK/IK bootstrap** over TLS: clients POST `FrameType::Hello` to `/connect`; the server negotiates protocol version, verifies a ZKP commitment, provisions (or rehydrates) device state, and returns `FrameType::Auth`.
+- **Connect channel variants:** `/connect` now supports SSE (`mode=sse`/`Accept: text/event-stream`), NDJSON long-poll (`mode=long-poll`), and WebSocket upgrades (`mode=websocket` or standard `Upgrade` headers). All variants reuse the CCP-1 frame codec; SSE/long-poll payloads are base64 encoded, while WebSocket frames remain binary.
+- **Stateful storage:** PostgreSQL holds users, devices, pairing tokens, relay queues, and ledger metadata; Redis backs presence and rendezvous caches.
+- **Device ledger:** JSONL append-only file (or in-memory null/debug adapter) captures registration, rotation, and call events with digest metadata.
+- **Pairing API:** `/api/pairing` and `/api/pairing/claim` mint short-lived codes so new devices can derive keys, even when auto-approval is disabled.
+- **Presence & relay queue:** established sessions publish presence and drain queued envelopes, supporting asynchronous delivery.
+- **Basic observability:** `/healthz`, `/readyz`, `/metrics` (Prometheus text) and structured `tracing` JSON logs.
 
-Дополнительные материалы: [архитектурный аудит](ARCHITECT.md), [спецификация CCP‑1](PROTOCOL.md), [дорожная карта](ROADMAP.md), [актуальный TODO](docs/todo.md).
+## What is still a stub
 
----
+- **Stealth & multipath transports:** catalog items such as `AmnesiaWg`, `QuicMasque`, `Onion`, `Reality` only expose scaffolding; there is no production-ready obfuscation or path diversity yet.
+- **Post-quantum (ML-KEM/ML-DSA) handshakes:** PQ crates are vendored but not wired into the Noise bootstrap.
+- **Media and SFU pipeline:** the `commucat-media` crate currently exercises Opus/VP8 codecs locally; remote SFU relay, adaptive bitrate, and GPU acceleration are not implemented.
+- **Federation dispatcher:** queues exist, but cross-domain event exchange is limited to mocks.
+- **Fine-grained policy & auditing:** RBAC, trace propagation, and per-tenant isolation are planned but not shipped.
 
-## Основные возможности
-
-- **Безопасное подключение.** Noise XK/IK поверх TLS 1.3, выдача сертификатов устройств, ротация Noise static ключей и админ-токена.
-- **Профили пользователей и устройств.** Postgres хранит пользователи, устройства, pairing-коды, журнал смен ключей; Redis служит для presence и маршрутизации.
-- **CCP‑1 каналы.** Поддержка управляющих кадров (`JOIN/LEAVE/CALL_*`), сообщений (`MSG/TYPING`), уведомлений о ключах (`KEY_UPDATE`), оффлайн-доставки и групповых чатов.
-- **Медиатранспорт.** Сервер перекодирует RAW PCM → Opus и RAW I420 → VP8, поддерживает ограниченный транзит VP8/Vp9, собирает CallStats и транспортные обновления.
-- **P2P assist.** `/api/p2p/assist` выдаёт рекомендации по Noise/PQ ключам, ICE-параметрам, мультипут/FEC и (пока) mock-транспортам.
-- **Синхронизация устройств друзей.** `PUT /api/friends` и `GET /api/friends/{user_id}/devices` сразу возвращают публичные ключи, статусы и метки ротации устройств доверенных контактов.
-- **Федерация.** Очередь `federation_outbox`, периодический диспетчер и входящая точка `/federation/events` позволяют доставлять фреймы между доменами с проверкой подписи.
-- **CLI для эксплуатации.** Миграции, регистрация, ротация ключей (с печатью закрытого ключа — прототип!), диагностика presence и медиапайплайна.
+See [ROADMAP.md](ROADMAP.md) and [docs/todo.md](docs/todo.md) for the latest task tracking.
 
 ---
 
-## Ограничения и риски
+## Workspace layout
 
-- **Транспорты.** Reality/AmnesiaWG/Shadowsocks/VLESS/Onion и анти-DPI пока реализованы как заглушки. Фактический трафик идёт исключительно через основной Pingora-поток.
-- **PQ-гибрид.** В основном туннеле выключен; экспериментальный код доступен только в соло-сценариях (`/api/p2p/assist`).
-- **Наблюдаемость.** Нет `trace_id/span_id`, ProblemDetails используются точечно, метрики агрегированные. Требуются улучшения по RFC 9457 и OpenTelemetry.
-- **Хранилище.** PostgreSQL и Redis используются без пулов подключений; CLI и сервер выполняют блокирующие вызовы внутри async-контекста.
-- **CLI безопасность.** Команда `rotate-keys` выводит приватные ключи в stdout; нет RBAC и валидации ввода.
-- **Медиа.** Нет адаптивного битрейта, FEC/SVC в прод-пути, H.264/AV1 включаются опционально и не покрыты тестами.
+| Crate | Purpose |
+|-------|---------|
+| `crates/server` | Pingora-based HTTP/2 server, Noise handshake, REST API, CCP‑1 session management, metrics, pairing, ledger orchestration |
+| `crates/proto` | CCP‑1 frame definitions, varint codec, JSON control envelopes |
+| `crates/crypto` | Noise patterns, device certificates, ZK proof helpers, seed/key rotation utilities |
+| `crates/storage` | PostgreSQL/Redis integration, schema migrations, pairing tokens, presence snapshots |
+| `crates/ledger` | File/Debug/Null adapters for JSONL audit trail |
+| `crates/federation` | Signed event schema and verification (dispatcher is partially stubbed) |
+| `crates/media`, `crates/media-types` | Media codec abstractions (Opus/VP8 implemented; AV1/H.264 placeholders) |
+| `crates/cli` | Operational CLI: migrations, key rotation, diagnostics |
 
-Подробности и предложения по исправлению см. в [ARCHITECT.md](ARCHITECT.md).
+Supporting documents:
 
----
-
-## Конфигурация
-
-- Основной файл: [`commucat.toml`](commucat.toml). Все параметры доступны через переменные окружения `COMMUCAT_*` (см. `crates/server/src/config.rs`).
-- Критичные ключи:
-  - `server.bind`, `server.domain`, `server.tls_cert`, `server.tls_key`;
-  - `storage.postgres_dsn`, `storage.redis_url`;
-  - `crypto.noise_private`, `crypto.noise_public`, `crypto.federation_seed` (hex);
-  - `rotation.*`, `limits.*`, `transport.reality_*` при использовании Reality.
-- Пример сервиса — `docs/systemd/commucat.service` (пользователь `commucat`, sandboxing systemd).
-
-Быстрый старт описан в [`docs/quickstart.md`](docs/quickstart.md) (обновляется по roadmap 1.2).
+- [ARCHITECT.md](ARCHITECT.md) — high-level architecture and data flow.
+- [PROTOCOL.md](PROTOCOL.md) — CCP‑1 bootstrap, frame types, timing expectations.
+- [docs/quickstart.md](docs/quickstart.md) — local setup, migrations, first connection.
+- [docs/openapi-server.spec.yaml](docs/openapi-server.spec.yaml) — REST surface (generated, some endpoints still marked TBD).
 
 ---
 
-## CLI команды
+## Getting started
 
-| Команда | Назначение |
-|---------|------------|
-| `commucat-cli migrate` | Применение SQL миграций Postgres (таблицы пользователей, устройств, relay, секретов, федерации). |
-| `commucat-cli register-user <handle> [display_name] [avatar_url]` | Создание профиля пользователя. Учётные данные выводятся в stdout. |
-| `commucat-cli rotate-keys (--user <id> | --handle <handle>) [--device <id>]` | Генерация пары ключей устройства и сертификата; результат печатается (включая приватный ключ). |
-| `commucat-cli diagnose` | Создание тестового профиля/устройства `diagnose`, публикация presence и сессии. |
-| `commucat-cli call-simulate [frames]` | Прогон медиапайплайна Opus (кодирование/декодирование synthetic PCM). |
+1. **Install dependencies:** Rust nightly toolchain, PostgreSQL ≥15, Redis ≥6, OpenSSL (for key generation), and codec toolchains (libvpx, opus) if you plan to build media crates.
+2. **Configure environment:** copy `commucat.toml` and adjust PostgreSQL/Redis DSNs, Noise keys, TLS certificate paths. Optionally export overrides via environment variables (`COMMUCAT_*`).
+3. **Provision database:**
+   ```bash
+   cargo run -p commucat-cli -- migrate
+   cargo run -p commucat-cli -- register-user alice "Alice" "https://example.com/avatar.png"
+   cargo run -p commucat-cli -- rotate-keys --handle alice
+   ```
+4. **Generate TLS & Noise keys:** see [docs/quickstart.md](docs/quickstart.md#32-generate-noise-keys-and-tls-cert) for exact commands.
+5. **Run the server:** `cargo run -p commucat-server --release`. Check `journalctl -u commucat` (or stdout) for `"commucat listening"`.
+6. **Bootstrap a device:** follow the pairing and Noise HELLO flow in [PROTOCOL.md](PROTOCOL.md#noise-bootstrap).
 
-> ℹ️ CLI использует те же DSN/URL, что и сервер (`COMMUCAT_PG_DSN`, `COMMUCAT_REDIS_URL`, `COMMUCAT_FEDERATION_SEED`).
-
----
-
-## Работа с репозиторием
-
-```bash
-# форматирование и проверки
-cargo fmt --all
-cargo clippy --all-targets --all-features
-
-# сборка бинарей
-cargo build --workspace --release
-
-# тесты по крейту (пример)
-cargo test -p commucat-proto
-```
-
-Некоторые модульные тесты в `crates/storage` требуют внешних сервисов (`COMMUCAT_TEST_PG_DSN`, `COMMUCAT_TEST_REDIS_URL`). Без них тесты пропускаются.
+> On Windows, WSL2/MSYS2 plus `pkg-config` for libvpx/opus is required; see quickstart caveats.
 
 ---
 
-## Дальнейшие шаги
+## Observability & operations
 
-- Следите за прогрессом в [ROADMAP.md](ROADMAP.md) и обновляемой таблице [docs/todo.md](docs/todo.md).
-- Для предложений и багрепортов открывайте issue/PR в GitHub или пишите на team@commucat.tech.
+- **Health:** `GET /healthz` (always returns `ok` when listener is alive). `GET /readyz` checks PostgreSQL/Redis connectivity.
+- **Metrics:** `GET /metrics` returns Prometheus metrics (`Authorization: Bearer <admin token>` if configured).
+- **Ledger:** when `ledger.mode = "file"`, entries are written to `/var/log/commucat/commucat-ledger.jsonl` (ensure service user has write access).
+- **Systemd unit:** see [docs/systemd/commucat.service](docs/systemd/commucat.service) for the maintained production unit (requires manual `LogsDirectory=` or `ReadWritePaths` override).
 
-Если обнаружите расхождение между документацией и реализацией — обновите соответствующий `.md` файл или откройте заявку: мы стремимся к честному описанию текущего состояния прототипа.
+---
+
+## Contributing & support
+
+The project is research software: issues and PRs are welcome, but production support is not yet offered. Please review [ROADMAP.md](ROADMAP.md) for current priorities before proposing large changes.
+
+Licensed under [MPL-2.0](LICENSE).

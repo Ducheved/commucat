@@ -20,6 +20,8 @@ use crate::security::limiter::{RateLimiter, RateScope};
 use crate::security::secrets::{NoiseKey, SecretManager};
 use crate::transport::{Endpoint, RealityConfig, TransportManager, default_manager};
 use crate::util::{decode_hex, decode_hex32, encode_hex, generate_id};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as Base64;
 use blake3::hash as blake3_hash;
 use chrono::{Duration, Utc};
 use commucat_crypto::zkp::{self, KnowledgeProof};
@@ -50,8 +52,10 @@ use commucat_storage::{
     Storage, StorageError, UserProfile, connect,
 };
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
+use futures_util::{SinkExt, StreamExt};
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
+use pingora::protocols::Stream as PingoraStream;
 use pingora::protocols::http::ServerSession;
 use pingora::protocols::http::v2::server::H2Options;
 use pingora::server::ShutdownWatch;
@@ -71,6 +75,11 @@ use std::time::Duration as StdDuration;
 use tokio::select;
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::interval;
+use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::tungstenite::{
+    handshake::derive_accept_key,
+    protocol::{Message, Role},
+};
 use tracing::{debug, error, info, warn};
 
 const LANDING_PAGE: &str = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\" />\n<title>CommuCat</title>\n<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0b1120;color:#f9fafb;margin:0;display:flex;align-items:center;justify-content:center;height:100vh;}main{max-width:480px;text-align:center;padding:2rem;background:rgba(15,23,42,0.85);border-radius:20px;box-shadow:0 10px 30px rgba(15,23,42,0.4);}h1{font-size:2.25rem;margin-bottom:0.5rem;}p{margin:0.75rem 0;color:#cbd5f5;}a{color:#38bdf8;text-decoration:none;}a:hover{text-decoration:underline;}</style>\n</head>\n<body>\n<main>\n<h1>CommuCat Server</h1>\n<p>Secure Noise + TLS relay for CCP-1 chats.</p>\n<p><a href=\"https://github.com/ducheved/commucat\">Project documentation</a></p>\n<p><a href=\"/healthz\">Health</a> · <a href=\"/readyz\">Readiness</a></p>\n</main>\n</body>\n</html>\n";
@@ -117,6 +126,509 @@ fn encode_varint_usize(mut value: usize) -> Vec<u8> {
     }
     bytes.push(value as u8);
     bytes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectMode {
+    Binary,
+    Sse,
+    LongPoll,
+    WebSocket,
+}
+
+impl ConnectMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Binary => "binary",
+            Self::Sse => "sse",
+            Self::LongPoll => "long-poll",
+            Self::WebSocket => "websocket",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpConnectFormat {
+    Binary,
+    Sse,
+    LongPoll,
+}
+
+impl HttpConnectFormat {
+    fn mode(self) -> ConnectMode {
+        match self {
+            Self::Binary => ConnectMode::Binary,
+            Self::Sse => ConnectMode::Sse,
+            Self::LongPoll => ConnectMode::LongPoll,
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Self::Binary => "application/octet-stream",
+            Self::Sse => "text/event-stream",
+            Self::LongPoll => "application/x-ndjson",
+        }
+    }
+}
+
+struct HttpChannel {
+    session: ServerSession,
+    format: HttpConnectFormat,
+    remote_addr: Option<String>,
+    request_summary: String,
+}
+
+struct WebSocketChannel {
+    stream: WebSocketStream<PingoraStream>,
+    remote_addr: Option<String>,
+    request_summary: String,
+}
+
+enum ConnectChannel {
+    Http(HttpChannel),
+    WebSocket(WebSocketChannel),
+}
+
+impl HttpChannel {
+    fn remote_addr(&self) -> Option<&str> {
+        self.remote_addr.as_deref()
+    }
+
+    fn request_summary(&self) -> &str {
+        &self.request_summary
+    }
+
+    async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, ServerError> {
+        match self.session.read_request_body().await {
+            Ok(Some(chunk)) => Ok(Some(chunk.to_vec())),
+            Ok(None) => Ok(None),
+            Err(_) => Err(ServerError::Io),
+        }
+    }
+
+    async fn write_payload(&mut self, frame: &Frame, payload: Vec<u8>) -> Result<(), ServerError> {
+        match self.format {
+            HttpConnectFormat::Binary => {
+                self.session
+                    .write_response_body(payload.into(), false)
+                    .await
+                    .map_err(|_| ServerError::Io)?;
+            }
+            HttpConnectFormat::Sse => {
+                let encoded = Base64.encode(payload);
+                let mut message = String::with_capacity(encoded.len() + 32);
+                message.push_str("event: frame\n");
+                message.push_str("id: ");
+                message.push_str(frame.sequence.to_string().as_str());
+                message.push_str("\ndata: ");
+                message.push_str(&encoded);
+                message.push_str("\n\n");
+                self.session
+                    .write_response_body(message.into_bytes().into(), false)
+                    .await
+                    .map_err(|_| ServerError::Io)?;
+            }
+            HttpConnectFormat::LongPoll => {
+                let encoded = Base64.encode(payload);
+                let body = json!({
+                    "channel": frame.channel_id,
+                    "sequence": frame.sequence,
+                    "type": frame_type_label(frame.frame_type),
+                    "data": encoded,
+                })
+                .to_string();
+                let mut message = body;
+                message.push('\n');
+                self.session
+                    .write_response_body(message.into_bytes().into(), false)
+                    .await
+                    .map_err(|_| ServerError::Io)?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_sse_preamble(&mut self) -> Result<(), ServerError> {
+        if matches!(self.format, HttpConnectFormat::Sse) {
+            self.session
+                .write_response_body(b":ready\n\n".to_vec().into(), false)
+                .await
+                .map_err(|_| ServerError::Io)?;
+        }
+        Ok(())
+    }
+
+    async fn finish(self) -> Result<(), ServerError> {
+        let HttpChannel { mut session, .. } = self;
+        session.finish().await.map_err(|_| ServerError::Io)?;
+        Ok(())
+    }
+}
+
+impl WebSocketChannel {
+    fn remote_addr(&self) -> Option<&str> {
+        self.remote_addr.as_deref()
+    }
+
+    fn request_summary(&self) -> &str {
+        &self.request_summary
+    }
+
+    async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, ServerError> {
+        loop {
+            match self.stream.next().await {
+                Some(Ok(Message::Binary(data))) => return Ok(Some(data)),
+                Some(Ok(Message::Text(text))) => match Base64.decode(text.trim().as_bytes()) {
+                    Ok(decoded) => return Ok(Some(decoded)),
+                    Err(err) => {
+                        warn!(error = %err, "invalid base64 text frame over websocket");
+                        continue;
+                    }
+                },
+                Some(Ok(Message::Ping(payload))) => {
+                    if let Err(err) = self.stream.send(Message::Pong(payload)).await {
+                        error!(error = %err, "failed to reply to websocket ping");
+                        return Err(ServerError::Io);
+                    }
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    continue;
+                }
+                Some(Ok(Message::Close(_))) => return Ok(None),
+                Some(Err(err)) => {
+                    error!(error = %err, "websocket read failure");
+                    return Err(ServerError::Io);
+                }
+                None => return Ok(None),
+            }
+        }
+    }
+
+    async fn write_payload(&mut self, payload: Vec<u8>) -> Result<(), ServerError> {
+        self.stream
+            .send(Message::Binary(payload))
+            .await
+            .map_err(|_| ServerError::Io)
+    }
+
+    async fn finish(mut self) -> Result<(), ServerError> {
+        if let Err(err) = self.stream.close(None).await {
+            debug!(error = %err, "websocket close error");
+        }
+        Ok(())
+    }
+}
+
+impl ConnectChannel {
+    async fn from_session(session: ServerSession, mode: ConnectMode) -> Result<Self, ServerError> {
+        match mode {
+            ConnectMode::Binary => Self::start_http(session, HttpConnectFormat::Binary).await,
+            ConnectMode::Sse => Self::start_http(session, HttpConnectFormat::Sse).await,
+            ConnectMode::LongPoll => Self::start_http(session, HttpConnectFormat::LongPoll).await,
+            ConnectMode::WebSocket => Self::upgrade_websocket(session).await,
+        }
+    }
+
+    fn mode(&self) -> ConnectMode {
+        match self {
+            Self::Http(channel) => channel.format.mode(),
+            Self::WebSocket(_) => ConnectMode::WebSocket,
+        }
+    }
+
+    fn remote_addr(&self) -> Option<&str> {
+        match self {
+            Self::Http(channel) => channel.remote_addr(),
+            Self::WebSocket(channel) => channel.remote_addr(),
+        }
+    }
+
+    fn request_summary(&self) -> &str {
+        match self {
+            Self::Http(channel) => channel.request_summary(),
+            Self::WebSocket(channel) => channel.request_summary(),
+        }
+    }
+
+    async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, ServerError> {
+        match self {
+            Self::Http(channel) => channel.read_chunk().await,
+            Self::WebSocket(channel) => channel.read_chunk().await,
+        }
+    }
+
+    async fn write_payload(&mut self, frame: &Frame, payload: Vec<u8>) -> Result<(), ServerError> {
+        match self {
+            Self::Http(channel) => channel.write_payload(frame, payload).await,
+            Self::WebSocket(channel) => channel.write_payload(payload).await,
+        }
+    }
+
+    async fn finish(self) -> Result<(), ServerError> {
+        match self {
+            Self::Http(channel) => channel.finish().await,
+            Self::WebSocket(channel) => channel.finish().await,
+        }
+    }
+
+    async fn start_http(
+        mut session: ServerSession,
+        format: HttpConnectFormat,
+    ) -> Result<Self, ServerError> {
+        let remote_addr = session.client_addr().map(|addr| addr.to_string());
+        let request_summary = session.request_summary();
+        let mut response =
+            ResponseHeader::build_no_case(200, None).map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("content-type", format.content_type())
+            .map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("cache-control", "no-store")
+            .map_err(|_| ServerError::Invalid)?;
+        response
+            .append_header("x-commucat-connect-mode", format.mode().as_str())
+            .map_err(|_| ServerError::Invalid)?;
+        if matches!(format, HttpConnectFormat::Sse) {
+            if let Err(_) = response.append_header("connection", "keep-alive") {
+                return Err(ServerError::Invalid);
+            }
+        }
+        session
+            .write_response_header(Box::new(response))
+            .await
+            .map_err(|_| ServerError::Io)?;
+        let mut channel = HttpChannel {
+            session,
+            format,
+            remote_addr,
+            request_summary,
+        };
+        channel.send_sse_preamble().await?;
+        Ok(Self::Http(channel))
+    }
+
+    async fn upgrade_websocket(mut session: ServerSession) -> Result<Self, ServerError> {
+        let remote_addr = session.client_addr().map(|addr| addr.to_string());
+        let request_summary = session.request_summary();
+        match session {
+            ServerSession::H1(mut h1) => {
+                let req = h1.req_header();
+                if !req.method.as_str().eq_ignore_ascii_case("GET") {
+                    let mut session = ServerSession::H1(h1);
+                    let _ = session.respond_error(405).await;
+                    return Err(ServerError::Invalid);
+                }
+                let upgrade_ok = req
+                    .headers
+                    .get("Upgrade")
+                    .map(|value| value.as_bytes())
+                    .map(|bytes| std::str::from_utf8(bytes).unwrap_or(""))
+                    .map(|value| value.eq_ignore_ascii_case("websocket"))
+                    .unwrap_or(false);
+                let connection_ok = req
+                    .headers
+                    .get("Connection")
+                    .is_some_and(|value| header_contains_token(value, "upgrade"));
+                if !upgrade_ok || !connection_ok {
+                    let mut session = ServerSession::H1(h1);
+                    let _ = session.respond_error(400).await;
+                    return Err(ServerError::Invalid);
+                }
+                let version_ok = req
+                    .headers
+                    .get("Sec-WebSocket-Version")
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| value.trim() == "13")
+                    .unwrap_or(false);
+                if !version_ok {
+                    let mut session = ServerSession::H1(h1);
+                    let _ = session.respond_error(400).await;
+                    return Err(ServerError::Invalid);
+                }
+                let key_header = match req.headers.get("Sec-WebSocket-Key") {
+                    Some(value) => value,
+                    None => {
+                        let mut session = ServerSession::H1(h1);
+                        let _ = session.respond_error(400).await;
+                        return Err(ServerError::Invalid);
+                    }
+                };
+                let key = match std::str::from_utf8(key_header.as_bytes()) {
+                    Ok(value) => value.trim(),
+                    Err(_) => {
+                        let mut session = ServerSession::H1(h1);
+                        let _ = session.respond_error(400).await;
+                        return Err(ServerError::Invalid);
+                    }
+                };
+                let accept_key = derive_accept_key(key);
+                let mut response =
+                    ResponseHeader::build_no_case(101, None).map_err(|_| ServerError::Invalid)?;
+                response
+                    .append_header("upgrade", "websocket")
+                    .map_err(|_| ServerError::Invalid)?;
+                response
+                    .append_header("connection", "Upgrade")
+                    .map_err(|_| ServerError::Invalid)?;
+                response
+                    .append_header("sec-websocket-accept", &accept_key)
+                    .map_err(|_| ServerError::Invalid)?;
+                response
+                    .append_header("x-commucat-connect-mode", ConnectMode::WebSocket.as_str())
+                    .map_err(|_| ServerError::Invalid)?;
+                h1.write_response_header(Box::new(response))
+                    .await
+                    .map_err(|_| ServerError::Io)?;
+                let stream = h1.into_inner();
+                let websocket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+                Ok(Self::WebSocket(WebSocketChannel {
+                    stream: websocket,
+                    remote_addr,
+                    request_summary,
+                }))
+            }
+            other => {
+                let mut session = other;
+                let _ = session.respond_error(400).await;
+                Err(ServerError::Invalid)
+            }
+        }
+    }
+}
+
+fn detect_connect_mode(session: &ServerSession) -> ConnectMode {
+    let header = session.req_header();
+    if let Some(explicit) = header
+        .uri
+        .path_and_query()
+        .and_then(|pq| pq.query())
+        .and_then(|query| {
+            query
+                .split('&')
+                .filter_map(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    let key = parts.next()?;
+                    let value = parts.next().unwrap_or("");
+                    if key.eq_ignore_ascii_case("mode") || key.eq_ignore_ascii_case("transport") {
+                        parse_mode_fragment(value)
+                    } else {
+                        None
+                    }
+                })
+                .next()
+        })
+    {
+        return explicit;
+    }
+
+    if let Some(explicit) = header
+        .headers
+        .get("x-connect-mode")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_mode_fragment)
+    {
+        return explicit;
+    }
+
+    if let Some(mode) = header
+        .headers
+        .get("x-commucat-connect-mode")
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_mode_fragment)
+    {
+        return mode;
+    }
+
+    if header
+        .headers
+        .get("Upgrade")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        && header
+            .headers
+            .get("Connection")
+            .is_some_and(|value| header_contains_token(value, "upgrade"))
+    {
+        return ConnectMode::WebSocket;
+    }
+
+    if header
+        .headers
+        .get("Accept")
+        .is_some_and(|value| header_contains_token(value, "text/event-stream"))
+    {
+        return ConnectMode::Sse;
+    }
+
+    ConnectMode::Binary
+}
+
+fn parse_mode_fragment(value: &str) -> Option<ConnectMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "binary" | "stream" => Some(ConnectMode::Binary),
+        "sse" | "event-stream" | "eventstream" => Some(ConnectMode::Sse),
+        "long-poll" | "longpoll" | "poll" => Some(ConnectMode::LongPoll),
+        "websocket" | "ws" => Some(ConnectMode::WebSocket),
+        _ => None,
+    }
+}
+
+fn header_contains_token(value: &http::HeaderValue, token: &str) -> bool {
+    value
+        .to_str()
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case(token))
+        })
+        .unwrap_or(false)
+}
+
+fn frame_type_label(frame_type: FrameType) -> &'static str {
+    match frame_type {
+        FrameType::Hello => "hello",
+        FrameType::Auth => "auth",
+        FrameType::Join => "join",
+        FrameType::Leave => "leave",
+        FrameType::Msg => "msg",
+        FrameType::Ack => "ack",
+        FrameType::Typing => "typing",
+        FrameType::Presence => "presence",
+        FrameType::KeyUpdate => "key_update",
+        FrameType::GroupCreate => "group_create",
+        FrameType::GroupInvite => "group_invite",
+        FrameType::GroupEvent => "group_event",
+        FrameType::Error => "error",
+        FrameType::CallOffer => "call_offer",
+        FrameType::CallAnswer => "call_answer",
+        FrameType::CallEnd => "call_end",
+        FrameType::VoiceFrame => "voice_frame",
+        FrameType::VideoFrame => "video_frame",
+        FrameType::CallStats => "call_stats",
+        FrameType::TransportUpdate => "transport_update",
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    #[test]
+    fn mode_fragment_aliases() {
+        assert_eq!(parse_mode_fragment("stream"), Some(ConnectMode::Binary));
+        assert_eq!(parse_mode_fragment("SSe"), Some(ConnectMode::Sse));
+        assert_eq!(parse_mode_fragment("longpoll"), Some(ConnectMode::LongPoll));
+        assert_eq!(parse_mode_fragment("ws"), Some(ConnectMode::WebSocket));
+        assert_eq!(parse_mode_fragment("unknown"), None);
+    }
+
+    #[test]
+    fn header_token_detection_is_case_insensitive() {
+        let header = http::HeaderValue::from_static("Upgrade, keep-alive");
+        assert!(header_contains_token(&header, "upgrade"));
+        assert!(header_contains_token(&header, "KEEP-ALIVE"));
+        assert!(!header_contains_token(&header, "websocket"));
+    }
 }
 
 fn decode_varint_prefix(buffer: &[u8]) -> Option<(usize, usize)> {
@@ -3557,16 +4069,20 @@ impl CommuCatApp {
             }
             return None;
         }
-        let remote_addr = session.client_addr().map(|addr| addr.to_string());
-        let mut response = ResponseHeader::build_no_case(200, None).ok()?;
-        response
-            .append_header("content-type", "application/octet-stream")
-            .ok()?;
-        response.append_header("cache-control", "no-store").ok()?;
-        session
-            .write_response_header(Box::new(response))
-            .await
-            .ok()?;
+        let mode = detect_connect_mode(&session);
+        let mut channel = match ConnectChannel::from_session(session, mode).await {
+            Ok(channel) => channel,
+            Err(err) => {
+                error!(mode = mode.as_str(), error = %err, "failed to initialise connect channel");
+                return None;
+            }
+        };
+        let remote_addr = channel.remote_addr().map(|addr| addr.to_string());
+        info!(
+            remote_addr = remote_addr.as_deref().unwrap_or("unknown"),
+            mode = mode.as_str(),
+            "connect channel opened"
+        );
 
         let mut buffer = Vec::new();
         let mut handshake = HandshakeContext {
@@ -3587,8 +4103,12 @@ impl CommuCatApp {
         let mut shutdown_rx = shutdown.clone();
 
         while !matches!(handshake.stage, HandshakeStage::Established) {
-            match session.read_request_body().await {
-                Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
+            match channel.read_chunk().await {
+                Ok(Some(chunk)) => {
+                    if !chunk.is_empty() {
+                        buffer.extend_from_slice(&chunk);
+                    }
+                }
                 Ok(None) => {
                     self.emit_handshake_failure(
                         &handshake,
@@ -3628,7 +4148,7 @@ impl CommuCatApp {
                         let previous_stage = handshake.stage.as_str();
                         if let Err(err) = self
                             .process_handshake_frame(
-                                &mut session,
+                                &mut channel,
                                 &mut handshake,
                                 frame,
                                 &mut server_sequence,
@@ -3657,8 +4177,7 @@ impl CommuCatApp {
                                 frame_type: FrameType::Error,
                                 payload: FramePayload::Control(ControlEnvelope { properties }),
                             };
-                            let _ = self.write_frame(&mut session, error_frame, None).await;
-                            session.finish().await.ok()?;
+                            let _ = self.write_frame(&mut channel, error_frame, None).await;
                             return None;
                         } else {
                             let stage = handshake.stage.as_str();
@@ -3704,8 +4223,7 @@ impl CommuCatApp {
                                 }),
                             }),
                         };
-                        let _ = self.write_frame(&mut session, error_frame, None).await;
-                        session.finish().await.ok()?;
+                        let _ = self.write_frame(&mut channel, error_frame, None).await;
                         return None;
                     }
                 }
@@ -3781,7 +4299,7 @@ impl CommuCatApp {
             session_id: session_id.clone(),
             user_id: user_id.clone(),
             device_id: device_id.clone(),
-            tls_fingerprint: generate_id(&session.request_summary()),
+            tls_fingerprint: generate_id(channel.request_summary()),
             created_at: Utc::now(),
             ttl_seconds: self.state.config.connection_keepalive as i64,
         };
@@ -3884,7 +4402,7 @@ impl CommuCatApp {
             }),
         };
         server_sequence += 1;
-        if let Err(err) = self.write_frame(&mut session, ack_frame, None).await {
+        if let Err(err) = self.write_frame(&mut channel, ack_frame, None).await {
             error!("handshake ack send failed: {}", err);
             return None;
         }
@@ -3986,7 +4504,7 @@ impl CommuCatApp {
                             }
                             if decrypted_any {
                                 match self.consume_established_frames(
-                                    &mut session,
+                                    &mut channel,
                                     &device_id,
                                     &mut buffer,
                                     &tx_out,
@@ -4019,7 +4537,7 @@ impl CommuCatApp {
                 outbound = rx_out.recv() => {
                     match outbound {
                         Some(frame) => {
-                            if let Err(err) = self.write_frame(&mut session, frame, Some(&transport)).await {
+                            if let Err(err) = self.write_frame(&mut channel, frame, Some(&transport)).await {
                                 error!("outbound send failed: {}", err);
                                 break;
                             }
@@ -4038,13 +4556,15 @@ impl CommuCatApp {
         }
 
         self.cleanup_connection(&device_id).await;
-        session.finish().await.ok()?;
+        if let Err(err) = channel.finish().await {
+            debug!(error = %err, "connect channel finish failed");
+        }
         None
     }
 
     async fn process_handshake_frame(
         &self,
-        session: &mut ServerSession,
+        channel: &mut ConnectChannel,
         context: &mut HandshakeContext,
         frame: Frame,
         server_sequence: &mut u64,
@@ -4429,7 +4949,7 @@ impl CommuCatApp {
                     }),
                 };
                 *server_sequence += 1;
-                self.write_frame(session, response_frame, None).await?;
+                self.write_frame(channel, response_frame, None).await?;
                 context.device_id = device_id;
                 context.session_id = session_id;
                 context.handshake = Some(handshake_state);
@@ -4464,7 +4984,7 @@ impl CommuCatApp {
 
     async fn write_frame(
         &self,
-        session: &mut ServerSession,
+        channel: &mut ConnectChannel,
         frame: Frame,
         transport: Option<&Arc<Mutex<NoiseTransport>>>,
     ) -> Result<(), ServerError> {
@@ -4482,10 +5002,7 @@ impl CommuCatApp {
         } else {
             encoded
         };
-        session
-            .write_response_body(payload.into(), false)
-            .await
-            .map_err(|_| ServerError::Io)?;
+        channel.write_payload(&frame, payload).await?;
         self.state.metrics.mark_egress();
         Ok(())
     }
@@ -4925,7 +5442,7 @@ impl CommuCatApp {
 
     async fn consume_established_frames(
         &self,
-        session: &mut ServerSession,
+        channel: &mut ConnectChannel,
         device_id: &str,
         buffer: &mut Vec<u8>,
         tx_out: &mpsc::Sender<Frame>,
@@ -4954,7 +5471,7 @@ impl CommuCatApp {
                         }),
                     };
                     *server_sequence += 1;
-                    let _ = self.write_frame(session, error_frame, transport).await;
+                    let _ = self.write_frame(channel, error_frame, transport).await;
                     return Err(ServerError::Codec);
                 }
             }

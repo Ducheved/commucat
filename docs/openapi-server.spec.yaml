@@ -1,229 +1,522 @@
 openapi: 3.1.0
 info:
-  title: CommuCat Secure Messaging Server API
-  version: 1.0.0
+  title: CommuCat Server API
+  version: 0.3.0-pre
   description: |
-    REST API для защищённого P2P-мессенджера с Noise Protocol, post-quantum криптографией
-    и мультипутевой маршрутизацией. 
-    
-    **Безопасность:**
-    - Noise Protocol (XK/IK patterns) для E2E шифрования
-    - ML-KEM post-quantum KEM
-    - Device certificates с CA подписью
-    - Zero-knowledge proofs для handshake
-    
-    **Транспорт:**
-    - WebSocket (POST /connect) для real-time messaging
-    - HTTP/2 для REST API
-    - Multipath туннели с FEC (Forward Error Correction)
+    REST endpoints exposed by the CommuCat secure routing server. The project is
+    pre-alpha; request and response contracts may still change. Streaming CCP-1
+    traffic is handled over HTTP/2 `/connect` and is documented separately in
+    `PROTOCOL.md`.
   contact:
     name: CommuCat Project
     url: https://github.com/ducheved/commucat
   license:
-    name: MIT
-    url: https://opensource.org/licenses/MIT
-
+    name: MPL-2.0
+    url: https://www.mozilla.org/MPL/2.0/
 servers:
   - url: https://{domain}
-    description: Production server
+    description: Production instance
     variables:
       domain:
         default: commucat.example.org
-  - url: http://localhost:8443
+  - url: https://localhost:8443
     description: Local development
-
-tags:
-  - name: Health
-    description: Health и readiness checks
-  - name: Server Info
-    description: Информация о сервере и настройках
-  - name: Authentication
-    description: Device pairing и сертификаты
-  - name: Devices
-    description: Управление устройствами
-  - name: Users
-    description: Профили пользователей
-  - name: Friends
-    description: Список друзей
-  - name: P2P
-    description: P2P connectivity assistance
-  - name: Security
-    description: Security stats и метрики
-  - name: Federation
-    description: Federation events
-  - name: Real-time
-    description: WebSocket connections
-
 security:
   - BearerAuth: []
-
+tags:
+  - name: Health
+  - name: Metrics
+  - name: Server Info
+  - name: Friends
+  - name: Devices
+  - name: Pairing
+  - name: P2P
+  - name: Security
+  - name: Federation
+  - name: Real-time
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      security: []
+      responses:
+        '200':
+          description: Service is running
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ok
+  /readyz:
+    get:
+      tags: [Health]
+      summary: Readiness check
+      security: []
+      responses:
+        '200':
+          description: All dependencies reachable
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: ready
+        '503':
+          description: Storage or cache unavailable
+          content:
+            text/plain:
+              schema:
+                type: string
+                example: degraded
+  /metrics:
+    get:
+      tags: [Metrics]
+      summary: Prometheus metrics snapshot
+      description: Requires the admin token when `[admin.token]` is configured.
+      responses:
+        '200':
+          description: Prometheus metrics exposition format
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          description: Missing or invalid admin token
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+  /api/server-info:
+    get:
+      tags: [Server Info]
+      summary: Fetch bootstrap parameters for clients
+      description: Returns Noise key catalog, session timings, and pairing settings.
+      responses:
+        '200':
+          description: Current server capabilities
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerInfoResponse'
+  /api/friends:
+    get:
+      tags: [Friends]
+      summary: List friends and cached device snapshots
+      responses:
+        '200':
+          description: Friends with device summary
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendListResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+    put:
+      tags: [Friends]
+      summary: Replace friend list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FriendUpdateRequest'
+      responses:
+        '200':
+          description: Updated friend list and device snapshots
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendListResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/friends/{friendId}/devices:
+    get:
+      tags: [Friends]
+      summary: Get device snapshots for a specific friend
+      parameters:
+        - $ref: '#/components/parameters/FriendId'
+      responses:
+        '200':
+          description: Device snapshots for the friend
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendDevicesResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/users/me/avatar:
+    post:
+      tags: [Users]
+      summary: Upload user avatar
+      description: Accepts raw image data (JPEG/PNG/WebP/GIF). Max 5 MB.
+      requestBody:
+        required: true
+        content:
+          image/*:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '200':
+          description: Avatar stored successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvatarUploadResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/friends/requests:
+    get:
+      tags: [Friends]
+      summary: List incoming/outgoing friend requests
+      responses:
+        '200':
+          description: Pending friend requests
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequestsResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/friends/requests/{userId}:
+    post:
+      tags: [Friends]
+      summary: Create a friend request (local or federated)
+      parameters:
+        - $ref: '#/components/parameters/FriendId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FriendRequestCreate'
+      responses:
+        '201':
+          description: Friend request created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequestEnvelope'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/friends/requests/{userId}/accept:
+    post:
+      tags: [Friends]
+      summary: Accept an incoming friend request
+      parameters:
+        - $ref: '#/components/parameters/FriendId'
+      responses:
+        '200':
+          description: Request accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequestAcceptResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/friends/requests/{userId}/reject:
+    post:
+      tags: [Friends]
+      summary: Reject an incoming friend request
+      parameters:
+        - $ref: '#/components/parameters/FriendId'
+      responses:
+        '200':
+          description: Request rejected
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendRequestRejectResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/friends/{userId}:
+    delete:
+      tags: [Friends]
+      summary: Remove a friend
+      parameters:
+        - $ref: '#/components/parameters/FriendId'
+      responses:
+        '200':
+          description: Friend removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FriendDeleteResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/pair:
+    post:
+      tags: [Pairing]
+      summary: Issue a pairing code for a new device
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairCreateRequest'
+      responses:
+        '200':
+          description: Pairing code created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairCreateResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/pair/claim:
+    post:
+      tags: [Pairing]
+      summary: Claim a pairing code and mint device keys
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PairClaimRequest'
+      responses:
+        '200':
+          description: Device credentials issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PairClaimResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/p2p/assist:
+    post:
+      tags: [P2P]
+      summary: Experimental transport assistance endpoint
+      description: Returns draft advice for multi-path/obfuscated transports.
+      security: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/P2pAssistRequest'
+      responses:
+        '200':
+          description: Advice payload (experimental)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/P2pAssistResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/security-stats:
+    get:
+      tags: [Security]
+      summary: Snapshot of security-related counters (experimental)
+      security: []
+      responses:
+        '200':
+          description: Security metrics snapshot
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecuritySnapshot'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/device/csr:
+    post:
+      tags: [Devices]
+      summary: Submit a device rotation proof
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceRotationRequest'
+      responses:
+        '200':
+          description: Rotation applied and certificate reissued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceRotationResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/devices:
+    get:
+      tags: [Devices]
+      summary: List devices for the authenticated user
+      responses:
+        '200':
+          description: Device list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DevicesListResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /api/devices/revoke:
+    post:
+      tags: [Devices]
+      summary: Revoke a device session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeviceRevokeRequest'
+      responses:
+        '200':
+          description: Device revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeviceRevokeResponse'
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /federation/events:
+    post:
+      tags: [Federation]
+      summary: Receive a signed federation event (experimental)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignedFederationEvent'
+      responses:
+        '202':
+          description: Event accepted for processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [accepted, duplicate]
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /federation/friend-request:
+    post:
+      tags: [Federation]
+      summary: Submit a federated friend request payload (experimental)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FederatedFriendRequestPayload'
+      responses:
+        '200':
+          description: Request stored
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: accepted
+                  request_id:
+                    type: string
+        default:
+          $ref: '#/components/responses/DefaultError'
+  /connect:
+    post:
+      tags: [Real-time]
+      summary: CCP-1 streaming session
+      description: |
+        Initiates the CCP-1 Noise handshake over HTTP/2. The request and response
+        bodies remain open for bidirectional frame streaming. See `PROTOCOL.md`
+        for bootstrap details.
+      responses:
+        '200':
+          description: Stream established (HTTP/2)
+        '400':
+          description: Handshake failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/ProblemDetails'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 components:
   securitySchemes:
     BearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: Session Token
-      description: Session token полученный после успешного Noise handshake
-
+      bearerFormat: Session
+      description: Session token obtained after Noise bootstrap
+  parameters:
+    FriendId:
+      name: userId
+      in: path
+      required: true
+      description: User identifier or handle
+      schema:
+        type: string
+  responses:
+    DefaultError:
+      description: Error response
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
+    TooManyRequests:
+      description: Rate limit exceeded
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until a new attempt is permitted
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/ProblemDetails'
   schemas:
-    # ============= Common =============
-    
     ProblemDetails:
       type: object
-      description: RFC 9457 Problem Details for HTTP APIs
-      required:
-        - type
-        - title
-        - status
+      required: [type, title, status]
       properties:
         type:
           type: string
           default: about:blank
-          example: about:blank
         title:
           type: string
-          example: BadRequest
         status:
           type: integer
-          example: 400
         detail:
           type: string
-          example: "friend.user_id is required"
-    
-    UserProfile:
+    ServerInfoResponse:
       type: object
-      description: |
-        Профиль пользователя. 
-        
-        **Идентификация пользователей:**
-        - `user_id` - уникальный внутренний идентификатор (например, `user-abc123`)
-        - `handle` - читаемое имя пользователя (например, `alice`)
-        
-        API-эндпоинты, принимающие параметр `{user_id}` в пути, могут работать как с `user_id`, 
-        так и с `handle`. Сервер автоматически определит тип идентификатора.
-      required:
-        - user_id
-        - handle
-      properties:
-        id:
-          type: string
-          description: Alias для user_id
-        user_id:
-          type: string
-          description: Уникальный внутренний идентификатор пользователя
-          example: user-abc123
-        handle:
-          type: string
-          description: Читаемое имя пользователя (уникальное)
-          example: alice
-        display_name:
-          type: string
-          nullable: true
-          description: Отображаемое имя пользователя
-          example: Alice Wonderland
-        avatar_url:
-          type: string
-          nullable: true
-          description: URL аватара пользователя
-          example: https://cdn.example.org/avatars/alice.jpg
-    
-    # ============= Server Info =============
-    
-    ServerInfo:
-      type: object
-      required:
-        - domain
-        - noise_public
-        - device_ca_public
-        - supported_patterns
-        - supported_versions
       properties:
         domain:
           type: string
-          example: commucat.example.org
         noise_public:
           type: string
-          description: Текущий Noise static public key (hex)
-          example: 101112131415161718191a1b1c1d1e1f101112131415161718191a1b1c1d1e1f
+          description: Hex-encoded Noise static public key currently advertised
         noise_keys:
           type: array
-          description: Все активные Noise ключи с версионированием
           items:
-            type: object
-            required:
-              - version
-              - public
-              - valid_after
-              - rotates_at
-              - expires_at
-            properties:
-              version:
-                type: integer
-                example: 3
-              public:
-                type: string
-                example: 202122232425262728292a2b2c2d2e2f202122232425262728292a2b2c2d2e2f
-              valid_after:
-                type: string
-                format: date-time
-              rotates_at:
-                type: string
-                format: date-time
-              expires_at:
-                type: string
-                format: date-time
+            $ref: '#/components/schemas/NoiseKeyEntry'
         device_ca_public:
           type: string
-          description: Device Certificate Authority public key (hex)
-          example: 303132333435363738393a3b3c3d3e3f303132333435363738393a3b3c3d3e3f
         supported_patterns:
           type: array
           items:
             type: string
             enum: [XK, IK]
-          example: [XK, IK]
         supported_versions:
           type: array
           items:
             type: integer
-          example: [1, 2]
         session:
-          type: object
-          description: Настройки сессий и keepalive
-          properties:
-            ttl_seconds:
-              type: integer
-              description: TTL сессии (секунды). Клиент должен отправлять keepalive чаще этого интервала.
-              example: 60
-              minimum: 60
-              maximum: 3600
-            keepalive_interval:
-              type: integer
-              description: Рекомендуемый интервал отправки keepalive (секунды)
-              example: 30
+          $ref: '#/components/schemas/SessionSettings'
         presence:
           type: object
-          description: Настройки presence (статус онлайн)
           properties:
             ttl_seconds:
               type: integer
-              description: TTL presence записи (секунды). Клиент должен обновлять статус чаще этого интервала.
-              example: 30
         device_rotation:
-          type: object
-          description: Настройки ротации ключей устройств
-          properties:
-            enabled:
-              type: boolean
-              description: Включена ли ротация ключей устройств
-            min_interval_seconds:
-              type: integer
-              description: Минимальный интервал между ротациями ключей (секунды)
-              example: 86400
-            proof_ttl_seconds:
-              type: integer
-              description: TTL для proof ротации ключей (секунды)
-              example: 300
+          $ref: '#/components/schemas/DeviceRotationSettings'
         pairing:
           type: object
           properties:
@@ -231,306 +524,51 @@ components:
               type: boolean
             pairing_ttl:
               type: integer
-              description: TTL для pairing tokens (секунды)
             max_auto_devices:
               type: integer
-    
-    # ============= Pairing =============
-    
-    PairCreateRequest:
+    NoiseKeyEntry:
       type: object
       properties:
-        ttl:
+        version:
           type: integer
-          description: Желаемый TTL (секунды), будет обрезан до server limit
-          example: 300
-    
-    PairCreateResponse:
-      type: object
-      required:
-        - pair_code
-        - issued_at
-        - expires_at
-        - ttl
-        - device_seed
-        - issuer_device_id
-        - device_ca_public
-      properties:
-        pair_code:
+        public:
           type: string
-          example: ABC123XYZ
-        issued_at:
+        valid_after:
+          type: string
+          format: date-time
+        rotates_at:
           type: string
           format: date-time
         expires_at:
           type: string
           format: date-time
-        ttl:
+    SessionSettings:
+      type: object
+      properties:
+        ttl_seconds:
           type: integer
-          example: 300
-        device_seed:
-          type: string
-          description: Seed для генерации ключей нового устройства (hex, 32 bytes)
-          example: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-        issuer_device_id:
-          type: string
-          example: device-xyz789
-        device_ca_public:
-          type: string
-          example: 303132333435363738393a3b3c3d3e3f303132333435363738393a3b3c3d3e3f
-    
-    PairClaimRequest:
-      type: object
-      required:
-        - pair_code
-      properties:
-        pair_code:
-          type: string
-          example: ABC123XYZ
-        device_name:
-          type: string
-          nullable: true
-          example: Alice's iPhone
-    
-    PairClaimResponse:
-      type: object
-      required:
-        - device_id
-        - private_key
-        - public_key
-        - seed
-        - issuer_device_id
-        - user_id
-        - user
-        - device_certificate
-        - device_ca_public
-      properties:
-        device_id:
-          type: string
-        private_key:
-          type: string
-          description: Ed25519 private key (hex, 64 bytes)
-        public_key:
-          type: string
-          description: Ed25519 public key (hex, 32 bytes)
-        seed:
-          type: string
-          description: Seed использованный для генерации ключей (hex, 32 bytes)
-        issuer_device_id:
-          type: string
-        user_id:
-          type: string
-        user:
-          $ref: '#/components/schemas/UserProfile'
-        device_certificate:
-          $ref: '#/components/schemas/DeviceCertificate'
-        device_ca_public:
-          type: string
-        device_name:
-          type: string
-          nullable: true
-    
-    DeviceCertificate:
-      type: object
-      required:
-        - data
-        - signature
-      properties:
-        data:
-          type: object
-          required:
-            - serial
-            - user_id
-            - device_id
-            - public_key
-            - ca_public_key
-            - issued_at
-            - expires_at
-          properties:
-            serial:
-              type: integer
-              format: uint64
-            user_id:
-              type: string
-            device_id:
-              type: string
-            public_key:
-              type: string
-              description: Ed25519 public key (hex, 32 bytes)
-            ca_public_key:
-              type: string
-              description: CA public key (hex, 32 bytes)
-            issued_at:
-              type: integer
-              format: int64
-              description: Unix timestamp
-            expires_at:
-              type: integer
-              format: int64
-              description: Unix timestamp
-        signature:
-          type: string
-          description: Ed25519 signature (hex, 64 bytes)
-    
-    # ============= Devices =============
-    
-    DeviceListResponse:
-      type: object
-      required:
-        - devices
-      properties:
-        devices:
-          type: array
-          items:
-            type: object
-            required:
-              - device_id
-              - status
-              - created_at
-              - public_key
-              - current
-            properties:
-              device_id:
-                type: string
-              status:
-                type: string
-                enum: [active, revoked]
-              created_at:
-                type: string
-                format: date-time
-              public_key:
-                type: string
-              current:
-                type: boolean
-                description: Является ли это текущее устройство
-    
-    DeviceRevokeRequest:
-      type: object
-      required:
-        - device_id
-      properties:
-        device_id:
-          type: string
-    
-    DeviceRevokeResponse:
+        keepalive_interval:
+          type: integer
+    DeviceRotationSettings:
       type: object
       properties:
-        device_id:
-          type: string
-        status:
-          type: string
-          example: revoked
-    
-    # ============= Device Key Rotation =============
-    
-    DeviceRotationRequest:
-      type: object
-      required:
-        - public_key
-        - signature
-        - expires_at
-      properties:
-        public_key:
-          type: string
-          description: Новый Ed25519 public key (hex, 32 bytes)
-        signature:
-          type: string
-          description: Подпись старым ключом (hex, 64 bytes)
-        expires_at:
-          type: string
-          format: date-time
-          description: Время истечения proof
-        nonce:
-          type: string
-          nullable: true
-          description: Опциональный nonce (hex, min 8 bytes)
-    
-    DeviceRotationResponse:
-      type: object
-      required:
-        - device_id
-        - user_id
-        - public_key
-        - old_public_key
-        - rotation_id
-        - event_id
-        - applied_at
-        - proof_expires_at
-        - certificate
-      properties:
-        device_id:
-          type: string
-        user_id:
-          type: string
-        public_key:
-          type: string
-          description: Новый ключ
-        old_public_key:
-          type: string
-          description: Старый ключ
-        rotation_id:
-          type: string
-        event_id:
-          type: string
-        applied_at:
-          type: string
-          format: date-time
-        proof_expires_at:
-          type: string
-          format: date-time
-        certificate:
-          $ref: '#/components/schemas/DeviceCertificate'
-    
-    # ============= Friends =============
-    
+        enabled:
+          type: boolean
+        min_interval_seconds:
+          type: integer
+        proof_ttl_seconds:
+          type: integer
     FriendEntry:
       type: object
-      required:
-        - user_id
+      required: [user_id]
       properties:
         user_id:
           type: string
         alias:
           type: string
           nullable: true
-          description: Пользовательский alias для друга
-    
-    FriendsGetResponse:
+    FriendDevice:
       type: object
-      required:
-        - friends
-        - devices
-      properties:
-        friends:
-          type: array
-          items:
-            $ref: '#/components/schemas/FriendEntry'
-        devices:
-          type: object
-          description: Map user_id -> device snapshots
-          additionalProperties:
-            type: array
-            items:
-              $ref: '#/components/schemas/FriendDeviceSnapshot'
-    
-    FriendsPutRequest:
-      type: object
-      required:
-        - friends
-      properties:
-        friends:
-          type: array
-          maxItems: 512
-          items:
-            $ref: '#/components/schemas/FriendEntry'
-    
-    FriendDeviceSnapshot:
-      type: object
-      required:
-        - device_id
-        - public_key
-        - status
-        - created_at
       properties:
         device_id:
           type: string
@@ -545,126 +583,219 @@ components:
           type: string
           format: date-time
           nullable: true
-    
+    FriendListResponse:
+      type: object
+      properties:
+        friends:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendEntry'
+        devices:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/FriendDevice'
+    FriendUpdateRequest:
+      type: object
+      properties:
+        friends:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendEntry'
+      required: [friends]
     FriendDevicesResponse:
       type: object
-      required:
-        - friend
-        - devices
       properties:
         friend:
           type: string
-          description: user_id друга
         devices:
           type: array
           items:
-            $ref: '#/components/schemas/FriendDeviceSnapshot'
-    
-    # ============= Friend Requests =============
-    
+            $ref: '#/components/schemas/FriendDevice'
+    AvatarUploadResponse:
+      type: object
+      properties:
+        avatar_url:
+          type: string
+        filename:
+          type: string
+    FriendRequestsResponse:
+      type: object
+      properties:
+        incoming:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendRequest'
+        outgoing:
+          type: array
+          items:
+            $ref: '#/components/schemas/FriendRequest'
     FriendRequest:
       type: object
-      required:
-        - id
-        - from_user_id
-        - to_user_id
-        - status
-        - created_at
-        - updated_at
       properties:
         id:
           type: string
-          example: req-xyz789
         from_user_id:
           type: string
-          example: user-alice
         to_user_id:
           type: string
-          example: user-bob
         status:
           type: string
-          enum: [pending, accepted, rejected]
-          example: pending
         message:
           type: string
           nullable: true
-          example: "Let's be friends!"
         created_at:
           type: string
           format: date-time
-          example: "2024-03-17T12:00:00Z"
         updated_at:
           type: string
           format: date-time
-          example: "2024-03-17T12:05:00Z"
-    
     FriendRequestCreate:
       type: object
       properties:
         message:
           type: string
           nullable: true
-          maxLength: 500
-          example: "Hi! I'd like to add you as a friend"
-    
-    FriendRequestsListResponse:
+    FriendRequestEnvelope:
       type: object
-      required:
-        - incoming
-        - outgoing
-      properties:
-        incoming:
-          type: array
-          description: Входящие запросы в друзья (только pending)
-          items:
-            $ref: '#/components/schemas/FriendRequest'
-        outgoing:
-          type: array
-          description: Исходящие запросы в друзья (все статусы)
-          items:
-            $ref: '#/components/schemas/FriendRequest'
-    
-    FriendRequestResponse:
-      type: object
-      required:
-        - request
       properties:
         request:
           $ref: '#/components/schemas/FriendRequest'
         to_user:
+          type: object
+          properties:
+            user_id:
+              type: string
+            handle:
+              type: string
+            display_name:
+              type: string
+              nullable: true
+            avatar_url:
+              type: string
+              nullable: true
+    FriendRequestAcceptResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        friend:
+          $ref: '#/components/schemas/FriendEntry'
+    FriendRequestRejectResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        request_id:
+          type: string
+    FriendDeleteResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: removed
+        user_id:
+          type: string
+    PairCreateRequest:
+      type: object
+      properties:
+        ttl:
+          type: integer
+          minimum: 1
+          description: Optional lifetime in seconds (capped by server config)
+    PairCreateResponse:
+      type: object
+      properties:
+        pair_code:
+          type: string
+        issued_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        ttl:
+          type: integer
+        device_seed:
+          type: string
+        issuer_device_id:
+          type: string
+        device_ca_public:
+          type: string
+    PairClaimRequest:
+      type: object
+      required: [pair_code]
+      properties:
+        pair_code:
+          type: string
+        device_name:
+          type: string
+          nullable: true
+    PairClaimResponse:
+      type: object
+      properties:
+        device_id:
+          type: string
+        private_key:
+          type: string
+        public_key:
+          type: string
+        seed:
+          type: string
+        issuer_device_id:
+          type: string
+        user_id:
+          type: string
+        user:
           $ref: '#/components/schemas/UserProfile'
-          description: Информация о пользователе, которому отправлен запрос (возвращается при создании запроса)
-        from_user:
-          $ref: '#/components/schemas/UserProfile'
-          description: Информация о пользователе, от которого пришёл запрос (возвращается при accept/reject)
-    
-    # ============= P2P Assist =============
-    
+        device_certificate:
+          type: object
+        device_ca_public:
+          type: string
+        device_name:
+          type: string
+          nullable: true
+    UserProfile:
+      type: object
+      properties:
+        user_id:
+          type: string
+        handle:
+          type: string
+        domain:
+          type: string
+        display_name:
+          type: string
+          nullable: true
+        avatar_url:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
     P2pAssistRequest:
       type: object
       properties:
         peer_hint:
           type: string
           nullable: true
-          description: Подсказка адреса peer
         paths:
           type: array
           items:
-            $ref: '#/components/schemas/PathHint'
+            $ref: '#/components/schemas/P2pPathHint'
         prefer_reality:
           type: boolean
-          default: true
         fec:
-          $ref: '#/components/schemas/FecHint'
+          $ref: '#/components/schemas/P2pFecHint'
         min_paths:
           type: integer
-          nullable: true
           minimum: 1
-    
-    PathHint:
+    P2pPathHint:
       type: object
-      required:
-        - address
       properties:
         address:
           type: string
@@ -680,40 +811,24 @@ components:
         priority:
           type: integer
           nullable: true
-          minimum: 0
-          maximum: 255
         reality_fingerprint:
           type: string
           nullable: true
-          description: TLS fingerprint (hex, 32 bytes)
         reality_pem:
           type: string
           nullable: true
-          description: Certificate PEM
-    
-    FecHint:
+    P2pFecHint:
       type: object
       properties:
         mtu:
           type: integer
           nullable: true
-          example: 1152
         repair_overhead:
           type: number
           format: float
           nullable: true
-          example: 0.35
-    
     P2pAssistResponse:
       type: object
-      required:
-        - noise
-        - pq
-        - ice
-        - transports
-        - multipath
-        - obfuscation
-        - security
       properties:
         noise:
           $ref: '#/components/schemas/NoiseAdvice'
@@ -731,74 +846,41 @@ components:
           $ref: '#/components/schemas/ObfuscationAdvice'
         security:
           $ref: '#/components/schemas/SecuritySnapshot'
-    
     NoiseAdvice:
       type: object
-      required:
-        - pattern
-        - prologue_hex
-        - device_seed_hex
-        - static_public_hex
       properties:
         pattern:
           type: string
-          enum: [XK, IK]
         prologue_hex:
           type: string
         device_seed_hex:
           type: string
-          description: Random seed для устройства (hex, 32 bytes)
         static_public_hex:
           type: string
-          description: Static public key (hex, 32 bytes)
-    
     PqAdvice:
       type: object
-      required:
-        - identity_public_hex
-        - signed_prekey_public_hex
-        - kem_public_hex
-        - signature_public_hex
       properties:
         identity_public_hex:
           type: string
-          description: Ed25519 identity key
         signed_prekey_public_hex:
           type: string
-          description: Signed prekey
         kem_public_hex:
           type: string
-          description: ML-KEM public key
         signature_public_hex:
           type: string
-          description: ML-DSA verifying key
-    
     IceAdvice:
       type: object
-      required:
-        - username_fragment
-        - password
-        - ttl_secs
-        - keepalive_interval_secs
-        - trickle
       properties:
         username_fragment:
           type: string
-          maxLength: 16
         password:
           type: string
-          maxLength: 64
         ttl_secs:
           type: integer
-          minimum: 60
-          maximum: 3600
         keepalive_interval_secs:
           type: integer
-          minimum: 5
-          maximum: 120
         trickle:
           type: boolean
-    
     TransportAdvice:
       type: object
       properties:
@@ -806,38 +888,26 @@ components:
           type: string
         transport:
           type: string
-          enum: [AmnesiaWg, Reality, Shadowsocks, Onion, QuicMasque, WebSocket, Dns]
         resistance:
           type: string
-          enum: [Basic, Enhanced, Maximum, Paranoid]
         latency:
           type: string
-          enum: [Low, Medium, High]
         throughput:
           type: string
-          enum: [Low, Medium, High]
-    
     MultipathAdvice:
       type: object
-      required:
-        - fec_mtu
-        - fec_overhead
-        - sample_segments
       properties:
         fec_mtu:
           type: integer
         fec_overhead:
           type: number
-          format: float
         primary_path:
           type: string
           nullable: true
         sample_segments:
           type: object
-          description: Map path_id -> segment breakdown
           additionalProperties:
             $ref: '#/components/schemas/SampleBreakdown'
-    
     SampleBreakdown:
       type: object
       properties:
@@ -845,7 +915,6 @@ components:
           type: integer
         repair:
           type: integer
-    
     ObfuscationAdvice:
       type: object
       properties:
@@ -858,792 +927,136 @@ components:
           type: boolean
         tor_bridge:
           type: boolean
-    
-    # ============= Security =============
-    
     SecuritySnapshot:
       type: object
       properties:
         noise_handshakes:
           type: integer
-          format: uint64
         pq_handshakes:
           type: integer
-          format: uint64
         fec_packets:
           type: integer
-          format: uint64
         multipath_sessions:
           type: integer
-          format: uint64
         average_paths:
           type: number
-          format: double
+          format: float
         censorship_deflections:
           type: integer
-          format: uint64
-    
-    # ============= Federation =============
-    
+    DeviceRotationRequest:
+      type: object
+      required: [public_key, signature, expires_at]
+      properties:
+        public_key:
+          type: string
+        signature:
+          type: string
+        expires_at:
+          type: string
+        nonce:
+          type: string
+          nullable: true
+    DeviceRotationResponse:
+      type: object
+      properties:
+        device_id:
+          type: string
+        user_id:
+          type: string
+        public_key:
+          type: string
+        old_public_key:
+          type: string
+        rotation_id:
+          type: string
+        event_id:
+          type: string
+        applied_at:
+          type: string
+          format: date-time
+        proof_expires_at:
+          type: string
+          format: date-time
+        certificate:
+          type: object
+    DevicesListResponse:
+      type: object
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/DeviceSummary'
+    DeviceSummary:
+      type: object
+      properties:
+        device_id:
+          type: string
+        status:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        public_key:
+          type: string
+        current:
+          type: boolean
+    DeviceRevokeRequest:
+      type: object
+      required: [device_id]
+      properties:
+        device_id:
+          type: string
+    DeviceRevokeResponse:
+      type: object
+      properties:
+        device_id:
+          type: string
+        status:
+          type: string
+    SignedFederationEvent:
+      type: object
+      properties:
+        event:
+          $ref: '#/components/schemas/FederationEvent'
+        signature:
+          type: array
+          items:
+            type: integer
+            format: uint8
+        digest:
+          type: array
+          items:
+            type: integer
+            format: uint8
     FederationEvent:
       type: object
-      required:
-        - event_id
-        - origin
-        - created_at
-        - payload
-        - scope
-        - signature
       properties:
         event_id:
           type: string
         origin:
           type: string
-          description: Домен отправителя
         created_at:
           type: string
           format: date-time
         payload:
           type: object
-          description: Relay payload
         scope:
           type: string
+    FederatedFriendRequestPayload:
+      type: object
+      required: [type, request_id, from, to, signature]
+      properties:
+        type:
+          type: string
+          enum: [friend_request]
+        request_id:
+          type: string
+        from:
+          type: string
+        to:
+          type: string
+        message:
+          type: string
+          nullable: true
         signature:
           type: string
-          description: Ed25519 signature (hex)
-    
-    FederationEventResponse:
-      type: object
-      properties:
-        status:
-          type: string
-          enum: [accepted, duplicate]
-
-paths:
-  # ============= Health =============
-  
-  /:
-    get:
-      summary: Landing page
-      tags: [Health]
-      security: []
-      responses:
-        '200':
-          description: HTML landing page
-          content:
-            text/html:
-              schema:
-                type: string
-  
-  /healthz:
-    get:
-      summary: Health check
-      tags: [Health]
-      security: []
-      responses:
-        '200':
-          description: Server healthy
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: ok
-  
-  /readyz:
-    get:
-      summary: Readiness check
-      tags: [Health]
-      security: []
-      responses:
-        '200':
-          description: Server ready
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: ready
-        '503':
-          description: Server degraded
-          content:
-            text/plain:
-              schema:
-                type: string
-                example: degraded
-  
-  /metrics:
-    get:
-      summary: Prometheus metrics
-      tags: [Health]
-      security:
-        - BearerAuth: []
-      description: |
-        Требует admin token. Возвращает Prometheus-совместимые метрики.
-      responses:
-        '200':
-          description: Metrics
-          content:
-            text/plain:
-              schema:
-                type: string
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  
-  # ============= Server Info =============
-  
-  /api/server-info:
-    get:
-      summary: Get server information
-      tags: [Server Info]
-      security: []
-      responses:
-        '200':
-          description: Server info
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ServerInfo'
-  
-  # ============= Authentication =============
-  
-  /api/pair:
-    post:
-      summary: Create pairing token
-      tags: [Authentication]
-      security:
-        - BearerAuth: []
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/PairCreateRequest'
-      responses:
-        '200':
-          description: Pairing token created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PairCreateResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-  
-  /api/pair/claim:
-    post:
-      summary: Claim pairing token
-      tags: [Authentication]
-      security: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/PairClaimRequest'
-      responses:
-        '200':
-          description: Device paired successfully
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PairClaimResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  
-  # ============= Devices =============
-  
-  /api/devices:
-    get:
-      summary: List devices
-      tags: [Devices]
-      security:
-        - BearerAuth: []
-      responses:
-        '200':
-          description: Device list
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DeviceListResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  
-  /api/devices/revoke:
-    post:
-      summary: Revoke device
-      tags: [Devices]
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/DeviceRevokeRequest'
-      responses:
-        '200':
-          description: Device revoked
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DeviceRevokeResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
-  
-  /api/device/csr:
-    post:
-      summary: Device key rotation (Certificate Signing Request)
-      tags: [Devices]
-      security:
-        - BearerAuth: []
-      description: |
-        Ротация ключа устройства. Требует подпись старым ключом.
-        Возвращает новый device certificate.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/DeviceRotationRequest'
-      responses:
-        '200':
-          description: Key rotated, new certificate issued
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/DeviceRotationResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
-  
-  # ============= Friends =============
-  
-  /api/users/me/avatar:
-    post:
-      summary: Upload user avatar
-      tags: [Users]
-      security:
-        - BearerAuth: []
-      description: |
-        Загрузить аватарку пользователя. Принимает изображение напрямую в теле запроса.
-        
-        **Ограничения:**
-        - Максимальный размер: 5 MB
-        - Допустимые форматы: JPEG, PNG, WebP, GIF
-        
-        После успешной загрузки профиль пользователя автоматически обновляется с новым avatar_url.
-      requestBody:
-        required: true
-        content:
-          image/jpeg:
-            schema:
-              type: string
-              format: binary
-          image/png:
-            schema:
-              type: string
-              format: binary
-          image/webp:
-            schema:
-              type: string
-              format: binary
-          image/gif:
-            schema:
-              type: string
-              format: binary
-      responses:
-        '200':
-          description: Avatar uploaded successfully
-          content:
-            application/json:
-              schema:
-                type: object
-                required:
-                  - avatar_url
-                  - filename
-                properties:
-                  avatar_url:
-                    type: string
-                    description: Полный URL загруженной аватарки
-                    example: https://commucat.example.org/uploads/a1b2c3d4e5f6g7h8.jpg
-                  filename:
-                    type: string
-                    description: Имя сохранённого файла
-                    example: a1b2c3d4e5f6g7h8.jpg
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  
-  /uploads/{filename}:
-    get:
-      summary: Get uploaded file
-      tags: [Users]
-      security: []
-      description: |
-        Отдаёт загруженный файл (аватарки и т.д.).
-        Файлы кешируются навсегда (immutable).
-      parameters:
-        - name: filename
-          in: path
-          required: true
-          schema:
-            type: string
-          description: Имя файла
-          example: a1b2c3d4e5f6g7h8.jpg
-      responses:
-        '200':
-          description: File content
-          headers:
-            Cache-Control:
-              schema:
-                type: string
-                example: public, max-age=31536000, immutable
-          content:
-            image/jpeg:
-              schema:
-                type: string
-                format: binary
-            image/png:
-              schema:
-                type: string
-                format: binary
-            image/webp:
-              schema:
-                type: string
-                format: binary
-            image/gif:
-              schema:
-                type: string
-                format: binary
-        '403':
-          description: Forbidden (path traversal detected)
-        '404':
-          description: File not found
-  
-  /api/friends:
-    get:
-      summary: Get friends list
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      responses:
-        '200':
-          description: Friends list
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FriendsGetResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-    
-    put:
-      summary: Update friends list
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/FriendsPutRequest'
-      responses:
-        '200':
-          description: Friends updated
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FriendsGetResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  
-  /api/friends/{user_id}/devices:
-    get:
-      summary: Get friend's devices
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      parameters:
-        - name: user_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Friend's devices
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FriendDevicesResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  
-  /api/friends/requests:
-    get:
-      summary: Get friend requests
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      description: |
-        Получить все входящие и исходящие запросы в друзья.
-        Возвращает только pending запросы для входящих.
-      responses:
-        '200':
-          description: Friend requests list
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FriendRequestsListResponse'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-  
-  /api/friends/requests/{user_id}:
-    post:
-      summary: Send friend request
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      description: |
-        Отправить запрос в друзья указанному пользователю.
-        После принятия оба пользователя будут автоматически добавлены
-        в списки друзей друг друга.
-        
-        **Примечание:** Параметр `user_id` может быть как `user_id`, так и `handle` пользователя.
-        Сервер автоматически определит тип идентификатора.
-      parameters:
-        - name: user_id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: ID или handle пользователя, которому отправляется запрос
-          examples:
-            user_id:
-              value: user-abc123
-              summary: Использование user_id
-            handle:
-              value: alice
-              summary: Использование handle
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/FriendRequestCreate'
-      responses:
-        '201':
-          description: Friend request created
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FriendRequestResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '409':
-          $ref: '#/components/responses/Conflict'
-  
-  /api/friends/requests/{user_id}/accept:
-    post:
-      summary: Accept friend request
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      description: |
-        Принять входящий запрос в друзья от указанного пользователя.
-        Оба пользователя будут автоматически добавлены в списки друзей друг друга.
-      parameters:
-        - name: user_id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: ID пользователя, от которого пришёл запрос
-      responses:
-        '200':
-          description: Friend request accepted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FriendRequestResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  
-  /api/friends/requests/{user_id}/reject:
-    post:
-      summary: Reject friend request
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      description: |
-        Отклонить входящий запрос в друзья от указанного пользователя.
-      parameters:
-        - name: user_id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: ID пользователя, от которого пришёл запрос
-      responses:
-        '200':
-          description: Friend request rejected
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FriendRequestResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  
-  /api/friends/{user_id}:
-    delete:
-      summary: Remove friend
-      tags: [Friends]
-      security:
-        - BearerAuth: []
-      description: |
-        Удалить пользователя из списка друзей.
-        Это одностороннее действие - удаляет только из вашего списка.
-      parameters:
-        - name: user_id
-          in: path
-          required: true
-          schema:
-            type: string
-          description: ID друга для удаления
-      responses:
-        '204':
-          description: Friend removed successfully
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  
-  # ============= P2P =============
-  
-  /api/p2p/assist:
-    post:
-      summary: P2P connectivity assistance
-      tags: [P2P]
-      security: []
-      description: |
-        Генерирует параметры для установки P2P соединения:
-        - Noise handshake parameters
-        - Post-quantum ключи
-        - ICE credentials
-        - Transport advice (multipath, FEC)
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/P2pAssistRequest'
-      responses:
-        '200':
-          description: P2P assistance parameters
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/P2pAssistResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-  
-  # ============= Security =============
-  
-  /api/security-stats:
-    get:
-      summary: Security statistics
-      tags: [Security]
-      security: []
-      responses:
-        '200':
-          description: Security stats
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/SecuritySnapshot'
-  
-  # ============= Federation =============
-  
-  /federation/events:
-    post:
-      summary: Receive federation event
-      tags: [Federation]
-      security: []
-      description: |
-        Принимает события от других серверов федерации.
-        Проверяет подпись, затем релеит целевому устройству.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/FederationEvent'
-      responses:
-        '200':
-          description: Event accepted (duplicate)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FederationEventResponse'
-        '202':
-          description: Event accepted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FederationEventResponse'
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/NotFound'
-  
-  # ============= Real-time =============
-  
-  /connect:
-    post:
-      summary: WebSocket connection for real-time messaging
-      tags: [Real-time]
-      security: []
-      description: |
-        Основной endpoint для real-time коммуникации.
-        
-        **Протокол:**
-        1. Client → Server: Hello frame (Noise handshake начало)
-        2. Server → Client: Auth frame (Noise handshake ответ)
-        3. Client → Server: Auth frame (Noise handshake завершение)
-        4. Server → Client: Ack frame (Handshake OK, session_id)
-        5. Далее: Encrypted frames (Join/Leave/Msg/CallOffer/etc.)
-        
-        **Frame types:**
-        - Hello, Auth, Ack, Error
-        - Join, Leave
-        - Msg, Typing
-        - CallOffer, CallAnswer, CallEnd, CallStats, TransportUpdate
-        - VoiceFrame, VideoFrame
-        - GroupCreate, GroupInvite, GroupEvent
-        - KeyUpdate, Presence
-        
-        **Encoding:**
-        - Все frames после handshake шифруются Noise Transport
-        - Формат: varint(len) + ciphertext
-        
-        Подробнее см. WebSocket Protocol документацию.
-      responses:
-        '200':
-          description: Connection upgraded to WebSocket
-        '400':
-          description: Bad request or handshake failed
-        '429':
-          $ref: '#/components/responses/TooManyRequests'
-
-  # ============= Common Responses =============
-  
-  components:
-    responses:
-      BadRequest:
-        description: Bad request
-        content:
-          application/problem+json:
-            schema:
-              $ref: '#/components/schemas/ProblemDetails'
-            example:
-              type: about:blank
-              title: BadRequest
-              status: 400
-              detail: "friend.user_id is required"
-      
-      Unauthorized:
-        description: Unauthorized - missing or invalid session token
-        content:
-          application/problem+json:
-            schema:
-              $ref: '#/components/schemas/ProblemDetails'
-            example:
-              type: about:blank
-              title: Unauthorized
-              status: 401
-              detail: "authorization required"
-      
-      Forbidden:
-        description: Forbidden - insufficient permissions
-        content:
-          application/problem+json:
-            schema:
-              $ref: '#/components/schemas/ProblemDetails'
-            example:
-              type: about:blank
-              title: Forbidden
-              status: 403
-              detail: "access denied"
-      
-      NotFound:
-        description: Resource not found
-        content:
-          application/problem+json:
-            schema:
-              $ref: '#/components/schemas/ProblemDetails'
-            example:
-              type: about:blank
-              title: NotFound
-              status: 404
-              detail: "resource not found"
-      
-      Conflict:
-        description: Conflict - resource state conflict
-        content:
-          application/problem+json:
-            schema:
-              $ref: '#/components/schemas/ProblemDetails'
-            example:
-              type: about:blank
-              title: Conflict
-              status: 409
-              detail: "cannot revoke active session device"
-      
-      TooManyRequests:
-        description: Rate limit exceeded
-        headers:
-          Retry-After:
-            schema:
-              type: integer
-            description: Секунды до следующей попытки
-        content:
-          application/problem+json:
-            schema:
-              $ref: '#/components/schemas/ProblemDetails'
-            example:
-              type: about:blank
-              title: Too Many Requests
-              status: 429
