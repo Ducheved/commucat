@@ -13,11 +13,11 @@
 5. **Криптография** — генерируются временные ключи:
    - Noise: seed (32 байта), static public, prologue — через `DeviceKeyPair::from_seed` + `build_handshake` (XK, инициатор).
    - PQ: `PqxdhBundle::generate` выдаёт ML-KEM/ML-DSA связку (identity, signed prekey, KEM, подпись).
-6. **ICE** — `build_ice_advice` формирует `username_fragment`, `password`, TTL и keepalive interval. Значения ограничены `pairing_ttl_seconds`/`connection_keepalive` из конфига.
+6. **ICE/TURN** — `build_ice_advice` формирует `username_fragment`, `password`, keepalive, а также список TURN-серверов. Для записей с `secret` генерируются coturn-совместимые временные учётки (`username = "<expires>:<ufrag>"`, `credential = BASE64(HMAC-SHA1(secret, username))`), для статических — возвращается исходная пара `username`/`password`. ICE-lite публикует host-кандидат с публичным адресом сервера.
 7. **Obfuscation** — `build_obfuscation_advice` подсвечивает флаги Reality / domain fronting / Shadowsocks / Tor в зависимости от реальных путей.
 8. **Security snapshot** — `Metrics::security_snapshot` в ответе отражает агрегированные показатели (handshake success, censorship и т.д.).
 
-Результат: `P2pAssistResponse` содержит всё необходимое для установки клиентом мультипатч Noise-тоннеля и ICE-креды для NAT traversal.
+Результат: `P2pAssistResponse` содержит всё необходимое для установки клиентом мультипатч Noise-тоннеля, ICE/ TURN-кредов и ICE-lite кандидатов для NAT traversal.
 
 ## 2. Транспортный слой и мультипатч
 

@@ -43,5 +43,7 @@ reqwest = { version = "0.11", default-features = false, features = ["json", "rus
 tokio-tungstenite = { version = "0.23", default-features = false, features = ["stream", "handshake", "connect"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 base64 = "0.22"
+hmac = "0.12"
 http = "1"
+sha1 = "0.10"
 utoipa = { version = "4.2" }

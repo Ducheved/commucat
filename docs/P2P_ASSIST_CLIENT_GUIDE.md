@@ -109,7 +109,32 @@ Content-Type: application/json
     "password": "long-random-password-for-ice-authentication",
     "ttl_secs": 600,
     "keepalive_interval_secs": 30,
-    "trickle": true
+    "trickle": true,
+    "servers": [
+      {
+        "urls": [
+          "turn:turn.commucat.tech:3478?transport=udp",
+          "turns:turn.commucat.tech:5349?transport=tcp"
+        ],
+        "username": "1712332800:ice-ufrag123456",
+        "credential": "base64-hmac-of-shared-secret",
+        "ttl_secs": 600,
+        "expires_at": "2025-10-06T12:00:00Z",
+        "realm": "commucat"
+      }
+    ],
+    "lite_candidates": [
+      {
+        "candidate": "candidate:a1b2c3d4 1 udp 2130706431 198.51.100.10 3478 typ host generation 0",
+        "component": 1,
+        "protocol": "udp",
+        "foundation": "a1b2c3d4",
+        "priority": 2130706431,
+        "ip": "198.51.100.10",
+        "port": 3478,
+        "typ": "host"
+      }
+    ]
   },
   "transports": [
     {
@@ -181,11 +206,42 @@ Content-Type: application/json
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `username_fragment` | string | ICE username (16 chars) |
+| `username_fragment` | string | ICE ufrag (16 chars) |
 | `password` | string | ICE password (64 chars) |
 | `ttl_secs` | integer | Credential validity period |
 | `keepalive_interval_secs` | integer | STUN/TURN keepalive interval |
 | `trickle` | boolean | Support trickle ICE |
+| `servers` | array | TURN servers with credentials |
+| `lite_candidates` | array | ICE-lite host candidates advertised by the server |
+
+##### `servers[]` entries
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `urls` | array | TURN URIs (e.g., `turn:` / `turns:`) |
+| `username` | string | TURN username (may include expiry prefix) |
+| `credential` | string | TURN credential (static or HMAC-SHA1) |
+| `ttl_secs` | integer | Remaining credential lifetime (0 for static creds) |
+| `expires_at` | string | RFC 3339 expiry timestamp when present |
+| `realm` | string | Optional TURN realm hint |
+
+##### `lite_candidates[]` entries
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `candidate` | string | SDP candidate line (ICE-lite host candidate) |
+| `component` | integer | RTP component (1 = RTP, 2 = RTCP) |
+| `protocol` | string | Transport protocol (`udp`) |
+| `foundation` | string | Candidate foundation (hash of public IP) |
+| `priority` | integer | Candidate priority (RFC 5245) |
+| `ip` | string | Advertised IP address |
+| `port` | integer | Advertised UDP port |
+| `typ` | string | Candidate type (`host`) |
+
+> **Note**
+> - TURN entries configured with `secret` use coturn-compatible temporary credentials: `username = "<expires>:<username_fragment>"` and `credential = BASE64(HMAC-SHA1(secret, username))`. `ttl_secs` and `expires_at` mirror `ice.turn_ttl`.
+> - Entries with static `username` / `password` are returned verbatim with `ttl_secs = 0`.
+> - `lite_candidates` expose the server’s ICE-lite host candidate so WebRTC stacks can bootstrap connectivity without waiting for a full STUN gathering cycle.
 
 #### `transports` Array - Available Transport Paths
 

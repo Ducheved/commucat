@@ -1,18 +1,31 @@
 use super::{ApiError, AppState};
-use crate::metrics::SecuritySnapshot;
+use crate::config::{IceConfig, TurnAuthConfig};
+use crate::metrics::{Metrics, SecuritySnapshot};
 use crate::transport::{
     Endpoint, MultipathEndpoint, MultipathPathInfo, PerformanceTier, RaptorqDecoder, RealityConfig,
     ResistanceLevel, TransportError, TransportType,
 };
 use crate::util::{decode_hex32, encode_hex, generate_id};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as Base64;
+use blake3::hash as blake3_hash;
+use chrono::{Duration as ChronoDuration, Utc};
 use commucat_crypto::{DeviceKeyPair, HandshakePattern, NoiseConfig, PqxdhBundle, build_handshake};
+use hmac::{Hmac, Mac};
 use ml_kem::EncodedSizeUser;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
+use sha1::Sha1;
 use std::collections::HashMap;
 use std::convert::TryFrom;
+use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tracing::warn;
+use std::time::Duration as StdDuration;
+use tokio::net::UdpSocket;
+use tracing::{debug, info, warn};
+
+type HmacSha1 = Hmac<Sha1>;
 
 #[derive(Debug, Deserialize)]
 pub struct P2pAssistRequest {
@@ -87,6 +100,34 @@ pub struct IceAdvice {
     pub ttl_secs: u32,
     pub keepalive_interval_secs: u16,
     pub trickle: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<IceServerAdvice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lite_candidates: Vec<IceCandidateAdvice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IceServerAdvice {
+    pub urls: Vec<String>,
+    pub username: String,
+    pub credential: String,
+    pub ttl_secs: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realm: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IceCandidateAdvice {
+    pub candidate: String,
+    pub component: u8,
+    pub protocol: String,
+    pub foundation: String,
+    pub priority: u32,
+    pub ip: String,
+    pub port: u16,
+    pub typ: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +159,265 @@ pub struct ObfuscationAdvice {
     pub domain_fronting: bool,
     pub protocol_mimicry: bool,
     pub tor_bridge: bool,
+}
+
+#[derive(Clone)]
+pub struct IceRuntime {
+    pub lite: Option<IceLiteRuntime>,
+    pub turn: Vec<TurnServerRuntime>,
+    pub credential_ttl: StdDuration,
+}
+
+#[derive(Clone)]
+pub struct IceLiteRuntime {
+    pub public_addr: SocketAddr,
+}
+
+#[derive(Clone)]
+pub struct TurnServerRuntime {
+    pub urls: Vec<String>,
+    pub auth: TurnAuth,
+    pub realm: Option<String>,
+}
+
+#[derive(Clone)]
+pub enum TurnAuth {
+    Static {
+        username: String,
+        credential: String,
+    },
+    Secret {
+        secret: String,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub struct IceLiteServerConfig {
+    pub bind_addr: SocketAddr,
+    pub public_addr: SocketAddr,
+}
+
+const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
+const ICE_SOFTWARE: &str = "CommuCat ICE-lite";
+
+pub(super) fn build_ice_runtime(config: &IceConfig) -> (IceRuntime, Option<IceLiteServerConfig>) {
+    let lite_public = if config.lite_enabled {
+        config.lite_public_address.or(config.lite_bind)
+    } else {
+        None
+    };
+    let lite_runtime = lite_public.map(|addr| IceLiteRuntime { public_addr: addr });
+    let lite_server_cfg = if config.lite_enabled {
+        match (config.lite_bind, lite_public) {
+            (Some(bind_addr), Some(public_addr)) => Some(IceLiteServerConfig {
+                bind_addr,
+                public_addr,
+            }),
+            _ => {
+                warn!("ice-lite enabled but bind/public address not fully configured");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let turn = config
+        .turn_servers
+        .iter()
+        .map(|entry| TurnServerRuntime {
+            urls: entry.urls.clone(),
+            auth: match &entry.auth {
+                TurnAuthConfig::Static { username, password } => TurnAuth::Static {
+                    username: username.clone(),
+                    credential: password.clone(),
+                },
+                TurnAuthConfig::Secret { secret } => TurnAuth::Secret {
+                    secret: secret.clone(),
+                },
+            },
+            realm: entry.realm.clone(),
+        })
+        .collect();
+    let runtime = IceRuntime {
+        lite: lite_runtime,
+        turn,
+        credential_ttl: config.turn_ttl,
+    };
+    (runtime, lite_server_cfg)
+}
+
+pub(super) fn spawn_ice_lite(config: IceLiteServerConfig, metrics: Arc<Metrics>) {
+    tokio::spawn(async move {
+        if let Err(err) = run_ice_lite_server(config, metrics).await {
+            warn!(error = %err, "ice-lite server terminated");
+        }
+    });
+}
+
+async fn run_ice_lite_server(config: IceLiteServerConfig, metrics: Arc<Metrics>) -> io::Result<()> {
+    let socket = UdpSocket::bind(config.bind_addr).await?;
+    info!(bind = %config.bind_addr, public = %config.public_addr, "ice-lite listener started");
+    let mut buf = [0u8; 2048];
+    loop {
+        let (len, peer) = socket.recv_from(&mut buf).await?;
+        match build_binding_response(&buf[..len], config.public_addr) {
+            Ok(Some(response)) => {
+                if let Err(err) = socket.send_to(&response, peer).await {
+                    warn!(peer = %peer, error = %err, "failed to send STUN binding response");
+                    metrics.mark_ice_binding_failure();
+                } else {
+                    metrics.mark_ice_binding_success();
+                }
+            }
+            Ok(None) => {}
+            Err(_) => metrics.mark_ice_binding_failure(),
+        }
+    }
+}
+
+fn build_binding_response(packet: &[u8], public_addr: SocketAddr) -> Result<Option<Vec<u8>>, ()> {
+    if packet.len() < 20 {
+        return Ok(None);
+    }
+    let msg_type = u16::from_be_bytes([packet[0], packet[1]]);
+    // Binding request
+    if msg_type != 0x0001 {
+        return Ok(None);
+    }
+    let length = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if packet.len() < 20 + length {
+        return Err(());
+    }
+    if &packet[4..8] != STUN_MAGIC_COOKIE {
+        return Err(());
+    }
+    let txid = &packet[8..20];
+    let mut response = Vec::with_capacity(64);
+    response.extend_from_slice(&0x0101u16.to_be_bytes());
+    response.extend_from_slice(&[0, 0]);
+    response.extend_from_slice(&STUN_MAGIC_COOKIE);
+    response.extend_from_slice(txid);
+
+    let mut xor_value = Vec::new();
+    xor_value.push(0);
+    match public_addr {
+        SocketAddr::V4(addr) => {
+            xor_value.push(0x01);
+            let xport =
+                addr.port() ^ u16::from_be_bytes([STUN_MAGIC_COOKIE[0], STUN_MAGIC_COOKIE[1]]);
+            xor_value.extend_from_slice(&xport.to_be_bytes());
+            let ip = addr.ip().octets();
+            for (octet, mask) in ip.iter().zip(STUN_MAGIC_COOKIE.iter()) {
+                xor_value.push(octet ^ mask);
+            }
+        }
+        SocketAddr::V6(addr) => {
+            xor_value.push(0x02);
+            let xport =
+                addr.port() ^ u16::from_be_bytes([STUN_MAGIC_COOKIE[0], STUN_MAGIC_COOKIE[1]]);
+            xor_value.extend_from_slice(&xport.to_be_bytes());
+            let ip = addr.ip().octets();
+            let mut mask = [0u8; 16];
+            mask[..4].copy_from_slice(&STUN_MAGIC_COOKIE);
+            mask[4..].copy_from_slice(txid);
+            for (octet, mask_byte) in ip.iter().zip(mask.iter()) {
+                xor_value.push(octet ^ mask_byte);
+            }
+        }
+    }
+    append_attribute(&mut response, 0x0020, &xor_value);
+
+    let tie_breaker = blake3_hash(public_addr.to_string().as_bytes());
+    append_attribute(&mut response, 0x8029, &tie_breaker.as_bytes()[..8]);
+    append_attribute(&mut response, 0x8022, ICE_SOFTWARE.as_bytes());
+
+    let attr_len = (response.len() - 20) as u16;
+    response[2] = (attr_len >> 8) as u8;
+    response[3] = attr_len as u8;
+    Ok(Some(response))
+}
+
+fn append_attribute(message: &mut Vec<u8>, ty: u16, value: &[u8]) {
+    message.extend_from_slice(&ty.to_be_bytes());
+    message.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    message.extend_from_slice(value);
+    while message.len() % 4 != 0 {
+        message.push(0);
+    }
+}
+
+fn foundation_for_ip(ip: IpAddr) -> String {
+    let bytes = match ip {
+        IpAddr::V4(addr) => addr.octets().to_vec(),
+        IpAddr::V6(addr) => addr.octets().to_vec(),
+    };
+    let hash = blake3_hash(&bytes);
+    hash.as_bytes()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{:02x}", byte))
+        .collect()
+}
+
+fn host_candidate_priority(component: u8) -> u32 {
+    let type_preference = 126u32;
+    let local_preference = 65_535u32;
+    let component_preference = 256u32 - u32::from(component);
+    (type_preference << 24) | (local_preference << 8) | component_preference
+}
+
+fn build_lite_candidate(addr: SocketAddr) -> IceCandidateAdvice {
+    let foundation = foundation_for_ip(addr.ip());
+    let component = 1;
+    let priority = host_candidate_priority(component);
+    let candidate = format!(
+        "candidate:{} {} udp {} {} {} typ host generation 0",
+        foundation,
+        component,
+        priority,
+        addr.ip(),
+        addr.port()
+    );
+    IceCandidateAdvice {
+        candidate,
+        component,
+        protocol: "udp".to_string(),
+        foundation,
+        priority,
+        ip: addr.ip().to_string(),
+        port: addr.port(),
+        typ: "host".to_string(),
+    }
+}
+
+fn generate_turn_credentials(
+    auth: &TurnAuth,
+    username_fragment: &str,
+    ttl: StdDuration,
+) -> (String, String, u32, Option<String>) {
+    match auth {
+        TurnAuth::Static {
+            username,
+            credential,
+        } => (username.clone(), credential.clone(), 0, None),
+        TurnAuth::Secret { secret } => {
+            let mut ttl_secs = ttl.as_secs();
+            if ttl_secs < 60 {
+                ttl_secs = 60;
+            }
+            if ttl_secs > u32::MAX as u64 {
+                ttl_secs = u32::MAX as u64;
+            }
+            let ttl_secs_u32 = ttl_secs as u32;
+            let expires = Utc::now().timestamp() + ttl_secs as i64;
+            let username = format!("{}:{}", expires, username_fragment);
+            let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("hmac key");
+            mac.update(username.as_bytes());
+            let credential = Base64.encode(mac.finalize().into_bytes());
+            let expires_at = (Utc::now() + ChronoDuration::seconds(ttl_secs as i64)).to_rfc3339();
+            (username, credential, ttl_secs_u32, Some(expires_at))
+        }
+    }
 }
 
 pub(super) async fn handle_assist(
@@ -524,11 +824,33 @@ fn build_ice_advice(state: &AppState) -> IceAdvice {
     let ttl_secs = state.config.pairing_ttl_seconds.clamp(60, 3_600) as u32;
     let keepalive = state.config.connection_keepalive.clamp(5, 120);
     let keepalive_interval_secs = u16::try_from(keepalive).unwrap_or(30);
+    let mut servers = Vec::new();
+    for server in &state.ice.turn {
+        let (username, credential, ttl, expires_at) =
+            generate_turn_credentials(&server.auth, &username_fragment, state.ice.credential_ttl);
+        servers.push(IceServerAdvice {
+            urls: server.urls.clone(),
+            username,
+            credential,
+            ttl_secs: ttl,
+            expires_at,
+            realm: server.realm.clone(),
+        });
+    }
+    let lite_candidates = state
+        .ice
+        .lite
+        .as_ref()
+        .map(|lite| build_lite_candidate(lite.public_addr))
+        .into_iter()
+        .collect();
     IceAdvice {
         username_fragment,
         password,
         ttl_secs,
         keepalive_interval_secs,
         trickle: true,
+        servers,
+        lite_candidates,
     }
 }

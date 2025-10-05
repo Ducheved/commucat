@@ -12,6 +12,8 @@ pub struct Metrics {
     fec_packets: AtomicU64,
     multipath_sessions: AtomicU64,
     multipath_paths_total: AtomicU64,
+    ice_binding_requests: AtomicU64,
+    ice_binding_failures: AtomicU64,
     censorship_deflections: AtomicU64,
     call_sessions_active: AtomicU64,
     call_sessions_total: AtomicU64,
@@ -62,6 +64,15 @@ impl Metrics {
 
     pub fn mark_pq_handshake(&self) {
         self.pq_handshakes.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn mark_ice_binding_success(&self) {
+        self.ice_binding_requests.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn mark_ice_binding_failure(&self) {
+        self.ice_binding_requests.fetch_add(1, Ordering::SeqCst);
+        self.ice_binding_failures.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn mark_fec_packets(&self, packets: u64) {
@@ -173,7 +184,7 @@ impl Metrics {
 
     pub fn encode_prometheus(&self) -> String {
         format!(
-            "# TYPE commucat_connections_active gauge\ncommucat_connections_active {}\n# TYPE commucat_frames_ingress counter\ncommucat_frames_ingress {}\n# TYPE commucat_frames_egress counter\ncommucat_frames_egress {}\n# TYPE commucat_relay_enqueued counter\ncommucat_relay_enqueued {}\n# TYPE commucat_security_noise counter\ncommucat_security_noise {}\n# TYPE commucat_security_pq counter\ncommucat_security_pq {}\n# TYPE commucat_security_fec counter\ncommucat_security_fec_packets {}\n# TYPE commucat_multipath_sessions counter\ncommucat_multipath_sessions {}\n# TYPE commucat_multipath_paths gauge\ncommucat_multipath_paths {}\n# TYPE commucat_censorship_deflections counter\ncommucat_censorship_deflections {}\n# TYPE commucat_calls_active gauge\ncommucat_calls_active {}\n# TYPE commucat_calls_total counter\ncommucat_calls_total {}\n# TYPE commucat_call_voice_frames counter\ncommucat_call_voice_frames {}\n# TYPE commucat_call_video_frames counter\ncommucat_call_video_frames {}\n# TYPE commucat_transport_candidates counter\ncommucat_transport_candidates {}\n# TYPE commucat_transport_pairs counter\ncommucat_transport_pairs {}\n# TYPE commucat_transport_keepalive counter\ncommucat_transport_keepalive {}\n# TYPE commucat_federation_outbox_enqueued counter\ncommucat_federation_outbox_enqueued {}\n# TYPE commucat_federation_outbox_delivered counter\ncommucat_federation_outbox_delivered {}\n# TYPE commucat_federation_inbound_processed counter\ncommucat_federation_inbound_processed {}\n# TYPE commucat_federation_inbound_rejected counter\ncommucat_federation_inbound_rejected {}\n# TYPE commucat_rate_limit_http counter\ncommucat_rate_limit_http {}\n# TYPE commucat_rate_limit_connect counter\ncommucat_rate_limit_connect {}\n# TYPE commucat_secret_rotations_noise counter\ncommucat_secret_rotations_noise {}\n# TYPE commucat_secret_rotations_admin counter\ncommucat_secret_rotations_admin {}\n# TYPE commucat_device_rotations counter\ncommucat_device_rotations {}\n",
+            "# TYPE commucat_connections_active gauge\ncommucat_connections_active {}\n# TYPE commucat_frames_ingress counter\ncommucat_frames_ingress {}\n# TYPE commucat_frames_egress counter\ncommucat_frames_egress {}\n# TYPE commucat_relay_enqueued counter\ncommucat_relay_enqueued {}\n# TYPE commucat_security_noise counter\ncommucat_security_noise {}\n# TYPE commucat_security_pq counter\ncommucat_security_pq {}\n# TYPE commucat_security_fec counter\ncommucat_security_fec_packets {}\n# TYPE commucat_multipath_sessions counter\ncommucat_multipath_sessions {}\n# TYPE commucat_multipath_paths gauge\ncommucat_multipath_paths {}\n# TYPE commucat_ice_binding_requests counter\ncommucat_ice_binding_requests {}\n# TYPE commucat_ice_binding_failures counter\ncommucat_ice_binding_failures {}\n# TYPE commucat_censorship_deflections counter\ncommucat_censorship_deflections {}\n# TYPE commucat_calls_active gauge\ncommucat_calls_active {}\n# TYPE commucat_calls_total counter\ncommucat_calls_total {}\n# TYPE commucat_call_voice_frames counter\ncommucat_call_voice_frames {}\n# TYPE commucat_call_video_frames counter\ncommucat_call_video_frames {}\n# TYPE commucat_transport_candidates counter\ncommucat_transport_candidates {}\n# TYPE commucat_transport_pairs counter\ncommucat_transport_pairs {}\n# TYPE commucat_transport_keepalive counter\ncommucat_transport_keepalive {}\n# TYPE commucat_federation_outbox_enqueued counter\ncommucat_federation_outbox_enqueued {}\n# TYPE commucat_federation_outbox_delivered counter\ncommucat_federation_outbox_delivered {}\n# TYPE commucat_federation_inbound_processed counter\ncommucat_federation_inbound_processed {}\n# TYPE commucat_federation_inbound_rejected counter\ncommucat_federation_inbound_rejected {}\n# TYPE commucat_rate_limit_http counter\ncommucat_rate_limit_http {}\n# TYPE commucat_rate_limit_connect counter\ncommucat_rate_limit_connect {}\n# TYPE commucat_secret_rotations_noise counter\ncommucat_secret_rotations_noise {}\n# TYPE commucat_secret_rotations_admin counter\ncommucat_secret_rotations_admin {}\n# TYPE commucat_device_rotations counter\ncommucat_device_rotations {}\n",
             self.connections_active.load(Ordering::SeqCst),
             self.frames_ingress.load(Ordering::SeqCst),
             self.frames_egress.load(Ordering::SeqCst),
@@ -183,6 +194,8 @@ impl Metrics {
             self.fec_packets.load(Ordering::SeqCst),
             self.multipath_sessions.load(Ordering::SeqCst),
             self.multipath_paths_total.load(Ordering::SeqCst),
+            self.ice_binding_requests.load(Ordering::SeqCst),
+            self.ice_binding_failures.load(Ordering::SeqCst),
             self.censorship_deflections.load(Ordering::SeqCst),
             self.call_sessions_active.load(Ordering::SeqCst),
             self.call_sessions_total.load(Ordering::SeqCst),

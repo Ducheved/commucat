@@ -1,10 +1,11 @@
 use crate::util::{decode_hex, decode_hex32};
 use commucat_crypto::DeviceKeyPair;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration as StdDuration;
 
@@ -103,6 +104,28 @@ pub struct DeviceRotationConfig {
     pub notify_channel: u64,
 }
 
+#[derive(Clone, Debug)]
+pub struct IceConfig {
+    pub lite_enabled: bool,
+    pub lite_bind: Option<SocketAddr>,
+    pub lite_public_address: Option<SocketAddr>,
+    pub turn_ttl: StdDuration,
+    pub turn_servers: Vec<TurnServerConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TurnServerConfig {
+    pub urls: Vec<String>,
+    pub auth: TurnAuthConfig,
+    pub realm: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum TurnAuthConfig {
+    Static { username: String, password: String },
+    Secret { secret: String },
+}
+
 #[derive(Clone)]
 pub struct ServerConfig {
     pub bind: String,
@@ -127,6 +150,7 @@ pub struct ServerConfig {
     pub rate_limit: RateLimitConfig,
     pub rotation: SecretRotationConfig,
     pub device_rotation: DeviceRotationConfig,
+    pub ice: IceConfig,
     pub transport: TransportConfig,
     pub uploads_dir: String,
     pub uploads_base_url: String,
@@ -285,6 +309,105 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         _ => return Err(ConfigError::Invalid),
     };
     let transport = TransportConfig { reality };
+
+    let lite_enabled = override_env("COMMUCAT_ICE_LITE_ENABLED", map.remove("ice.lite_enabled"))?
+        .unwrap_or_else(|| "false".to_string())
+        .parse::<bool>()
+        .map_err(|_| ConfigError::Invalid)?;
+    let lite_bind_raw = override_env("COMMUCAT_ICE_LITE_BIND", map.remove("ice.lite_bind"))?;
+    let lite_public_raw = override_env(
+        "COMMUCAT_ICE_LITE_PUBLIC_ADDRESS",
+        map.remove("ice.lite_public_address"),
+    )?;
+    let mut lite_bind = match lite_bind_raw {
+        Some(value) => Some(
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| ConfigError::Invalid)?,
+        ),
+        None => None,
+    };
+    let lite_public_address = match lite_public_raw {
+        Some(value) => Some(
+            value
+                .parse::<SocketAddr>()
+                .map_err(|_| ConfigError::Invalid)?,
+        ),
+        None => None,
+    };
+    if lite_enabled && lite_bind.is_none() {
+        lite_bind = Some("0.0.0.0:3478".parse().map_err(|_| ConfigError::Invalid)?);
+    }
+    let turn_ttl_secs = override_env("COMMUCAT_ICE_TURN_TTL", map.remove("ice.turn_ttl"))?
+        .unwrap_or_else(|| "600".to_string())
+        .parse::<u64>()
+        .map_err(|_| ConfigError::Invalid)?;
+    if turn_ttl_secs == 0 {
+        return Err(ConfigError::Invalid);
+    }
+
+    let mut turn_blocks: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
+    let turn_keys: Vec<String> = map.keys().cloned().collect();
+    for key in turn_keys {
+        if let Some(rest) = key.strip_prefix("ice.turn.") {
+            let value = map.remove(&key).unwrap();
+            let (entry_key, prop) = rest.split_once('.').ok_or(ConfigError::Invalid)?;
+            turn_blocks
+                .entry(entry_key.to_string())
+                .or_default()
+                .insert(prop.to_string(), value);
+        }
+    }
+    let mut turn_servers = Vec::new();
+    for (_name, props) in turn_blocks.into_iter() {
+        let urls_raw = props.get("urls").ok_or(ConfigError::Invalid)?;
+        let urls: Vec<String> = urls_raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if urls.is_empty() {
+            return Err(ConfigError::Invalid);
+        }
+        let secret = props
+            .get("secret")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let username = props
+            .get("username")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let password = props
+            .get("password")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let realm = props
+            .get("realm")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if secret.is_some() && (username.is_some() || password.is_some()) {
+            return Err(ConfigError::Invalid);
+        }
+        let auth = if let Some(secret) = secret {
+            TurnAuthConfig::Secret { secret }
+        } else {
+            let user = username.ok_or(ConfigError::Invalid)?;
+            let pass = password.ok_or(ConfigError::Invalid)?;
+            TurnAuthConfig::Static {
+                username: user,
+                password: pass,
+            }
+        };
+        turn_servers.push(TurnServerConfig { urls, auth, realm });
+    }
+
+    let ice = IceConfig {
+        lite_enabled,
+        lite_bind,
+        lite_public_address,
+        turn_ttl: StdDuration::from_secs(turn_ttl_secs),
+        turn_servers,
+    };
 
     let rate_http_burst = parse_u32_field(
         override_env(
@@ -526,6 +649,7 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         rate_limit,
         rotation,
         device_rotation,
+        ice,
         transport,
         uploads_dir,
         uploads_base_url,

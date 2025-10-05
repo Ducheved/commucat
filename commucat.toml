@@ -100,6 +100,29 @@ proof_ttl = 600
 # CCP channel used for KeyUpdate notifications
 notify_channel = 0
 
+[ice]
+# Enable built-in ICE-lite responder (STUN binding)
+lite_enabled = true
+# UDP socket where ICE-lite listens (0.0.0.0 allows both IPv4/IPv6)
+lite_bind = "0.0.0.0:3478"
+# Public address advertised to clients (set to your external IP)
+lite_public_address = "198.51.100.10:3478"
+# TTL for generated TURN credentials (seconds)
+turn_ttl = 600
+
+[ice.turn.1]
+# Comma-separated list of TURN URLs (udp/tcp, turn/turns)
+urls = "turn:turn.example.org:3478?transport=udp,turns:turn.example.org:5349?transport=tcp"
+# Shared secret for HMAC-based temporary credentials (coturn format)
+secret = "replace-with-shared-secret"
+realm = "commucat"
+
+[ice.turn.2]
+# Static credentials for fallback TURN service
+urls = "turn:backup.example.org:3478?transport=udp"
+username = "static-user"
+password = "static-password"
+
 [admin]
 # Optional bearer token for /api/security-stats and /metrics
 token = "replace-with-secret"

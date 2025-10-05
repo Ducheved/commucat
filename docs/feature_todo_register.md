@@ -48,7 +48,7 @@
 | F032 | Security       | CLI для ротации админ-токена                                          | 1.2                   | Запланировано   | docs/todo.md                 |
 | F033 | Медиа          | Адаптивный битрейт, simulcast/FEC                                     | 1.4                   | Запланировано   | docs/todo.md                 |
 | F034 | Mesh           | QUIC/multipath relay прототип                                         | 1.4                   | Запланировано   | docs/todo.md                 |
-| F035 | P2P            | TURN/ICE-lite интеграция, NAT traversal                               | 1.4                   | Запланировано   | dev_todo_tracker T8          |
+| F035 | P2P            | TURN/ICE-lite интеграция, NAT traversal                               | 1.4                   | Готово          | ICE-lite UDP + HMAC TURN creds (см. T8) |
 | F036 | Mesh           | Offline синхронизация (Wi-Fi Direct/BLE)                              | 2.0                   | Исследование    | ROADMAP §3.3                 |
 | F037 | Медиа          | AV1/H.264 поддержка (софт/GPU)                                        | 2.0                   | Запланировано   | ROADMAP §3.2                 |
 | F038 | Медиа          | Распределённый SFU                                                    | 2.0                   | Запланировано   | ROADMAP §3.2                 |

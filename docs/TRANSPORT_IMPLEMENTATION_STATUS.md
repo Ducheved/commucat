@@ -2,11 +2,12 @@
 
 ## Overview
 
-CommuCat ships a pluggable transport layer that can dynamically select the most suitable transport per connection. As of this iteration we have moved beyond pure scaffolding in two critical areas:
+CommuCat ships a pluggable transport layer that can dynamically select the most suitable transport per connection. As of this iteration we have moved beyond pure scaffolding in three critical areas:
 
 - **WebSocket transport** performs a real handshake against the P2P ingress endpoint and exposes an `AsyncRead + AsyncWrite` adapter backed by `tokio_tungstenite`.
 - **Reality transport** performs active reachability probing (TCP connect with fingerprint validation) before exposing the transport.
 - **TransportManager** now performs lightweight RTT/loss/bandwidth estimation by probing the intended endpoint with bounded TCP dials before ranking transports.
+- **ICE-lite/TURN services** expose a built-in STUN listener and coturn-compatible TURN credentials so clients can bootstrap NAT traversal immediately from the assist response.
 
 Forward error correction (RaptorQ) and multipath scheduling remain production ready; additional transports continue to reuse those facilities once they gain real I/O implementations.
 
@@ -37,6 +38,14 @@ Forward error correction (RaptorQ) and multipath scheduling remain production re
 - Establishes temporary multipath tunnels using live transports (respecting min path count).
 - Runs an FEC sample over the resulting paths, verifies recovery with `RaptorqDecoder`, and records segment mix per path.
 - Returns actual transport profiles (resistance/performance tiers) and the primary path ID, along with `SampleBreakdown` statistics derived from the encoded segments.
+
+### ICE-lite & TURN Integration
+- `build_ice_runtime` seeds TURN configuration and spawns an ICE-lite UDP listener when enabled (`ice.lite_*` in config).
+- `build_ice_advice` now surfaces:
+  - Coturn-compatible TURN credentials (HMAC-SHA1) when a server entry defines `secret`.
+  - Static TURN credentials for entries with explicit `username`/`password`.
+  - Server-advertised ICE-lite host candidate so WebRTC clients can connect without extra STUN round-trips.
+- `Metrics` expose `commucat_ice_binding_requests` / `commucat_ice_binding_failures` to observe STUN volume.
 
 ## 🚧 Remaining Scaffolding
 

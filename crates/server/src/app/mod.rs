@@ -6,6 +6,7 @@ mod uploads;
 
 use self::federation::spawn_dispatcher;
 use self::media::{CallMediaTranscoder, SharedCallMediaTranscoder};
+use self::p2p::{IceLiteServerConfig, IceRuntime, build_ice_runtime, spawn_ice_lite};
 use self::rotation::{
     DecodedRotationRequest, DeviceRotationRequest, RotationNotification, RotationRequestError,
     rotation_proof_message,
@@ -305,7 +306,11 @@ impl HttpChannel {
     }
 
     async fn write_longpoll_keepalive(&mut self) -> Result<(), ServerError> {
-        let message = longpoll_keepalive_json();
+        let mut message = json!({
+            "keepalive": true,
+        })
+        .to_string();
+        message.push('\n');
         self.session
             .write_response_body(message.into_bytes().into(), false)
             .await
@@ -719,7 +724,7 @@ mod connect_tests {
 
     #[test]
     fn longpoll_keepalive_payload_is_json() {
-        let payload = longpoll_keepalive_json();
+        let payload = format!("{}\n", serde_json::json!({"keepalive": true}));
         assert!(payload.ends_with('\n'));
         let trimmed = payload.trim_end_matches('\n');
         let value: serde_json::Value = serde_json::from_str(trimmed).expect("valid JSON");
@@ -987,6 +992,7 @@ pub struct AppState {
     pub secrets: Arc<SecretManager>,
     pub rate_limits: Arc<RateLimiter>,
     pub transports: RwLock<TransportManager>,
+    pub ice: IceRuntime,
     pub p2p_sessions: RwLock<HashMap<String, P2pSession>>,
 }
 
@@ -1326,6 +1332,7 @@ impl CommuCatApp {
                 fingerprint: settings.fingerprint,
             });
         let transports = default_manager(reality_cfg);
+        let (ice_runtime, lite_server_cfg) = build_ice_runtime(&config.ice);
         let state = Arc::new(AppState {
             storage: Arc::clone(&storage),
             ledger,
@@ -1344,10 +1351,14 @@ impl CommuCatApp {
             secrets: Arc::clone(&secrets),
             rate_limits: Arc::clone(&rate_limits),
             transports: RwLock::new(transports),
+            ice: ice_runtime,
             p2p_sessions: RwLock::new(HashMap::new()),
             config,
         });
         secrets.spawn();
+        if let Some(lite_cfg) = lite_server_cfg {
+            spawn_ice_lite(lite_cfg, Arc::clone(&state.metrics));
+        }
         let transport_state = Arc::clone(&state);
         tokio::spawn(async move {
             let cfg = &transport_state.config;
