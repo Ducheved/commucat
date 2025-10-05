@@ -321,13 +321,17 @@ impl MultipathEndpoint {
 
 #[derive(Debug, Clone)]
 pub struct MultipathPathInfo {
+    #[allow(dead_code)]
     pub id: String,
     pub transport: TransportType,
+    #[allow(dead_code)]
     pub resistance: ResistanceLevel,
+    #[allow(dead_code)]
     pub performance: PerformanceProfile,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MultipathSegment {
     pub path_id: String,
     #[allow(dead_code)]
@@ -336,6 +340,7 @@ pub struct MultipathSegment {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MultipathDispatch {
     #[allow(dead_code)]
     pub oti: ObjectTransmissionInformation,
@@ -345,16 +350,19 @@ pub struct MultipathDispatch {
 #[derive(Debug)]
 struct PathSession {
     descriptor: MultipathEndpoint,
+    #[allow(dead_code)]
     session: TransportSession,
 }
 
 #[derive(Debug)]
 pub struct MultipathTunnel {
+    #[allow(dead_code)]
     fec: FecProfile,
     paths: Vec<PathSession>,
 }
 
 impl MultipathTunnel {
+    #[allow(dead_code)]
     fn new(fec: FecProfile, paths: Vec<PathSession>) -> Self {
         Self { fec, paths }
     }
@@ -364,6 +372,7 @@ impl MultipathTunnel {
         self.paths.len()
     }
 
+    #[allow(dead_code)]
     pub fn path_info(&self) -> Vec<MultipathPathInfo> {
         self.paths
             .iter()
@@ -376,6 +385,7 @@ impl MultipathTunnel {
             .collect()
     }
 
+    #[allow(dead_code)]
     pub fn encode_frame(&self, payload: &[u8]) -> MultipathDispatch {
         let encoder = RaptorqEncoder::new(self.fec.clone());
         let batch = encoder.encode(payload);
@@ -588,6 +598,7 @@ impl TransportManager {
         Err(TransportError::Exhausted)
     }
 
+    #[allow(dead_code)]
     pub async fn establish_multipath(
         &mut self,
         endpoints: &[MultipathEndpoint],

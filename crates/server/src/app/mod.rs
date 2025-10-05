@@ -845,6 +845,34 @@ fn user_snapshot(profile: &UserProfile) -> serde_json::Value {
     })
 }
 
+// P2P relay session for connecting two peers
+pub(crate) struct P2pSession {
+    #[allow(dead_code)]
+    session_id: String,
+    peer_a: Option<mpsc::Sender<Vec<u8>>>,
+    peer_b: Option<mpsc::Sender<Vec<u8>>>,
+    created_at: std::time::Instant,
+}
+
+impl P2pSession {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            peer_a: None,
+            peer_b: None,
+            created_at: std::time::Instant::now(),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.peer_a.is_some() && self.peer_b.is_some()
+    }
+
+    fn is_expired(&self, timeout_secs: u64) -> bool {
+        self.created_at.elapsed().as_secs() > timeout_secs
+    }
+}
+
 pub struct AppState {
     pub config: ServerConfig,
     pub storage: Arc<Storage>,
@@ -864,6 +892,7 @@ pub struct AppState {
     pub secrets: Arc<SecretManager>,
     pub rate_limits: Arc<RateLimiter>,
     pub transports: RwLock<TransportManager>,
+    pub p2p_sessions: RwLock<HashMap<String, P2pSession>>,
 }
 
 pub struct ConnectionEntry {
@@ -1224,6 +1253,7 @@ impl CommuCatApp {
             secrets: Arc::clone(&secrets),
             rate_limits: Arc::clone(&rate_limits),
             transports: RwLock::new(transports),
+            p2p_sessions: RwLock::new(HashMap::new()),
             config,
         });
         secrets.spawn();
@@ -4087,7 +4117,7 @@ impl CommuCatApp {
         self.state.metrics.mark_ingress();
 
         // Extract the WebSocket stream
-        let ws_channel = match channel {
+        let mut ws_channel = match channel {
             ConnectChannel::WebSocket(ws) => ws,
             _ => {
                 error!("Expected WebSocket channel");
@@ -4095,42 +4125,209 @@ impl CommuCatApp {
             }
         };
 
-        // TODO: Implement P2P relay logic
-        // For now, just keep connection open and echo back messages
+        // Wait for first message to get session_id
         use tokio::time::{Duration, timeout};
 
-        info!("P2P relay session started");
-        let mut ws = ws_channel;
-
-        // Simple echo server for testing
-        loop {
-            match timeout(Duration::from_secs(60), ws.read_chunk()).await {
-                Ok(Ok(Some(data))) => {
-                    info!(size = data.len(), "P2P data received, echoing back");
-                    if let Err(err) = ws.write_payload(data).await {
-                        error!(error = %err, "Failed to send P2P data");
-                        break;
+        let session_id = match timeout(Duration::from_secs(10), ws_channel.read_chunk()).await {
+            Ok(Ok(Some(data))) => match String::from_utf8(data) {
+                Ok(id) => {
+                    let trimmed = id.trim();
+                    if trimmed.is_empty() {
+                        error!("Empty session_id received");
+                        return None;
                     }
-                }
-                Ok(Ok(None)) => {
-                    info!("P2P connection closed by client");
-                    break;
-                }
-                Ok(Err(err)) => {
-                    error!(error = %err, "P2P read error");
-                    break;
+                    trimmed.to_string()
                 }
                 Err(_) => {
-                    debug!("P2P connection idle timeout");
-                    break;
+                    error!("Invalid UTF-8 in session_id");
+                    return None;
+                }
+            },
+            Ok(Ok(None)) => {
+                info!("Client closed connection before sending session_id");
+                return None;
+            }
+            Ok(Err(err)) => {
+                error!(error = %err, "Failed to read session_id");
+                return None;
+            }
+            Err(_) => {
+                error!("Timeout waiting for session_id");
+                return None;
+            }
+        };
+
+        info!(session_id = %session_id, "P2P session_id received");
+
+        // Create mpsc channels for this peer
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
+
+        // Lock p2p_sessions and find or create session
+        let (peer_tx, is_first_peer) = {
+            let mut sessions = self.state.p2p_sessions.write().await;
+
+            // Clean up expired sessions (older than 2 minutes)
+            sessions.retain(|_, session| !session.is_expired(120));
+
+            match sessions.entry(session_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let session = entry.get_mut();
+
+                    if session.peer_a.is_none() {
+                        // First peer
+                        session.peer_a = Some(tx);
+                        (None, true)
+                    } else if session.peer_b.is_none() {
+                        // Second peer - get first peer's tx
+                        let peer_tx = session.peer_a.clone();
+                        session.peer_b = Some(tx);
+                        info!(session_id = %session_id, "Both peers connected, starting relay");
+                        (peer_tx, false)
+                    } else {
+                        // Session already complete
+                        error!(session_id = %session_id, "Session already has two peers");
+                        return None;
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    // Create new session with this as first peer
+                    let mut new_session = P2pSession::new(session_id.clone());
+                    new_session.peer_a = Some(tx);
+                    entry.insert(new_session);
+                    info!(session_id = %session_id, "New P2P session created, waiting for second peer");
+                    (None, true)
+                }
+            }
+        };
+
+        // Send confirmation message
+        if let Err(err) = ws_channel.write_payload(b"OK".to_vec()).await {
+            error!(error = %err, "Failed to send OK confirmation");
+            return None;
+        }
+
+        if is_first_peer {
+            // First peer: wait for second peer to connect
+            info!(session_id = %session_id, "First peer connected, waiting...");
+
+            // Wait up to 30 seconds for second peer
+            let wait_result = timeout(Duration::from_secs(30), async {
+                // Poll until session is complete or timeout
+                loop {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    let sessions = self.state.p2p_sessions.read().await;
+                    if let Some(session) = sessions.get(&session_id) {
+                        if session.is_complete() {
+                            return true;
+                        }
+                    } else {
+                        return false; // Session removed
+                    }
+                }
+            })
+            .await;
+
+            match wait_result {
+                Ok(true) => {
+                    info!(session_id = %session_id, "Second peer joined, starting relay");
+                }
+                Ok(false) => {
+                    error!(session_id = %session_id, "Session was removed while waiting");
+                    return None;
+                }
+                Err(_) => {
+                    error!(session_id = %session_id, "Timeout waiting for second peer");
+                    // Clean up session
+                    let mut sessions = self.state.p2p_sessions.write().await;
+                    sessions.remove(&session_id);
+                    return None;
+                }
+            }
+        }
+
+        // Both peers connected - start bidirectional relay
+        info!(session_id = %session_id, "Starting bidirectional P2P relay");
+
+        // Get peer's tx for relaying in opposite direction
+        let peer_tx = if let Some(tx) = peer_tx {
+            tx
+        } else {
+            // We're first peer, need to get second peer's tx
+            let sessions = self.state.p2p_sessions.read().await;
+            if let Some(session) = sessions.get(&session_id) {
+                if let Some(tx) = &session.peer_b {
+                    tx.clone()
+                } else {
+                    error!(session_id = %session_id, "Second peer tx not found");
+                    return None;
+                }
+            } else {
+                error!(session_id = %session_id, "Session disappeared");
+                return None;
+            }
+        };
+
+        // Start bidirectional relay using tokio::select!
+        self.relay_p2p_bidirectional(session_id, ws_channel, peer_tx, rx)
+            .await;
+
+        None
+    }
+
+    async fn relay_p2p_bidirectional(
+        &self,
+        session_id: String,
+        mut ws: WebSocketChannel,
+        peer_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        mut peer_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        use tokio::time::{Duration, timeout};
+
+        info!(session_id = %session_id, "Bidirectional relay active");
+
+        loop {
+            tokio::select! {
+                // Read from WebSocket, send to peer
+                result = timeout(Duration::from_secs(60), ws.read_chunk()) => {
+                    match result {
+                        Ok(Ok(Some(data))) => {
+                            if peer_tx.send(data).await.is_err() {
+                                info!(session_id = %session_id, "Peer disconnected (send failed)");
+                                break;
+                            }
+                        }
+                        Ok(Ok(None)) => {
+                            info!(session_id = %session_id, "Client closed connection");
+                            break;
+                        }
+                        Ok(Err(err)) => {
+                            error!(session_id = %session_id, error = %err, "WebSocket read error");
+                            break;
+                        }
+                        Err(_) => {
+                            debug!(session_id = %session_id, "Read timeout");
+                            continue; // Just continue, don't break on timeout
+                        }
+                    }
+                }
+
+                // Receive from peer, write to WebSocket
+                Some(data) = peer_rx.recv() => {
+                    if let Err(err) = ws.write_payload(data).await {
+                        error!(session_id = %session_id, error = %err, "WebSocket write error");
+                        break;
+                    }
                 }
             }
         }
 
         let _ = ws.finish().await;
-        info!("P2P WebSocket session terminated");
+
+        // Clean up session
+        let mut sessions = self.state.p2p_sessions.write().await;
+        sessions.remove(&session_id);
+        info!(session_id = %session_id, "P2P relay session cleaned up");
         self.state.metrics.mark_egress();
-        None
     }
 
     async fn process_connect(

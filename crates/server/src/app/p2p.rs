@@ -132,7 +132,7 @@ pub(super) async fn handle_assist(
         })
         .unwrap_or_else(crate::transport::FecProfile::default_low_latency);
 
-    let min_paths = request.min_paths.unwrap_or(2);
+    let _min_paths = request.min_paths.unwrap_or(2);
     let mut endpoints = Vec::new();
     if request.paths.is_empty() {
         endpoints.extend(default_paths(
@@ -149,73 +149,46 @@ pub(super) async fn handle_assist(
         return Err(ApiError::BadRequest("no paths provided".to_string()));
     }
 
-    // Save FEC parameters before moving fec_profile
+    // Save FEC parameters
     let fec_mtu = fec_profile.mtu;
     let fec_overhead = fec_profile.repair_overhead;
 
-    // Try to establish multipath connection with real WebSocket transport!
-    let multipath_result = state
-        .transports
-        .write()
-        .await
-        .establish_multipath(&endpoints, min_paths, fec_profile)
-        .await;
+    // Build transport advice from available endpoints
+    // NOTE: Server does NOT establish connections - that's the CLIENT's job!
+    // We just provide advice about which transports to use
+    let transports_advice: Vec<TransportAdvice> = endpoints
+        .iter()
+        .map(|ep| {
+            // Determine transport type from endpoint
+            let transport = if ep.endpoint.reality.is_some() {
+                "Reality"
+            } else {
+                "WebSocket" // Default
+            };
 
-    let (transports_advice, sample_segments, paths_info) = match multipath_result {
-        Ok(tunnel) => {
-            // Success! Got real connections
-            let paths_info = tunnel.path_info();
-            let transports: Vec<_> = paths_info
-                .iter()
-                .map(|info| TransportAdvice {
-                    path_id: info.id.clone(),
-                    transport: format!("{:?}", info.transport),
-                    resistance: format!("{:?}", info.resistance),
-                    latency: format!("{:?}", info.performance.latency),
-                    throughput: format!("{:?}", info.performance.throughput),
-                })
-                .collect();
-
-            let dispatch = tunnel.encode_frame(b"sample");
-            let mut segments = HashMap::new();
-            for segment in &dispatch.segments {
-                segments
-                    .entry(segment.path_id.clone())
-                    .or_insert_with(SampleBreakdown::default)
-                    .total += 1;
-                if segment.repair {
-                    segments.get_mut(&segment.path_id).unwrap().repair += 1;
-                }
-            }
-
-            (transports, segments, paths_info)
-        }
-        Err(e) => {
-            // Fallback: если не удалось установить соединение, возвращаем базовую информацию
-            warn!(error = ?e, "Failed to establish multipath, returning basic info");
-
-            let transports = vec![TransportAdvice {
-                path_id: "primary".to_string(),
-                transport: "WebSocket".to_string(),
+            TransportAdvice {
+                path_id: ep.id.clone(),
+                transport: transport.to_string(),
                 resistance: "Basic".to_string(),
                 latency: "Medium".to_string(),
-                throughput: "Medium".to_string(),
-            }];
+                throughput: "High".to_string(),
+            }
+        })
+        .collect();
 
-            let mut segments = HashMap::new();
-            segments.insert(
-                "primary".to_string(),
-                SampleBreakdown {
-                    total: 10,
-                    repair: 3,
-                },
-            );
+    // Build sample FEC segments for client guidance
+    let mut sample_segments = HashMap::new();
+    for (idx, ep) in endpoints.iter().enumerate() {
+        sample_segments.insert(
+            ep.id.clone(),
+            SampleBreakdown {
+                total: 10,
+                repair: if idx == 0 { 3 } else { 2 }, // Primary path gets more repair packets
+            },
+        );
+    }
 
-            (transports, segments, Vec::new())
-        }
-    };
-
-    let obfuscation = build_obfuscation_advice(&paths_info, &endpoints);
+    let obfuscation = build_obfuscation_advice(&[], &endpoints);
     let noise = build_noise_advice(state)?;
     state.metrics.mark_noise_handshake();
     let pq = build_pq_advice()?;
