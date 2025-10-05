@@ -178,6 +178,20 @@ struct HttpChannel {
     remote_addr: Option<String>,
     request_summary: String,
     last_keepalive: StdInstant,
+    keepalive_interval: StdDuration,
+}
+
+const SSE_KEEPALIVE_COMMENT: &[u8] = b":keepalive\n\n";
+
+fn longpoll_keepalive_json() -> String {
+    let mut message = json!({"keepalive": true}).to_string();
+    message.push('\n');
+    message
+}
+
+fn keepalive_interval_seconds(base: u64) -> u64 {
+    let half = base.saturating_div(2).max(1);
+    half.max(5)
 }
 
 struct WebSocketChannel {
@@ -193,8 +207,6 @@ enum ConnectChannel {
 }
 
 impl HttpChannel {
-    const KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(25);
-
     fn remote_addr(&self) -> Option<&str> {
         self.remote_addr.as_deref()
     }
@@ -273,7 +285,7 @@ impl HttpChannel {
             return Ok(());
         }
         let now = StdInstant::now();
-        if now.duration_since(self.last_keepalive) < Self::KEEPALIVE_INTERVAL {
+        if now.duration_since(self.last_keepalive) < self.keepalive_interval {
             return Ok(());
         }
         match self.format {
@@ -287,17 +299,13 @@ impl HttpChannel {
 
     async fn write_sse_keepalive(&mut self) -> Result<(), ServerError> {
         self.session
-            .write_response_body(b":keepalive\n\n".to_vec().into(), false)
+            .write_response_body(SSE_KEEPALIVE_COMMENT.to_vec().into(), false)
             .await
             .map_err(|_| ServerError::Io)
     }
 
     async fn write_longpoll_keepalive(&mut self) -> Result<(), ServerError> {
-        let mut message = json!({
-            "keepalive": true,
-        })
-        .to_string();
-        message.push('\n');
+        let message = longpoll_keepalive_json();
         self.session
             .write_response_body(message.into_bytes().into(), false)
             .await
@@ -308,6 +316,11 @@ impl HttpChannel {
         let HttpChannel { session, .. } = self;
         session.finish().await.map_err(|_| ServerError::Io)?;
         Ok(())
+    }
+
+    fn set_keepalive_interval(&mut self, interval: StdDuration) {
+        self.keepalive_interval = interval;
+        self.last_keepalive = StdInstant::now();
     }
 }
 
@@ -414,6 +427,12 @@ impl ConnectChannel {
         }
     }
 
+    fn set_keepalive_interval(&mut self, interval: StdDuration) {
+        if let Self::Http(channel) = self {
+            channel.set_keepalive_interval(interval);
+        }
+    }
+
     async fn maybe_send_keepalive(&mut self) -> Result<(), ServerError> {
         match self {
             Self::Http(channel) => channel.maybe_send_keepalive().await,
@@ -453,6 +472,7 @@ impl ConnectChannel {
             remote_addr,
             request_summary,
             last_keepalive: StdInstant::now(),
+            keepalive_interval: StdDuration::from_secs(25),
         };
         channel.send_sse_preamble().await?;
         Ok(Self::Http(channel))
@@ -678,6 +698,32 @@ mod connect_tests {
         assert!(header_contains_token(&header, "upgrade"));
         assert!(header_contains_token(&header, "KEEP-ALIVE"));
         assert!(!header_contains_token(&header, "websocket"));
+    }
+
+    #[test]
+    fn keepalive_interval_has_floor() {
+        assert_eq!(keepalive_interval_seconds(2), 5);
+        assert_eq!(keepalive_interval_seconds(0), 5);
+    }
+
+    #[test]
+    fn keepalive_interval_halves_connection_keepalive() {
+        assert_eq!(keepalive_interval_seconds(120), 60);
+        assert_eq!(keepalive_interval_seconds(61), 30);
+    }
+
+    #[test]
+    fn sse_keepalive_payload_format() {
+        assert_eq!(SSE_KEEPALIVE_COMMENT, b":keepalive\n\n");
+    }
+
+    #[test]
+    fn longpoll_keepalive_payload_is_json() {
+        let payload = longpoll_keepalive_json();
+        assert!(payload.ends_with('\n'));
+        let trimmed = payload.trim_end_matches('\n');
+        let value: serde_json::Value = serde_json::from_str(trimmed).expect("valid JSON");
+        assert_eq!(value, serde_json::json!({"keepalive": true}));
     }
 }
 
@@ -2071,7 +2117,9 @@ impl CommuCatApp {
             "supported_versions": SUPPORTED_PROTOCOL_VERSIONS,
             "session": {
                 "ttl_seconds": self.state.config.connection_keepalive,
-                "keepalive_interval": self.state.config.connection_keepalive / 2,
+                "keepalive_interval": keepalive_interval_seconds(
+                    self.state.config.connection_keepalive
+                ),
             },
             "presence": {
                 "ttl_seconds": self.state.config.presence_ttl_seconds,
@@ -4525,6 +4573,8 @@ impl CommuCatApp {
                 return None;
             }
         };
+        let keepalive_secs = keepalive_interval_seconds(self.state.config.connection_keepalive);
+        channel.set_keepalive_interval(StdDuration::from_secs(keepalive_secs));
         let remote_addr = channel.remote_addr().map(|addr| addr.to_string());
         info!(
             remote_addr = remote_addr.as_deref().unwrap_or("unknown"),
@@ -4811,6 +4861,12 @@ impl CommuCatApp {
                 json!(encode_hex(&self.state.device_ca_public)),
             );
             obj.insert("noise_public".to_string(), json!(current_noise_public));
+            obj.insert(
+                "keepalive_interval".to_string(),
+                json!(keepalive_interval_seconds(
+                    self.state.config.connection_keepalive
+                )),
+            );
             if let Some(noise_key) = handshake.noise_key.as_ref() {
                 obj.insert("noise_key_version".to_string(), json!(noise_key.version));
                 obj.insert(
