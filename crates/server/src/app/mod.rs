@@ -6,7 +6,7 @@ mod uploads;
 
 use self::federation::spawn_dispatcher;
 use self::media::{CallMediaTranscoder, SharedCallMediaTranscoder};
-use self::p2p::{IceLiteServerConfig, IceRuntime, build_ice_runtime, spawn_ice_lite};
+use self::p2p::{IceRuntime, build_ice_runtime, spawn_ice_lite};
 use self::rotation::{
     DecodedRotationRequest, DeviceRotationRequest, RotationNotification, RotationRequestError,
     rotation_proof_message,
@@ -14,7 +14,7 @@ use self::rotation::{
 use self::uploads::{
     UploadError, generate_filename, mime_type_from_filename, read_file, save_file, validate_avatar,
 };
-use crate::config::{LedgerAdapter, PeerConfig, ServerConfig};
+use crate::config::{LedgerAdapter, PeerConfig, PqHandshakeConfig, ServerConfig};
 use crate::metrics::Metrics;
 use crate::openapi;
 use crate::security::limiter::{RateLimiter, RateScope};
@@ -28,7 +28,8 @@ use chrono::{Duration, Utc};
 use commucat_crypto::zkp::{self, KnowledgeProof};
 use commucat_crypto::{
     CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair, EventSigner,
-    EventVerifier, HandshakePattern, NoiseConfig, NoiseHandshake, NoiseTransport, build_handshake,
+    EventVerifier, HandshakePattern, HybridResponderResult, HybridSettings, NoiseConfig,
+    NoiseHandshake, NoiseTransport, SessionRole, build_handshake, decapsulate_hybrid,
 };
 use commucat_federation::{
     FederationError, FederationEvent, SignedEvent, sign_event, verify_event,
@@ -47,13 +48,17 @@ use commucat_proto::{
     is_supported_protocol_version, negotiate_protocol_version,
 };
 use commucat_storage::{
-    ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederatedFriendRequest,
-    FederationOutboxInsert, FederationOutboxMessage, FederationPeerStatus, GroupMember, GroupRole,
-    IdempotencyKey, InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord,
-    Storage, StorageError, UserProfile, connect,
+    ChatGroup, DeviceKeyEvent, DevicePqKeys, DeviceRecord, DeviceRotationRecord,
+    FederatedFriendRequest, FederationOutboxInsert, FederationOutboxMessage, FederationPeerStatus,
+    GroupMember, GroupRole, IdempotencyKey, InboxOffset, NewUserProfile, PresenceSnapshot,
+    RelayEnvelope, SessionRecord, Storage, StorageError, UserProfile, connect,
 };
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
+use ml_dsa::{EncodedSignature as MlDsaEncodedSignature, MlDsa65, Signature as MlDsaSignature,
+    VerifyingKey as MlDsaVerifyingKey};
+use ml_kem::{Ciphertext as MlKemCiphertext, DecapsulationKey as MlKemDecapsulationKey,
+    EncapsulationKey as MlKemEncapsulationKey, MlKem768};
 use http::HeaderValue;
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
@@ -183,12 +188,6 @@ struct HttpChannel {
 }
 
 const SSE_KEEPALIVE_COMMENT: &[u8] = b":keepalive\n\n";
-
-fn longpoll_keepalive_json() -> String {
-    let mut message = json!({"keepalive": true}).to_string();
-    message.push('\n');
-    message
-}
 
 fn keepalive_interval_seconds(base: u64) -> u64 {
     let half = base.saturating_div(2).max(1);
@@ -973,6 +972,39 @@ impl P2pSession {
     }
 }
 
+#[derive(Clone)]
+pub struct PqRuntime {
+    kem_public: Vec<u8>,
+    kem_secret: Vec<u8>,
+}
+
+impl PqRuntime {
+    fn from_config(config: &PqHandshakeConfig) -> Result<Self, ServerError> {
+        let runtime = PqRuntime {
+            kem_public: config.kem_public.clone(),
+            kem_secret: config.kem_secret.clone(),
+        };
+        runtime.validate()?;
+        Ok(runtime)
+    }
+
+    fn validate(&self) -> Result<(), ServerError> {
+        let _ = self.encapsulation_key()?;
+        let _ = self.decapsulation_key()?;
+        Ok(())
+    }
+
+    fn encapsulation_key(&self) -> Result<MlKemEncapsulationKey, ServerError> {
+        MlKemEncapsulationKey::try_from(self.kem_public.as_slice())
+            .map_err(|_| ServerError::Invalid)
+    }
+
+    fn decapsulation_key(&self) -> Result<MlKemDecapsulationKey, ServerError> {
+        MlKemDecapsulationKey::try_from(self.kem_secret.as_slice())
+            .map_err(|_| ServerError::Invalid)
+    }
+}
+
 pub struct AppState {
     pub config: ServerConfig,
     pub storage: Arc<Storage>,
@@ -993,6 +1025,7 @@ pub struct AppState {
     pub rate_limits: Arc<RateLimiter>,
     pub transports: RwLock<TransportManager>,
     pub ice: IceRuntime,
+    pub pq: Option<PqRuntime>,
     pub p2p_sessions: RwLock<HashMap<String, P2pSession>>,
 }
 
@@ -1236,6 +1269,7 @@ struct HandshakeContext {
     certificate: Option<DeviceCertificate>,
     noise_key: Option<NoiseKey>,
     transport: Option<Arc<Mutex<NoiseTransport>>>,
+    pq_session: Option<HybridResponderResult>,
     device_known: bool,
 }
 
@@ -1333,6 +1367,10 @@ impl CommuCatApp {
             });
         let transports = default_manager(reality_cfg);
         let (ice_runtime, lite_server_cfg) = build_ice_runtime(&config.ice);
+        let pq_runtime = match config.pq.as_ref() {
+            Some(cfg) => Some(PqRuntime::from_config(cfg)?),
+            None => None,
+        };
         let state = Arc::new(AppState {
             storage: Arc::clone(&storage),
             ledger,
@@ -1352,6 +1390,7 @@ impl CommuCatApp {
             rate_limits: Arc::clone(&rate_limits),
             transports: RwLock::new(transports),
             ice: ice_runtime,
+            pq: pq_runtime,
             p2p_sessions: RwLock::new(HashMap::new()),
             config,
         });
@@ -4606,6 +4645,7 @@ impl CommuCatApp {
             certificate: None,
             noise_key: None,
             transport: None,
+            pq_session: None,
             device_known: false,
         };
         let mut server_sequence = 1u64;

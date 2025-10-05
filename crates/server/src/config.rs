@@ -61,6 +61,12 @@ pub struct RealitySettings {
     pub fingerprint: [u8; 32],
 }
 
+#[derive(Clone)]
+pub struct PqHandshakeConfig {
+    pub kem_public: Vec<u8>,
+    pub kem_secret: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RateLimitSettings {
     pub burst: u32,
@@ -152,6 +158,7 @@ pub struct ServerConfig {
     pub device_rotation: DeviceRotationConfig,
     pub ice: IceConfig,
     pub transport: TransportConfig,
+    pub pq: Option<PqHandshakeConfig>,
     pub uploads_dir: String,
     pub uploads_base_url: String,
 }
@@ -309,6 +316,24 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         _ => return Err(ConfigError::Invalid),
     };
     let transport = TransportConfig { reality };
+
+    let pq_kem_secret_hex = override_env("COMMUCAT_PQ_KEM_SECRET", map.remove("crypto.pq_kem_secret"))?;
+    let pq_kem_public_hex = override_env("COMMUCAT_PQ_KEM_PUBLIC", map.remove("crypto.pq_kem_public"))?;
+    let pq = match (pq_kem_secret_hex, pq_kem_public_hex) {
+        (Some(secret_hex), Some(public_hex)) => {
+            let kem_secret = decode_hex(secret_hex.trim()).map_err(|_| ConfigError::Invalid)?;
+            let kem_public = decode_hex(public_hex.trim()).map_err(|_| ConfigError::Invalid)?;
+            if kem_secret.is_empty() || kem_public.is_empty() {
+                return Err(ConfigError::Invalid);
+            }
+            Some(PqHandshakeConfig {
+                kem_public,
+                kem_secret,
+            })
+        }
+        (None, None) => None,
+        _ => return Err(ConfigError::Invalid),
+    };
 
     let lite_enabled = override_env("COMMUCAT_ICE_LITE_ENABLED", map.remove("ice.lite_enabled"))?
         .unwrap_or_else(|| "false".to_string())
@@ -651,6 +676,7 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
         device_rotation,
         ice,
         transport,
+        pq,
         uploads_dir,
         uploads_base_url,
     })

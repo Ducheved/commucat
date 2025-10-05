@@ -18,6 +18,7 @@ const DEVICE_ROTATION_SQL: &str = include_str!("../migrations/005_device_rotatio
 const FEDERATION_OUTBOX_SQL: &str = include_str!("../migrations/006_federation_outbox.sql");
 const FRIEND_REQUESTS_SQL: &str = include_str!("../migrations/007_friend_requests.sql");
 const FEDERATED_IDENTIFIERS_SQL: &str = include_str!("../migrations/008_federated_identifiers.sql");
+const DEVICE_PQ_SQL: &str = include_str!("../migrations/009_device_pq.sql");
 const PAIRING_MAX_ATTEMPTS: i32 = 5;
 const PAIRING_CODE_LENGTH: usize = 8;
 const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -78,6 +79,14 @@ pub struct DeviceRecord {
     pub public_key: Vec<u8>,
     pub status: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DevicePqKeys {
+    pub device_id: String,
+    pub kem_public: Vec<u8>,
+    pub signature_public: Vec<u8>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -441,6 +450,10 @@ impl Storage {
             .map_err(|_| StorageError::Postgres)?;
         self.client
             .batch_execute(FEDERATED_IDENTIFIERS_SQL)
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        self.client
+            .batch_execute(DEVICE_PQ_SQL)
             .await
             .map_err(|_| StorageError::Postgres)?;
         Ok(())
@@ -926,6 +939,47 @@ impl Storage {
             status: row.get(3),
             created_at: row.get(4),
         })
+    }
+
+    /// Loads stored post-quantum key material for a device when available.
+    pub async fn load_device_pq_keys(
+        &self,
+        device_id: &str,
+    ) -> Result<Option<DevicePqKeys>, StorageError> {
+        let row = self
+            .client
+            .query_opt(
+                "SELECT device_id, kem_public, signature_public, updated_at FROM device_pq_keys WHERE device_id = $1",
+                &[&device_id],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(row.map(|row| DevicePqKeys {
+            device_id: row.get(0),
+            kem_public: row.get(1),
+            signature_public: row.get(2),
+            updated_at: row.get(3),
+        }))
+    }
+
+    /// Upserts post-quantum key material for a device.
+    pub async fn upsert_device_pq_keys(
+        &self,
+        keys: &DevicePqKeys,
+    ) -> Result<(), StorageError> {
+        self.client
+            .execute(
+                "INSERT INTO device_pq_keys (device_id, kem_public, signature_public, updated_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (device_id) DO UPDATE
+                 SET kem_public = EXCLUDED.kem_public,
+                     signature_public = EXCLUDED.signature_public,
+                     updated_at = EXCLUDED.updated_at",
+                &[&keys.device_id, &keys.kem_public, &keys.signature_public, &keys.updated_at],
+            )
+            .await
+            .map_err(|_| StorageError::Postgres)?;
+        Ok(())
     }
 
     /// Counts active devices registered for a user.

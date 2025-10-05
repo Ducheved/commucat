@@ -17,13 +17,13 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use std::collections::HashMap;
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 use tokio::net::UdpSocket;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -104,6 +104,8 @@ pub struct IceAdvice {
     pub servers: Vec<IceServerAdvice>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lite_candidates: Vec<IceCandidateAdvice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,7 +290,8 @@ fn build_binding_response(packet: &[u8], public_addr: SocketAddr) -> Result<Opti
     if packet.len() < 20 + length {
         return Err(());
     }
-    if &packet[4..8] != STUN_MAGIC_COOKIE {
+    let cookie: [u8; 4] = packet[4..8].try_into().map_err(|_| ())?;
+    if cookie != STUN_MAGIC_COOKIE {
         return Err(());
     }
     let txid = &packet[8..20];
@@ -341,8 +344,9 @@ fn append_attribute(message: &mut Vec<u8>, ty: u16, value: &[u8]) {
     message.extend_from_slice(&ty.to_be_bytes());
     message.extend_from_slice(&(value.len() as u16).to_be_bytes());
     message.extend_from_slice(value);
-    while message.len() % 4 != 0 {
-        message.push(0);
+    let padding = (4 - (value.len() % 4)) % 4;
+    if padding > 0 {
+        message.extend(std::iter::repeat_n(0, padding));
     }
 }
 

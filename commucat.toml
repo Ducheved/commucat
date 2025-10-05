@@ -29,6 +29,9 @@ noise_public  = "101112131415161718191a1b1c1d1e1f101112131415161718191a1b1c1d1e1
 federation_seed = "202122232425262728292a2b2c2d2e2f202122232425262728292a2b2c2d2e2f"
 # Optional Noise prologue (bytes)
 prologue = "commucat"
+# Optional ML-KEM/ML-DSA key material for hybrid handshake (hex)
+# pq_kem_public = ""
+# pq_kem_secret = ""
 
 [federation]
 # Semicolon-separated list of domain,endpoint,public_key(32 B hex)
