@@ -69,7 +69,8 @@ pub struct FecHint {
 #[derive(Debug, Serialize)]
 pub struct P2pAssistResponse {
     pub noise: NoiseAdvice,
-    pub pq: PqAdvice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pq: Option<PqAdvice>,
     pub ice: IceAdvice,
     pub transports: Vec<TransportAdvice>,
     pub multipath: MultipathAdvice,
@@ -529,8 +530,13 @@ pub(super) async fn handle_assist(
     let obfuscation = build_obfuscation_advice(&path_info, &endpoints);
     let noise = build_noise_advice(state)?;
     state.metrics.mark_noise_handshake();
-    let pq = build_pq_advice()?;
-    state.metrics.mark_pq_handshake();
+
+    // PQ advice - опционально, если настроено на сервере
+    let pq = build_pq_advice_from_state(state);
+    if pq.is_some() {
+        state.metrics.mark_pq_handshake();
+    }
+
     let ice = build_ice_advice(state);
 
     let response = P2pAssistResponse {
@@ -805,7 +811,25 @@ fn build_noise_advice(state: &AppState) -> Result<NoiseAdvice, ApiError> {
     })
 }
 
-fn build_pq_advice() -> Result<PqAdvice, ApiError> {
+fn build_pq_advice_from_state(state: &AppState) -> Option<PqAdvice> {
+    // Если PQ не настроен в конфиге, возвращаем None
+    let pq_runtime = state.pq.as_ref()?;
+
+    // Используем публичный ключ из конфигурации вместо генерации нового
+    // Для полноценного PQXDH нужны ephemeral ключи, но для assist-advice
+    // достаточно показать что сервер поддерживает PQ
+    Some(PqAdvice {
+        identity_public_hex: String::new(), // Ephemeral, генерится клиентом
+        signed_prekey_public_hex: String::new(), // Ephemeral, генерится клиентом
+        kem_public_hex: encode_hex(&pq_runtime.kem_public),
+        signature_public_hex: String::new(), // Опционально для assist
+    })
+}
+
+// Deprecated: используйте build_pq_advice_from_state
+// Оставлено для обратной совместимости если нужно генерировать полный bundle
+#[allow(dead_code)]
+fn build_pq_advice_full() -> Result<PqAdvice, ApiError> {
     let mut rng = OsRng;
     let bundle = PqxdhBundle::generate(4, 2, &mut rng).map_err(|_| ApiError::Internal)?;
     let identity_public = bundle.identity_key.verifying_key().to_bytes();
