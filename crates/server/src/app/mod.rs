@@ -5089,9 +5089,37 @@ impl CommuCatApp {
         let mut cipher_buffer: Vec<u8> = Vec::new();
         let read_timeout = StdDuration::from_millis(50);
 
+        // Для периодического обновления сессии в WebSocket соединениях
+        let mut last_session_refresh = Utc::now();
+        let session_refresh_interval =
+            Duration::seconds(self.state.config.connection_keepalive as i64 / 2);
+
         'session_loop: loop {
             if *shutdown.borrow() {
                 break;
+            }
+
+            // Периодически обновляем TTL сессии для долгоживущих WebSocket соединений
+            let now = Utc::now();
+            if now - last_session_refresh >= session_refresh_interval {
+                let updated_session = SessionRecord {
+                    session_id: session_id.clone(),
+                    user_id: user_id.clone(),
+                    device_id: device_id.clone(),
+                    tls_fingerprint: generate_id(channel.request_summary()),
+                    created_at: now,
+                    ttl_seconds: self.state.config.connection_keepalive as i64,
+                };
+
+                // Обновляем в фоне, не блокируем основной цикл
+                let storage = self.state.storage.clone();
+                tokio::spawn(async move {
+                    if let Err(err) = storage.record_session(&updated_session).await {
+                        debug!("websocket session refresh failed: {}", err);
+                    }
+                });
+
+                last_session_refresh = now;
             }
 
             while let Ok(frame) = rx_out.try_recv() {
