@@ -574,6 +574,16 @@ enum HandshakeStage {
     Established,
 }
 
+impl HandshakeStage {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hello => "hello",
+            Self::AwaitClient => "await_client",
+            Self::Established => "established",
+        }
+    }
+}
+
 struct HandshakeContext {
     stage: HandshakeStage,
     device_id: String,
@@ -3582,6 +3592,15 @@ impl CommuCatApp {
                 }
                 Err(err) => {
                     error!("handshake read failed: {}", err);
+                    self.emit_handshake_failure(
+                        &handshake,
+                        remote_addr.as_deref(),
+                        "read",
+                        json!({
+                            "error": err.to_string(),
+                            "source": "body",
+                        }),
+                    );
                     return None;
                 }
             }
@@ -3609,6 +3628,12 @@ impl CommuCatApp {
                                 obj.insert("title".to_string(), json!("PairingRequired"));
                                 obj.insert("pairing_required".to_string(), json!(true));
                             }
+                            self.emit_handshake_failure(
+                                &handshake,
+                                remote_addr.as_deref(),
+                                "handshake",
+                                properties.clone(),
+                            );
                             let error_frame = Frame {
                                 channel_id: 0,
                                 sequence: server_sequence,
@@ -3626,6 +3651,15 @@ impl CommuCatApp {
                     Err(commucat_proto::CodecError::UnexpectedEof) => break,
                     Err(err) => {
                         error!("handshake decode failure: {}", err);
+                        self.emit_handshake_failure(
+                            &handshake,
+                            remote_addr.as_deref(),
+                            "decode",
+                            json!({
+                                "error": "decode",
+                                "detail": err.to_string(),
+                            }),
+                        );
                         let error_frame = Frame {
                             channel_id: 0,
                             sequence: server_sequence,
@@ -4401,6 +4435,58 @@ impl CommuCatApp {
             .map_err(|_| ServerError::Io)?;
         self.state.metrics.mark_egress();
         Ok(())
+    }
+
+    fn emit_handshake_failure(
+        &self,
+        context: &HandshakeContext,
+        remote_addr: Option<&str>,
+        reason: &str,
+        detail: serde_json::Value,
+    ) {
+        let recorded_at = Utc::now();
+        let digest_seed = format!(
+            "handshake-failure:{}:{}:{}:{}:{}",
+            reason,
+            context.device_id,
+            context.user_id,
+            remote_addr.unwrap_or(""),
+            recorded_at.timestamp_nanos_opt().unwrap_or_default()
+        );
+        let digest_hash = blake3_hash(digest_seed.as_bytes());
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(digest_hash.as_bytes());
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("scope".to_string(), json!("handshake"));
+        metadata.insert("result".to_string(), json!("failure"));
+        metadata.insert("stage".to_string(), json!(context.stage.as_str()));
+        metadata.insert("reason".to_string(), json!(reason));
+        metadata.insert("detail".to_string(), detail);
+        if let Some(addr) = remote_addr {
+            metadata.insert("remote_addr".to_string(), json!(addr));
+        }
+        if !context.device_id.is_empty() {
+            metadata.insert("device".to_string(), json!(context.device_id.clone()));
+        }
+        if !context.user_id.is_empty() {
+            metadata.insert("user".to_string(), json!(context.user_id.clone()));
+        }
+        if context.protocol_version != 0 {
+            metadata.insert(
+                "protocol_version".to_string(),
+                json!(context.protocol_version),
+            );
+        }
+
+        let record = LedgerRecord {
+            digest,
+            recorded_at,
+            metadata: serde_json::Value::Object(metadata),
+        };
+        if let Err(err) = self.state.ledger.submit(&record) {
+            warn!("handshake ledger submission failed: {}", err);
+        }
     }
 
     fn emit_call_event(&self, call_id: &str, event: &str, extra: serde_json::Value) {
