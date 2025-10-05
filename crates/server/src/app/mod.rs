@@ -1764,14 +1764,18 @@ impl CommuCatApp {
             }
             return None;
         }
-        if path == "/api/p2p/assist" && method == "POST" {
+        if path == "/api/p2p/assist" && (method == "POST" || method == "GET") {
             self.state.metrics.mark_ingress();
-            let body = match Self::read_body(&mut session).await {
-                Ok(payload) => payload,
-                Err(err) => {
-                    let _ = self.respond_api_error(&mut session, err).await;
-                    return None;
+            let body = if method == "POST" {
+                match Self::read_body(&mut session).await {
+                    Ok(payload) => payload,
+                    Err(err) => {
+                        let _ = self.respond_api_error(&mut session, err).await;
+                        return None;
+                    }
                 }
+            } else {
+                Vec::new() // GET request - empty body
             };
             let request = if body.is_empty() {
                 p2p::P2pAssistRequest {
