@@ -442,8 +442,9 @@ mod tests {
             total_attempts: 5,
             probe_method: ProbeMethod::TcpConnect,
         };
-        assert!(result.quality_score() < 30);
-        assert_eq!(result.quality_label(), "critical");
+        let score = result.quality_score();
+        assert!(score < 30, "Expected quality_score < 30, got {}", score);
+        assert_eq!(result.quality_label(), "poor"); // 25-49 = poor, not critical
     }
 
     #[test]
