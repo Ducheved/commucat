@@ -123,99 +123,11 @@ pub(super) async fn handle_assist(
     state: &AppState,
     request: P2pAssistRequest,
 ) -> Result<P2pAssistResponse, ApiError> {
-    let fec_profile = request
-        .fec
-        .as_ref()
-        .map(|hint| {
-            crate::transport::FecProfile::new(
-                hint.mtu.unwrap_or(1152),
-                hint.repair_overhead.unwrap_or(0.35),
-            )
-        })
-        .unwrap_or_else(crate::transport::FecProfile::default_low_latency);
-
-    let min_paths = request.min_paths.unwrap_or(2);
-    let mut endpoints = Vec::new();
-    if request.paths.is_empty() {
-        endpoints.extend(default_paths(
-            state,
-            request.prefer_reality,
-            request.peer_hint.as_deref(),
-        ));
-    } else {
-        for (idx, hint) in request.paths.iter().enumerate() {
-            endpoints.push(path_from_hint(state, hint, idx)?);
-        }
-    }
-    if endpoints.is_empty() {
-        return Err(ApiError::BadRequest("no paths provided".to_string()));
-    }
-
-    // TODO: Remove this workaround when real transports are implemented
-    // Currently all transports are stubs using memory_stream(), which cannot
-    // establish real network connections. For P2P Assist, we return simulated data.
-    let transports = vec![
-        TransportAdvice {
-            path_id: "primary".to_string(),
-            transport: "WebSocket".to_string(),
-            resistance: "Basic".to_string(),
-            latency: "Medium".to_string(),
-            throughput: "Medium".to_string(),
-        },
-        TransportAdvice {
-            path_id: "backup".to_string(),
-            transport: "Reality".to_string(),
-            resistance: "Maximum".to_string(),
-            latency: "High".to_string(),
-            throughput: "High".to_string(),
-        },
-    ];
-
-    let mut sample_segments = HashMap::new();
-    sample_segments.insert(
-        "primary".to_string(),
-        SampleBreakdown { total: 10, repair: 3 },
-    );
-    sample_segments.insert(
-        "backup".to_string(),
-        SampleBreakdown { total: 5, repair: 2 },
-    );
-
-    // Simulated obfuscation advice
-    let obfuscation = ObfuscationAdvice {
-        reality_fingerprint_hex: state
-            .config
-            .transport
-            .reality
-            .as_ref()
-            .map(|cfg| encode_hex(&cfg.fingerprint)),
-        domain_fronting: true,
-        protocol_mimicry: true,
-        tor_bridge: false,
-    };
-
-    let noise = build_noise_advice(state)?;
-    state.metrics.mark_noise_handshake();
-    let pq = build_pq_advice()?;
-    state.metrics.mark_pq_handshake();
-    let ice = build_ice_advice(state);
-
-    let response = P2pAssistResponse {
-        noise,
-        pq,
-        ice,
-        transports,
-        multipath: MultipathAdvice {
-            fec_mtu: fec_profile.mtu,
-            fec_overhead: fec_profile.repair_overhead,
-            primary_path: Some("primary".to_string()),
-            sample_segments,
-        },
-        obfuscation,
-        security: state.metrics.security_snapshot(),
-    };
-    info!(paths = response.transports.len(), "p2p assistance prepared (simulated - transports are stubs)");
-    Ok(response)
+    // P2P Assist API requires at least one real transport implementation
+    // Currently all transports are stubs using memory_stream() - they cannot establish real connections
+    // We're implementing WebSocket transport right now!
+    warn!("P2P Assist called but no real transports available yet - returning 501");
+    Err(ApiError::NotImplemented)
 }
 
 fn default_paths(

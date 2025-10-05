@@ -454,6 +454,15 @@ setInterval(() => {
 
 **Key Takeaway:** Always use query parameter (`?mode=...`) for explicit mode selection!
 
+## TODO / Pending Work
+
+- **CLI engine parity**: implement ConnectMode-aware reader/writer stacks for SSE, long-poll, and WebSocket in `commucat-cli-client` (currently only binary works).
+- **WebSocket handshake**: reuse TLS connector + `tokio-tungstenite` so `/connect?mode=websocket` works end-to-end in the CLI.
+- **Streaming decoders**: add incremental SSE / NDJSON frame decoding helpers (base64 + framing) shared between engine and tests.
+- **TUI affordances**: surface mode selection in the UI, show active mode, and allow quick switching; redesign layout with friend list sidebar and handle search.
+- **Regression tests**: add integration tests or fixtures for each mode (server + CLI) and document expected request / response snapshots.
+- **Docs**: update quickstart/README once client-side support ships, including examples per mode and known limitations.
+
 ## See Also
 
 - [PROTOCOL.md](../PROTOCOL.md) - Frame protocol specification
