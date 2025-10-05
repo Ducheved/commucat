@@ -53,6 +53,7 @@ use commucat_storage::{
 };
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
+use http::HeaderValue;
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
 use pingora::protocols::Stream as PingoraStream;
@@ -72,9 +73,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration as StdDuration;
-use tokio::select;
 use tokio::sync::{Mutex, RwLock, mpsc};
-use tokio::time::interval;
+use tokio::time::{interval, timeout};
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::{
     handshake::derive_accept_key,
@@ -185,6 +185,7 @@ struct WebSocketChannel {
     request_summary: String,
 }
 
+#[allow(clippy::large_enum_variant)]
 enum ConnectChannel {
     Http(HttpChannel),
     WebSocket(WebSocketChannel),
@@ -260,7 +261,7 @@ impl HttpChannel {
     }
 
     async fn finish(self) -> Result<(), ServerError> {
-        let HttpChannel { mut session, .. } = self;
+        let HttpChannel { session, .. } = self;
         session.finish().await.map_err(|_| ServerError::Io)?;
         Ok(())
     }
@@ -296,6 +297,10 @@ impl WebSocketChannel {
                     continue;
                 }
                 Some(Ok(Message::Close(_))) => return Ok(None),
+                Some(Ok(Message::Frame(_))) => {
+                    // ignore raw frame notifications and keep polling
+                    continue;
+                }
                 Some(Err(err)) => {
                     error!(error = %err, "websocket read failure");
                     return Err(ServerError::Io);
@@ -327,13 +332,6 @@ impl ConnectChannel {
             ConnectMode::Sse => Self::start_http(session, HttpConnectFormat::Sse).await,
             ConnectMode::LongPoll => Self::start_http(session, HttpConnectFormat::LongPoll).await,
             ConnectMode::WebSocket => Self::upgrade_websocket(session).await,
-        }
-    }
-
-    fn mode(&self) -> ConnectMode {
-        match self {
-            Self::Http(channel) => channel.format.mode(),
-            Self::WebSocket(_) => ConnectMode::WebSocket,
         }
     }
 
@@ -389,10 +387,10 @@ impl ConnectChannel {
         response
             .append_header("x-commucat-connect-mode", format.mode().as_str())
             .map_err(|_| ServerError::Invalid)?;
-        if matches!(format, HttpConnectFormat::Sse) {
-            if let Err(_) = response.append_header("connection", "keep-alive") {
-                return Err(ServerError::Invalid);
-            }
+        if matches!(format, HttpConnectFormat::Sse)
+            && response.append_header("connection", "keep-alive").is_err()
+        {
+            return Err(ServerError::Invalid);
         }
         session
             .write_response_header(Box::new(response))
@@ -408,7 +406,7 @@ impl ConnectChannel {
         Ok(Self::Http(channel))
     }
 
-    async fn upgrade_websocket(mut session: ServerSession) -> Result<Self, ServerError> {
+    async fn upgrade_websocket(session: ServerSession) -> Result<Self, ServerError> {
         let remote_addr = session.client_addr().map(|addr| addr.to_string());
         let request_summary = session.request_summary();
         match session {
@@ -462,7 +460,7 @@ impl ConnectChannel {
                         return Err(ServerError::Invalid);
                     }
                 };
-                let accept_key = derive_accept_key(key);
+                let accept_key = derive_accept_key(key.as_bytes());
                 let mut response =
                     ResponseHeader::build_no_case(101, None).map_err(|_| ServerError::Invalid)?;
                 response
@@ -573,7 +571,7 @@ fn parse_mode_fragment(value: &str) -> Option<ConnectMode> {
     }
 }
 
-fn header_contains_token(value: &http::HeaderValue, token: &str) -> bool {
+fn header_contains_token(value: &HeaderValue, token: &str) -> bool {
     value
         .to_str()
         .ok()
@@ -624,7 +622,7 @@ mod connect_tests {
 
     #[test]
     fn header_token_detection_is_case_insensitive() {
-        let header = http::HeaderValue::from_static("Upgrade, keep-alive");
+        let header = HeaderValue::from_static("Upgrade, keep-alive");
         assert!(header_contains_token(&header, "upgrade"));
         assert!(header_contains_token(&header, "KEEP-ALIVE"));
         assert!(!header_contains_token(&header, "websocket"));
@@ -4059,7 +4057,7 @@ impl CommuCatApp {
 
     async fn process_connect(
         self: &Arc<Self>,
-        mut session: ServerSession,
+        session: ServerSession,
         shutdown: &ShutdownWatch,
     ) -> Option<ReusedHttpStream> {
         if let Some(retry_after) = self.check_rate_limit(&session, RateScope::Connect).await {
@@ -4100,7 +4098,6 @@ impl CommuCatApp {
             device_known: false,
         };
         let mut server_sequence = 1u64;
-        let mut shutdown_rx = shutdown.clone();
 
         while !matches!(handshake.stage, HandshakeStage::Established) {
             match channel.read_chunk().await {
@@ -4466,91 +4463,92 @@ impl CommuCatApp {
             }
         };
         let mut cipher_buffer: Vec<u8> = Vec::new();
+        let read_timeout = StdDuration::from_millis(50);
 
         'session_loop: loop {
-            select! {
-                inbound = session.read_request_body() => {
-                    match inbound {
-                        Ok(Some(chunk)) => {
-                            if chunk.is_empty() {
-                                continue;
-                            }
-                            cipher_buffer.extend_from_slice(chunk.as_ref());
-                            let mut decrypted_any = false;
-                            loop {
-                                let Some((message_len, header_len)) = decode_varint_prefix(&cipher_buffer) else {
-                                    break;
-                                };
-                                let total_len = header_len + message_len;
-                                if cipher_buffer.len() < total_len {
-                                    break;
-                                }
-                                let ciphertext = cipher_buffer[header_len..total_len].to_vec();
-                                cipher_buffer.drain(0..total_len);
-                                let plaintext = {
-                                    let mut guard = transport.lock().await;
-                                    match guard.read_message(&ciphertext) {
-                                        Ok(data) => data,
-                                        Err(_) => {
-                                            error!("noise decrypt failed");
-                                            break 'session_loop;
-                                        }
-                                    }
-                                };
-                                if !plaintext.is_empty() {
-                                    buffer.extend_from_slice(&plaintext);
-                                }
-                                decrypted_any = true;
-                            }
-                            if decrypted_any {
-                                match self.consume_established_frames(
-                                    &mut channel,
-                                    &device_id,
-                                    &mut buffer,
-                                    &tx_out,
-                                    &mut server_sequence,
-                                    Some(&transport),
-                                )
-                                .await
-                                {
-                                    Ok(continue_running) => {
-                                        if !continue_running {
-                                            break;
-                                        }
-                                    }
-                                    Err(err) => {
-                                        error!("frame processing failure: {}", err);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            break;
-                        }
-                        Err(err) => {
-                            error!("read failure: {}", err);
-                            break;
-                        }
-                    }
+            if *shutdown.borrow() {
+                break;
+            }
+
+            while let Ok(frame) = rx_out.try_recv() {
+                if let Err(err) = self
+                    .write_frame(&mut channel, frame, Some(&transport))
+                    .await
+                {
+                    error!("outbound send failed: {}", err);
+                    break 'session_loop;
                 }
-                outbound = rx_out.recv() => {
-                    match outbound {
-                        Some(frame) => {
-                            if let Err(err) = self.write_frame(&mut channel, frame, Some(&transport)).await {
-                                error!("outbound send failed: {}", err);
+            }
+
+            match timeout(read_timeout, channel.read_chunk()).await {
+                Ok(Ok(Some(chunk))) => {
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    cipher_buffer.extend_from_slice(&chunk);
+                    let mut decrypted_any = false;
+                    loop {
+                        let Some((message_len, header_len)) = decode_varint_prefix(&cipher_buffer)
+                        else {
+                            break;
+                        };
+                        let total_len = header_len + message_len;
+                        if cipher_buffer.len() < total_len {
+                            break;
+                        }
+                        let ciphertext = cipher_buffer[header_len..total_len].to_vec();
+                        cipher_buffer.drain(0..total_len);
+                        let plaintext = {
+                            let mut guard = transport.lock().await;
+                            match guard.read_message(&ciphertext) {
+                                Ok(data) => data,
+                                Err(_) => {
+                                    error!("noise decrypt failed");
+                                    break 'session_loop;
+                                }
+                            }
+                        };
+                        if !plaintext.is_empty() {
+                            buffer.extend_from_slice(&plaintext);
+                        }
+                        decrypted_any = true;
+                    }
+                    if decrypted_any {
+                        match self
+                            .consume_established_frames(
+                                &mut channel,
+                                &device_id,
+                                &mut buffer,
+                                &tx_out,
+                                &mut server_sequence,
+                                Some(&transport),
+                            )
+                            .await
+                        {
+                            Ok(continue_running) => {
+                                if !continue_running {
+                                    break;
+                                }
+                            }
+                            Err(err) => {
+                                error!("frame processing failure: {}", err);
                                 break;
                             }
                         }
-                        None => {
-                            break;
-                        }
                     }
                 }
-                changed = shutdown_rx.changed() => {
-                    if changed.is_ok() {
+                Ok(Ok(None)) => {
+                    break;
+                }
+                Ok(Err(err)) => {
+                    error!("read failure: {}", err);
+                    break;
+                }
+                Err(_) => {
+                    if rx_out.is_closed() && rx_out.is_empty() {
                         break;
                     }
+                    continue;
                 }
             }
         }
