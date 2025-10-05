@@ -748,12 +748,51 @@ fn score_transport(
     base + perf + network_bias + bandwidth_bias + latency_bias + loss_bias + censorship_bias
 }
 
+/// Check if address is loopback, localhost, or common self-reference patterns
+fn is_loopback_or_self(address: &str) -> bool {
+    // Check for localhost variants
+    if address == "localhost"
+        || address == "127.0.0.1"
+        || address == "::1"
+        || address.starts_with("127.")
+        || address == "0.0.0.0"
+    {
+        return true;
+    }
+
+    // Check if it's a domain that might resolve to local
+    // Common patterns: own domain, relay.domain, etc.
+    // We can't do DNS resolution here synchronously, so we rely on heuristics
+    // In production, server should not probe itself
+    false
+}
+
 async fn assess_network_conditions(endpoint: &Endpoint) -> NetworkSnapshot {
+    // Skip detailed network probing for loopback/localhost to avoid self-connection issues
+    // This prevents HTTPS HEAD requests to the server itself during P2P Assist calls
+    if is_loopback_or_self(&endpoint.address) {
+        debug!(
+            target = %format!("{}:{}", endpoint.address, endpoint.port),
+            "skipping network probe for loopback/self address, using optimistic defaults"
+        );
+        return NetworkSnapshot {
+            rtt_ms: 10,
+            bandwidth_kbps: 20_000,
+            loss_rate: 0.0,
+            quality: NetworkQuality::Excellent,
+            jitter_ms: 2.0,
+            probe_method: ProbeMethod::TcpConnect,
+            quality_score: 100,
+        };
+    }
+
     // Use advanced network probing with jitter/loss/bandwidth estimation
+    // Use fewer attempts for faster results (especially important for self-probing scenarios)
+    // Disable HTTPS HEAD to avoid self-connection issues when probing own domain
     let config = ProbeConfig {
-        attempts: 5,
-        timeout: Duration::from_millis(300),
-        use_https: endpoint.port == 443 || endpoint.port == 8443,
+        attempts: 3,                         // Reduced from 5 to minimize overhead
+        timeout: Duration::from_millis(200), // Reduced from 300ms
+        use_https: false,                    // Disabled to prevent self-TLS-handshake issues
         measure_jitter: true,
         estimate_bandwidth: true,
     };
