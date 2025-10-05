@@ -76,6 +76,47 @@ pub struct P2pAssistResponse {
     pub multipath: MultipathAdvice,
     pub obfuscation: ObfuscationAdvice,
     pub security: SecuritySnapshot,
+    pub keepalive: KeepAliveAdvice,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect: Option<ReconnectAdvice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KeepAliveAdvice {
+    pub enabled: bool,
+    pub ping_interval_secs: u64,
+    pub pong_timeout_secs: u64,
+    pub max_missed_pongs: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconnectAdvice {
+    pub strategy: String, // "exponential_backoff"
+    pub initial_backoff_secs: u64,
+    pub max_backoff_secs: u64,
+    pub max_attempts: u32, // 0 = infinite
+}
+
+impl Default for KeepAliveAdvice {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ping_interval_secs: 30,
+            pong_timeout_secs: 10,
+            max_missed_pongs: 3,
+        }
+    }
+}
+
+impl Default for ReconnectAdvice {
+    fn default() -> Self {
+        Self {
+            strategy: "exponential_backoff".to_string(),
+            initial_backoff_secs: 1,
+            max_backoff_secs: 60,
+            max_attempts: 0, // Infinite
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -552,6 +593,8 @@ pub(super) async fn handle_assist(
         },
         obfuscation,
         security: state.metrics.security_snapshot(),
+        keepalive: KeepAliveAdvice::default(),
+        reconnect: Some(ReconnectAdvice::default()),
     };
 
     Ok(response)

@@ -1,4 +1,5 @@
 mod fec;
+mod keepalive;
 
 use async_trait::async_trait;
 use blake3::hash as blake3_hash;
@@ -16,13 +17,19 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use tracing::{debug, error, info, warn};
 
 pub use fec::{FecProfile, RaptorqDecoder, RaptorqEncoder};
+// Re-export keepalive types for potential future use
+#[allow(unused_imports)]
+pub use keepalive::{
+    ConnectionHealth, ConnectionState, KeepAliveConfig, KeepAliveError, PortKnockingSequence,
+    ReconnectStrategy,
+};
 
 pub trait TransportIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
 
 pub type TransportStream = Box<dyn TransportIo>;
 
-/// WebSocket adapter that implements AsyncRead + AsyncWrite
+/// WebSocket adapter with keep-alive support
 /// This allows WebSocket to work with Noise protocol and Frame protocol
 struct WebSocketAdapter {
     stream: WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,

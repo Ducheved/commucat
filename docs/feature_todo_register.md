@@ -49,6 +49,11 @@
 | F033 | Медиа          | Адаптивный битрейт, simulcast/FEC                                     | 1.4                   | Запланировано   | docs/todo.md                 |
 | F034 | Mesh           | QUIC/multipath relay прототип                                         | 1.4                   | Запланировано   | docs/todo.md                 |
 | F035 | P2P            | TURN/ICE-lite интеграция, NAT traversal                               | 1.4                   | Готово          | ICE-lite UDP + HMAC TURN creds (см. T8) |
+| F058 | Надёжность     | WebSocket Keep-Alive (Ping/Pong heartbeat)                            | 1.4                   | Готово          | Текущая итерация + resilience guide     |
+| F059 | Надёжность     | Connection Health Monitoring (RTT/jitter/loss)                        | 1.4                   | Готово          | Текущая итерация + metrics              |
+| F060 | Надёжность     | Automatic Reconnection с exponential backoff                          | 1.4                   | Готово          | Текущая итерация + client SDKs          |
+| F061 | Безопасность   | Port Knocking для Reality transport (TCP/UDP)                         | 1.4                   | Готово          | Текущая итерация + server config        |
+| F062 | P2P            | Multipath Failover (автоматическое переключение транспортов)          | 1.4                   | Готово          | Текущая итерация + degradation detect   |
 | F036 | Mesh           | Offline синхронизация (Wi-Fi Direct/BLE)                              | 2.0                   | Исследование    | ROADMAP §3.3                 |
 | F037 | Медиа          | AV1/H.264 поддержка (софт/GPU)                                        | 2.0                   | Запланировано   | ROADMAP §3.2                 |
 | F038 | Медиа          | Распределённый SFU                                                    | 2.0                   | Запланировано   | ROADMAP §3.2                 |

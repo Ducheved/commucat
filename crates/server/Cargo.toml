@@ -48,3 +48,4 @@ hmac = "0.12"
 http = "1"
 sha1 = "0.10"
 utoipa = { version = "4.2" }
+thiserror = "1.0"
