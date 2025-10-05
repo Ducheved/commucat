@@ -974,6 +974,8 @@ enum ApiError {
     NotFound,
     Conflict(String),
     Internal,
+    #[allow(dead_code)]
+    NotImplemented,
 }
 
 impl ApiError {
@@ -985,6 +987,7 @@ impl ApiError {
             Self::NotFound => 404,
             Self::Conflict(_) => 409,
             Self::Internal => 500,
+            Self::NotImplemented => 501,
         }
     }
 
@@ -996,6 +999,7 @@ impl ApiError {
             Self::NotFound => "NotFound",
             Self::Conflict(_) => "Conflict",
             Self::Internal => "InternalError",
+            Self::NotImplemented => "NotImplemented",
         }
     }
 }
@@ -3545,6 +3549,7 @@ impl CommuCatApp {
             ApiError::Internal => Some("internal server error"),
             ApiError::BadRequest(reason) => Some(reason.as_str()),
             ApiError::Conflict(reason) => Some(reason.as_str()),
+            ApiError::NotImplemented => Some("feature not yet implemented"),
         };
         let mut body = json!({
             "type": "about:blank",

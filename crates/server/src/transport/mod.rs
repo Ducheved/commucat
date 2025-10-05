@@ -1,6 +1,7 @@
 mod fec;
 
 use async_trait::async_trait;
+use futures_util::{Sink, Stream};
 use raptorq::ObjectTransmissionInformation;
 use std::collections::VecDeque;
 use std::fmt::{self, Display, Formatter};
@@ -9,11 +10,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{self, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::time::{Duration, sleep, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
-use futures_util::{SinkExt, StreamExt};
-use tracing::{debug, info, warn, error};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tracing::{debug, error, info, warn};
 
-pub use fec::{FecProfile, RaptorqDecoder, RaptorqEncoder};
+pub use fec::{FecProfile, RaptorqEncoder};
 
 pub trait TransportIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -50,12 +50,12 @@ impl AsyncRead for WebSocketAdapter {
             let to_copy = available.min(buf.remaining());
             buf.put_slice(&self.read_buffer[self.read_pos..self.read_pos + to_copy]);
             self.read_pos += to_copy;
-            
+
             if self.read_pos >= self.read_buffer.len() {
                 self.read_buffer.clear();
                 self.read_pos = 0;
             }
-            
+
             return Poll::Ready(Ok(()));
         }
 
@@ -64,13 +64,13 @@ impl AsyncRead for WebSocketAdapter {
             Poll::Ready(Some(Ok(Message::Binary(data)))) => {
                 let to_copy = data.len().min(buf.remaining());
                 buf.put_slice(&data[..to_copy]);
-                
+
                 // Buffer any remaining data
                 if to_copy < data.len() {
                     self.read_buffer = data[to_copy..].to_vec();
                     self.read_pos = 0;
                 }
-                
+
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Some(Ok(Message::Close(_)))) => {
@@ -81,9 +81,7 @@ impl AsyncRead for WebSocketAdapter {
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
-            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Ready(None) => {
                 Poll::Ready(Ok(())) // EOF
             }
@@ -100,13 +98,11 @@ impl AsyncWrite for WebSocketAdapter {
     ) -> Poll<io::Result<usize>> {
         let msg = Message::Binary(buf.to_vec());
         match Pin::new(&mut self.stream).poll_ready(cx) {
-            Poll::Ready(Ok(())) => {
-                match Pin::new(&mut self.stream).start_send(msg) {
-                    Ok(()) => Poll::Ready(Ok(buf.len())),
-                    Err(e) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
-                }
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Ok(())) => match Pin::new(&mut self.stream).start_send(msg) {
+                Ok(()) => Poll::Ready(Ok(buf.len())),
+                Err(e) => Poll::Ready(Err(io::Error::other(e))),
+            },
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -114,7 +110,7 @@ impl AsyncWrite for WebSocketAdapter {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match Pin::new(&mut self.stream).poll_flush(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -122,7 +118,7 @@ impl AsyncWrite for WebSocketAdapter {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match Pin::new(&mut self.stream).poll_close(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -334,12 +330,14 @@ pub struct MultipathPathInfo {
 #[derive(Debug, Clone)]
 pub struct MultipathSegment {
     pub path_id: String,
+    #[allow(dead_code)]
     pub payload: Vec<u8>,
     pub repair: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct MultipathDispatch {
+    #[allow(dead_code)]
     pub oti: ObjectTransmissionInformation,
     pub segments: Vec<MultipathSegment>,
 }
@@ -361,6 +359,7 @@ impl MultipathTunnel {
         Self { fec, paths }
     }
 
+    #[allow(dead_code)]
     pub fn path_count(&self) -> usize {
         self.paths.len()
     }
@@ -417,6 +416,7 @@ impl MultipathTunnel {
         }
     }
 
+    #[allow(dead_code)]
     pub fn primary_path_id(&self) -> Option<&str> {
         self.paths.first().map(|path| path.descriptor.id.as_str())
     }
@@ -958,13 +958,21 @@ impl PluggableTransport for WebSocketTransport {
         ctx: &TransportContext<'_>,
     ) -> Result<TransportSession, TransportError> {
         // Build WebSocket URL from endpoint
-        let scheme = if ctx.endpoint.port == 443 { "wss" } else { "ws" };
-        let host = ctx.endpoint.server_name.as_deref().unwrap_or(&ctx.endpoint.address);
+        let scheme = if ctx.endpoint.port == 443 {
+            "wss"
+        } else {
+            "ws"
+        };
+        let host = ctx
+            .endpoint
+            .server_name
+            .as_deref()
+            .unwrap_or(&ctx.endpoint.address);
         let port = ctx.endpoint.port;
         let url = format!("{}://{}:{}/p2p", scheme, host, port);
-        
+
         info!(url = %url, "Connecting to WebSocket P2P endpoint");
-        
+
         // Connect with timeout
         let connect_future = connect_async(&url);
         let (ws_stream, _response) = timeout(Duration::from_secs(10), connect_future)
@@ -977,9 +985,9 @@ impl PluggableTransport for WebSocketTransport {
                 error!(url = %url, error = %e, "WebSocket connection failed");
                 TransportError::Network
             })?;
-        
+
         info!(url = %url, "WebSocket P2P connection established");
-        
+
         let adapter = WebSocketAdapter::new(ws_stream);
         Ok(TransportSession::new(
             TransportType::WebSocket,
