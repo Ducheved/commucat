@@ -76,7 +76,8 @@ fn ensure_openapi_symbols_linked() {
             FriendRequestResponse,
             ServerInfoResponse,
             NoiseKeyDescriptor,
-            PairingInfo
+            PairingInfo,
+            PostQuantumCapabilities
         )
     ),
     modifiers(&SecurityAddon),
@@ -229,6 +230,17 @@ pub struct PairingInfo {
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
+pub struct PostQuantumCapabilities {
+    pub enabled: bool,
+    #[schema(example = "ML-KEM-768")]
+    pub kem_algorithm: Option<String>,
+    #[schema(example = "ML-DSA-65")]
+    pub signature_algorithm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kem_public_hex: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
 pub struct ServerInfoResponse {
     #[schema(example = "commucat.example.org")]
     pub domain: String,
@@ -240,6 +252,7 @@ pub struct ServerInfoResponse {
     pub supported_patterns: Vec<String>,
     pub supported_versions: Vec<u16>,
     pub pairing: PairingInfo,
+    pub post_quantum: PostQuantumCapabilities,
 }
 
 #[derive(IntoParams)]

@@ -317,8 +317,10 @@ pub fn load_configuration(path: &Path) -> Result<ServerConfig, ConfigError> {
     };
     let transport = TransportConfig { reality };
 
-    let pq_kem_secret_hex = override_env("COMMUCAT_PQ_KEM_SECRET", map.remove("crypto.pq_kem_secret"))?;
-    let pq_kem_public_hex = override_env("COMMUCAT_PQ_KEM_PUBLIC", map.remove("crypto.pq_kem_public"))?;
+    let pq_kem_secret_hex =
+        override_env("COMMUCAT_PQ_KEM_SECRET", map.remove("crypto.pq_kem_secret"))?;
+    let pq_kem_public_hex =
+        override_env("COMMUCAT_PQ_KEM_PUBLIC", map.remove("crypto.pq_kem_public"))?;
     let pq = match (pq_kem_secret_hex, pq_kem_public_hex) {
         (Some(secret_hex), Some(public_hex)) => {
             let kem_secret = decode_hex(secret_hex.trim()).map_err(|_| ConfigError::Invalid)?;

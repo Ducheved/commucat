@@ -28,8 +28,8 @@ use chrono::{Duration, Utc};
 use commucat_crypto::zkp::{self, KnowledgeProof};
 use commucat_crypto::{
     CryptoError, DeviceCertificate, DeviceCertificateData, DeviceKeyPair, EventSigner,
-    EventVerifier, HandshakePattern, HybridResponderResult, HybridSettings, NoiseConfig,
-    NoiseHandshake, NoiseTransport, SessionRole, build_handshake, decapsulate_hybrid,
+    EventVerifier, HandshakePattern, HybridResponderResult, NoiseConfig, NoiseHandshake,
+    NoiseTransport, build_handshake,
 };
 use commucat_federation::{
     FederationError, FederationEvent, SignedEvent, sign_event, verify_event,
@@ -48,18 +48,15 @@ use commucat_proto::{
     is_supported_protocol_version, negotiate_protocol_version,
 };
 use commucat_storage::{
-    ChatGroup, DeviceKeyEvent, DevicePqKeys, DeviceRecord, DeviceRotationRecord,
-    FederatedFriendRequest, FederationOutboxInsert, FederationOutboxMessage, FederationPeerStatus,
-    GroupMember, GroupRole, IdempotencyKey, InboxOffset, NewUserProfile, PresenceSnapshot,
-    RelayEnvelope, SessionRecord, Storage, StorageError, UserProfile, connect,
+    ChatGroup, DeviceKeyEvent, DeviceRecord, DeviceRotationRecord, FederatedFriendRequest,
+    FederationOutboxInsert, FederationOutboxMessage, FederationPeerStatus, GroupMember, GroupRole,
+    IdempotencyKey, InboxOffset, NewUserProfile, PresenceSnapshot, RelayEnvelope, SessionRecord,
+    Storage, StorageError, UserProfile, connect,
 };
 use ed25519_dalek::{Signature as Ed25519Signature, Verifier, VerifyingKey};
 use futures_util::{SinkExt, StreamExt};
-use ml_dsa::{EncodedSignature as MlDsaEncodedSignature, MlDsa65, Signature as MlDsaSignature,
-    VerifyingKey as MlDsaVerifyingKey};
-use ml_kem::{Ciphertext as MlKemCiphertext, DecapsulationKey as MlKemDecapsulationKey,
-    EncapsulationKey as MlKemEncapsulationKey, MlKem768};
 use http::HeaderValue;
+use ml_kem::{EncodedSizeUser, KemCore, MlKem768};
 use pingora::apps::{HttpServerApp, HttpServerOptions, ReusedHttpStream};
 use pingora::http::ResponseHeader;
 use pingora::protocols::Stream as PingoraStream;
@@ -978,6 +975,9 @@ pub struct PqRuntime {
     kem_secret: Vec<u8>,
 }
 
+type MlKemEncapsulationKey = <MlKem768 as KemCore>::EncapsulationKey;
+type MlKemDecapsulationKey = <MlKem768 as KemCore>::DecapsulationKey;
+
 impl PqRuntime {
     fn from_config(config: &PqHandshakeConfig) -> Result<Self, ServerError> {
         let runtime = PqRuntime {
@@ -995,13 +995,25 @@ impl PqRuntime {
     }
 
     fn encapsulation_key(&self) -> Result<MlKemEncapsulationKey, ServerError> {
-        MlKemEncapsulationKey::try_from(self.kem_public.as_slice())
-            .map_err(|_| ServerError::Invalid)
+        // ML-KEM-768 encapsulation key is 1184 bytes
+        const ENCAP_KEY_SIZE: usize = 1184;
+        if self.kem_public.len() != ENCAP_KEY_SIZE {
+            return Err(ServerError::Invalid);
+        }
+        let mut arr = [0u8; ENCAP_KEY_SIZE];
+        arr.copy_from_slice(&self.kem_public);
+        Ok(MlKemEncapsulationKey::from_bytes(&arr.into()))
     }
 
     fn decapsulation_key(&self) -> Result<MlKemDecapsulationKey, ServerError> {
-        MlKemDecapsulationKey::try_from(self.kem_secret.as_slice())
-            .map_err(|_| ServerError::Invalid)
+        // ML-KEM-768 decapsulation key is 2400 bytes
+        const DECAP_KEY_SIZE: usize = 2400;
+        if self.kem_secret.len() != DECAP_KEY_SIZE {
+            return Err(ServerError::Invalid);
+        }
+        let mut arr = [0u8; DECAP_KEY_SIZE];
+        arr.copy_from_slice(&self.kem_secret);
+        Ok(MlKemDecapsulationKey::from_bytes(&arr.into()))
     }
 }
 
@@ -1269,6 +1281,7 @@ struct HandshakeContext {
     certificate: Option<DeviceCertificate>,
     noise_key: Option<NoiseKey>,
     transport: Option<Arc<Mutex<NoiseTransport>>>,
+    #[allow(dead_code)] // TODO: Use for hybrid PQ ratcheting
     pq_session: Option<HybridResponderResult>,
     device_known: bool,
 }
@@ -2183,6 +2196,12 @@ impl CommuCatApp {
                 "auto_approve": self.state.config.auto_approve_devices,
                 "pairing_ttl": self.state.config.pairing_ttl_seconds,
                 "max_auto_devices": self.state.config.max_auto_devices_per_user,
+            },
+            "post_quantum": {
+                "enabled": self.state.pq.is_some(),
+                "kem_algorithm": if self.state.pq.is_some() { Some("ML-KEM-768") } else { None },
+                "signature_algorithm": if self.state.pq.is_some() { Some("ML-DSA-65") } else { None },
+                "kem_public_hex": self.state.pq.as_ref().map(|pq| encode_hex(&pq.kem_public)),
             }
         });
         self.respond_json(session, 200, payload, "application/json")

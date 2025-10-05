@@ -963,10 +963,7 @@ impl Storage {
     }
 
     /// Upserts post-quantum key material for a device.
-    pub async fn upsert_device_pq_keys(
-        &self,
-        keys: &DevicePqKeys,
-    ) -> Result<(), StorageError> {
+    pub async fn upsert_device_pq_keys(&self, keys: &DevicePqKeys) -> Result<(), StorageError> {
         self.client
             .execute(
                 "INSERT INTO device_pq_keys (device_id, kem_public, signature_public, updated_at)
@@ -975,7 +972,12 @@ impl Storage {
                  SET kem_public = EXCLUDED.kem_public,
                      signature_public = EXCLUDED.signature_public,
                      updated_at = EXCLUDED.updated_at",
-                &[&keys.device_id, &keys.kem_public, &keys.signature_public, &keys.updated_at],
+                &[
+                    &keys.device_id,
+                    &keys.kem_public,
+                    &keys.signature_public,
+                    &keys.updated_at,
+                ],
             )
             .await
             .map_err(|_| StorageError::Postgres)?;

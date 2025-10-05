@@ -848,6 +848,7 @@ fn build_ice_advice(state: &AppState) -> IceAdvice {
         .map(|lite| build_lite_candidate(lite.public_addr))
         .into_iter()
         .collect();
+    let expires_at = Some((Utc::now() + ChronoDuration::seconds(ttl_secs as i64)).to_rfc3339());
     IceAdvice {
         username_fragment,
         password,
@@ -856,5 +857,6 @@ fn build_ice_advice(state: &AppState) -> IceAdvice {
         trickle: true,
         servers,
         lite_candidates,
+        expires_at,
     }
 }
