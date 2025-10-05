@@ -1885,7 +1885,7 @@ impl CommuCatApp {
             }
             return None;
         }
-        if path == "/connect" && method == "POST" {
+        if path == "/connect" && (method == "POST" || method == "GET") {
             return self.process_connect(session, shutdown).await;
         }
         let mut response = ResponseHeader::build_no_case(404, None).ok()?;
