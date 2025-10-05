@@ -4505,12 +4505,23 @@ impl CommuCatApp {
             remote_for_hash
         };
         let detail_log = detail.clone();
+        let noise_version = context.noise_key.as_ref().map(|key| key.version);
+        let session_known = !context.session_id.is_empty();
+        let has_profile = context.user_profile.is_some();
+        let has_certificate = context.certificate.is_some();
+
         warn!(
             remote_addr = remote_label,
             stage = context.stage.as_str(),
             device = %context.device_id,
             user = %context.user_id,
+            session_known,
+            protocol_version = context.protocol_version,
+            noise_key_version = noise_version.unwrap_or_default(),
+            noise_key_active = noise_version.is_some(),
             device_known = context.device_known,
+            has_profile,
+            has_certificate,
             reason,
             detail = ?detail_log,
             "handshake failure"
@@ -4535,6 +4546,16 @@ impl CommuCatApp {
         metadata.insert("reason".to_string(), json!(reason));
         metadata.insert("detail".to_string(), detail);
         metadata.insert("device_known".to_string(), json!(context.device_known));
+        metadata.insert(
+            "noise_key_active".to_string(),
+            json!(noise_version.is_some()),
+        );
+        if let Some(version) = noise_version {
+            metadata.insert("noise_key_version".to_string(), json!(version));
+        }
+        metadata.insert("has_user_profile".to_string(), json!(has_profile));
+        metadata.insert("has_certificate".to_string(), json!(has_certificate));
+        metadata.insert("session_known".to_string(), json!(session_known));
         if let Some(addr) = remote_addr {
             metadata.insert("remote_addr".to_string(), json!(addr));
         }
@@ -4549,6 +4570,9 @@ impl CommuCatApp {
                 "protocol_version".to_string(),
                 json!(context.protocol_version),
             );
+        }
+        if !context.session_id.is_empty() {
+            metadata.insert("session".to_string(), json!(context.session_id.clone()));
         }
 
         let record = LedgerRecord {
