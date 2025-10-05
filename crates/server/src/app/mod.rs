@@ -1893,6 +1893,10 @@ impl CommuCatApp {
             }
             return None;
         }
+        if path == "/p2p" && method == "GET" {
+            // P2P WebSocket endpoint for direct peer connections
+            return self.process_p2p_websocket(session).await;
+        }
         if path == "/connect" && (method == "POST" || method == "GET") {
             return self.process_connect(session, shutdown).await;
         }
@@ -4062,6 +4066,71 @@ impl CommuCatApp {
         session.finish().await.map_err(|_| ServerError::Io)?;
         self.state.metrics.mark_egress();
         Ok(())
+    }
+
+    async fn process_p2p_websocket(
+        self: &Arc<Self>,
+        session: ServerSession,
+    ) -> Option<ReusedHttpStream> {
+        info!("P2P WebSocket connection requested");
+
+        // Use ConnectChannel's WebSocket upgrade (same as /connect)
+        let channel = match ConnectChannel::upgrade_websocket(session).await {
+            Ok(channel) => channel,
+            Err(err) => {
+                error!(error = %err, "P2P WebSocket upgrade failed");
+                return None;
+            }
+        };
+
+        info!("P2P WebSocket connection established");
+        self.state.metrics.mark_ingress();
+
+        // Extract the WebSocket stream
+        let ws_channel = match channel {
+            ConnectChannel::WebSocket(ws) => ws,
+            _ => {
+                error!("Expected WebSocket channel");
+                return None;
+            }
+        };
+
+        // TODO: Implement P2P relay logic
+        // For now, just keep connection open and echo back messages
+        use tokio::time::{Duration, timeout};
+
+        info!("P2P relay session started");
+        let mut ws = ws_channel;
+
+        // Simple echo server for testing
+        loop {
+            match timeout(Duration::from_secs(60), ws.read_chunk()).await {
+                Ok(Ok(Some(data))) => {
+                    info!(size = data.len(), "P2P data received, echoing back");
+                    if let Err(err) = ws.write_payload(data).await {
+                        error!(error = %err, "Failed to send P2P data");
+                        break;
+                    }
+                }
+                Ok(Ok(None)) => {
+                    info!("P2P connection closed by client");
+                    break;
+                }
+                Ok(Err(err)) => {
+                    error!(error = %err, "P2P read error");
+                    break;
+                }
+                Err(_) => {
+                    debug!("P2P connection idle timeout");
+                    break;
+                }
+            }
+        }
+
+        let _ = ws.finish().await;
+        info!("P2P WebSocket session terminated");
+        self.state.metrics.mark_egress();
+        None
     }
 
     async fn process_connect(
