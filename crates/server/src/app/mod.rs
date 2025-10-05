@@ -6414,7 +6414,74 @@ impl CommuCatApp {
                 let _ = tx_out.send(ack).await;
                 Ok(())
             }
-            FrameType::Msg | FrameType::Typing | FrameType::KeyUpdate | FrameType::GroupEvent => {
+            FrameType::Msg => {
+                // Handle application-level ping/pong for connection health monitoring
+                if let FramePayload::Control(ref envelope) = frame.payload
+                    && let Some(text) = envelope.properties.get("text").and_then(|v| v.as_str())
+                    && text.is_empty()
+                {
+                    // This is an application-level PING
+                    tracing::debug!(device = %device_id, "📥 Received application-level PING");
+
+                    // Mark ping received in metrics
+                    self.state.metrics.mark_websocket_ping_received();
+
+                    // Send empty message back (PONG)
+                    let pong_frame = Frame {
+                        channel_id: frame.channel_id,
+                        sequence: *server_sequence,
+                        frame_type: FrameType::Msg,
+                        payload: FramePayload::Control(ControlEnvelope {
+                            properties: json!({
+                                "text": "",
+                                "pong": true,
+                                "timestamp": chrono::Utc::now().timestamp_millis(),
+                            }),
+                        }),
+                    };
+                    *server_sequence += 1;
+                    let _ = tx_out.send(pong_frame).await;
+
+                    // Mark pong sent in metrics
+                    self.state.metrics.mark_websocket_pong_sent();
+
+                    tracing::debug!(device = %device_id, "📤 Sent application-level PONG");
+
+                    // Send ACK for the ping
+                    let ack = Frame {
+                        channel_id: frame.channel_id,
+                        sequence: *server_sequence,
+                        frame_type: FrameType::Ack,
+                        payload: FramePayload::Control(ControlEnvelope {
+                            properties: json!({
+                                "ack": frame.sequence,
+                                "ping_pong": true,
+                            }),
+                        }),
+                    };
+                    *server_sequence += 1;
+                    let _ = tx_out.send(ack).await;
+                    return Ok(());
+                }
+
+                // Handle regular messages
+                let inbound_sequence = frame.sequence;
+                self.broadcast_frame(device_id, frame.clone()).await?;
+                let ack = Frame {
+                    channel_id: frame.channel_id,
+                    sequence: *server_sequence,
+                    frame_type: FrameType::Ack,
+                    payload: FramePayload::Control(ControlEnvelope {
+                        properties: json!({
+                            "ack": inbound_sequence,
+                        }),
+                    }),
+                };
+                *server_sequence += 1;
+                let _ = tx_out.send(ack).await;
+                Ok(())
+            }
+            FrameType::Typing | FrameType::KeyUpdate | FrameType::GroupEvent => {
                 let inbound_sequence = frame.sequence;
                 self.broadcast_frame(device_id, frame.clone()).await?;
                 let ack = Frame {
