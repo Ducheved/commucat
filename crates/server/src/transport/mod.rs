@@ -1,5 +1,6 @@
 mod fec;
 mod keepalive;
+mod network_probe;
 
 use async_trait::async_trait;
 use blake3::hash as blake3_hash;
@@ -12,7 +13,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::time::{Duration, Instant, timeout};
+use tokio::time::{Duration, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
@@ -23,6 +24,7 @@ pub use keepalive::{
     ConnectionHealth, ConnectionState, KeepAliveConfig, KeepAliveError, PortKnockingSequence,
     ReconnectStrategy,
 };
+pub use network_probe::{NetworkProbeResult, ProbeConfig, ProbeMethod, probe_network};
 
 pub trait TransportIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -242,9 +244,13 @@ pub struct NetworkSnapshot {
     pub bandwidth_kbps: u32,
     pub loss_rate: f32,
     pub quality: NetworkQuality,
+    pub jitter_ms: f32,
+    pub probe_method: ProbeMethod,
+    pub quality_score: u8,
 }
 
 impl NetworkSnapshot {
+    #[allow(dead_code)] // Legacy compatibility function
     pub fn degraded(loss_rate: f32, bandwidth_kbps: u32, rtt_ms: u32) -> Self {
         let quality = if loss_rate < 0.01 && bandwidth_kbps > 5_000 && rtt_ms < 80 {
             NetworkQuality::Excellent
@@ -260,6 +266,33 @@ impl NetworkSnapshot {
             bandwidth_kbps,
             loss_rate,
             quality,
+            jitter_ms: 0.0,
+            probe_method: ProbeMethod::TcpConnect,
+            quality_score: 50,
+        }
+    }
+
+    pub fn from_probe_result(result: NetworkProbeResult) -> Self {
+        let quality = if result.packet_loss_rate < 0.01
+            && result.bandwidth_kbps > 5_000
+            && result.rtt_ms < 80
+        {
+            NetworkQuality::Excellent
+        } else if result.packet_loss_rate < 0.02 && result.bandwidth_kbps > 2_000 {
+            NetworkQuality::Good
+        } else if result.packet_loss_rate < 0.05 {
+            NetworkQuality::Degraded
+        } else {
+            NetworkQuality::Poor
+        };
+        Self {
+            rtt_ms: result.rtt_ms,
+            bandwidth_kbps: result.bandwidth_kbps,
+            loss_rate: result.packet_loss_rate,
+            quality,
+            jitter_ms: result.jitter_ms,
+            probe_method: result.probe_method,
+            quality_score: result.quality_score(),
         }
     }
 }
@@ -358,6 +391,7 @@ pub struct MultipathPathInfo {
     pub transport: TransportType,
     pub resistance: ResistanceLevel,
     pub performance: PerformanceProfile,
+    pub network: NetworkSnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -377,6 +411,7 @@ pub struct MultipathDispatch {
 struct PathSession {
     descriptor: MultipathEndpoint,
     session: TransportSession,
+    network: NetworkSnapshot,
 }
 
 #[derive(Debug)]
@@ -402,6 +437,7 @@ impl MultipathTunnel {
                 transport: path.session.transport,
                 resistance: path.session.resistance,
                 performance: path.session.profile,
+                network: path.network.clone(),
             })
             .collect()
     }
@@ -539,7 +575,7 @@ impl TransportManager {
     pub async fn establish_connection(
         &mut self,
         endpoint: &Endpoint,
-    ) -> Result<TransportSession, TransportError> {
+    ) -> Result<(TransportSession, NetworkSnapshot), TransportError> {
         let network = assess_network_conditions(endpoint).await;
         let default_context = TransportContext {
             endpoint,
@@ -575,7 +611,7 @@ impl TransportManager {
                 Ok(Ok(session)) => {
                     self.register_history(kind);
                     info!(transport = ?kind, "transport established");
-                    return Ok(session);
+                    return Ok((session, network));
                 }
                 Ok(Err(err)) => {
                     warn!(transport = ?kind, error = %err, "transport failed");
@@ -607,7 +643,7 @@ impl TransportManager {
                     Ok(Ok(session)) => {
                         self.register_history(fallback);
                         info!(transport = ?fallback, "fallback transport established");
-                        return Ok(session);
+                        return Ok((session, network));
                     }
                     Ok(Err(err)) => attempts.push((fallback, err)),
                     Err(_) => attempts.push((fallback, TransportError::Timeout)),
@@ -633,10 +669,11 @@ impl TransportManager {
         let mut last_error = None;
         for descriptor in ordered.into_iter() {
             match self.establish_connection(&descriptor.endpoint).await {
-                Ok(session) => {
+                Ok((session, network)) => {
                     sessions.push(PathSession {
                         descriptor,
                         session,
+                        network,
                     });
                 }
                 Err(err) => {
@@ -712,52 +749,29 @@ fn score_transport(
 }
 
 async fn assess_network_conditions(endpoint: &Endpoint) -> NetworkSnapshot {
-    const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
-    const ATTEMPTS: u32 = 3;
-    let target = format!("{}:{}", endpoint.address, endpoint.port);
-    let mut best_rtt: Option<u32> = None;
-    let mut successes = 0u32;
-
-    for attempt in 0..ATTEMPTS {
-        let started = Instant::now();
-        match timeout(CONNECT_TIMEOUT, TcpStream::connect(&target)).await {
-            Ok(Ok(mut stream)) => {
-                let elapsed = started.elapsed();
-                let rtt = elapsed.as_millis().min(u128::from(u32::MAX)) as u32;
-                best_rtt = Some(match best_rtt {
-                    Some(current) if current <= rtt => current,
-                    _ => rtt,
-                });
-                successes += 1;
-                if let Err(err) = stream.shutdown().await {
-                    debug!(target = %target, error = %err, "tcp probe shutdown failed");
-                }
-            }
-            Ok(Err(err)) => {
-                debug!(target = %target, error = %err, attempt = attempt + 1, "tcp probe failed");
-            }
-            Err(_) => {
-                debug!(target = %target, attempt = attempt + 1, "tcp probe timed out");
-            }
-        }
-    }
-
-    if successes == 0 {
-        return NetworkSnapshot::degraded(0.08, 1_000, 280);
-    }
-
-    let rtt_ms = best_rtt.unwrap_or(220);
-    let bandwidth_kbps = match rtt_ms {
-        0..=40 => 12_000,
-        41..=80 => 9_000,
-        81..=150 => 6_000,
-        151..=220 => 3_500,
-        _ => 1_500,
+    // Use advanced network probing with jitter/loss/bandwidth estimation
+    let config = ProbeConfig {
+        attempts: 5,
+        timeout: Duration::from_millis(300),
+        use_https: endpoint.port == 443 || endpoint.port == 8443,
+        measure_jitter: true,
+        estimate_bandwidth: true,
     };
-    let loss_fraction = 1.0f32 - (successes as f32 / ATTEMPTS as f32);
-    let loss_rate = (0.01 + loss_fraction * 0.25).min(0.2);
 
-    NetworkSnapshot::degraded(loss_rate, bandwidth_kbps, rtt_ms)
+    let probe_result = probe_network(&endpoint.address, endpoint.port, &config).await;
+
+    debug!(
+        target = %format!("{}:{}", endpoint.address, endpoint.port),
+        rtt_ms = probe_result.rtt_ms,
+        jitter_ms = probe_result.jitter_ms,
+        loss_rate = probe_result.packet_loss_rate,
+        bandwidth_kbps = probe_result.bandwidth_kbps,
+        quality = %probe_result.quality_label(),
+        probe_method = ?probe_result.probe_method,
+        "network assessment completed"
+    );
+
+    NetworkSnapshot::from_probe_result(probe_result)
 }
 
 fn memory_stream() -> io::Result<(TransportStream, TransportStream)> {
@@ -1260,7 +1274,7 @@ mod tests {
                 server_name: Some("example.org".to_string()),
                 reality: None,
             };
-            let session = manager.establish_connection(&endpoint).await.unwrap();
+            let (session, _network) = manager.establish_connection(&endpoint).await.unwrap();
             assert_eq!(session.transport, TransportType::AmnesiaWg);
         });
     }
@@ -1294,7 +1308,7 @@ mod tests {
                 server_name: Some("rescue.example".to_string()),
                 reality: None,
             };
-            let session = manager.establish_connection(&endpoint).await.unwrap();
+            let (session, _network) = manager.establish_connection(&endpoint).await.unwrap();
             assert_eq!(session.transport, TransportType::Shadowsocks);
         });
     }

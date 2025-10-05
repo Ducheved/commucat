@@ -1440,7 +1440,7 @@ impl CommuCatApp {
             let available = manager.list_transports();
             info!(transports = ?available, "transport candidates prepared");
             match manager.establish_connection(&endpoint).await {
-                Ok(session) => {
+                Ok((session, _network)) => {
                     info!(transport = ?session.transport, "transport bootstrap established");
                 }
                 Err(err) => {

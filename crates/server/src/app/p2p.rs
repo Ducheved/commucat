@@ -195,6 +195,18 @@ pub struct TransportAdvice {
     pub resistance: String,
     pub latency: String,
     pub throughput: String,
+    pub network_quality: NetworkQualityInfo,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NetworkQualityInfo {
+    pub rtt_ms: u32,
+    pub jitter_ms: f32,
+    pub packet_loss_percent: f32,
+    pub bandwidth_kbps: u32,
+    pub quality_score: u8,
+    pub quality_label: String,
+    pub probe_method: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -679,12 +691,40 @@ fn build_keepalive_advice(state: &AppState) -> KeepAliveAdvice {
 }
 
 fn transport_advice_from_info(info: &MultipathPathInfo) -> TransportAdvice {
+    let quality_label = if info.network.quality_score >= 90 {
+        "excellent"
+    } else if info.network.quality_score >= 75 {
+        "good"
+    } else if info.network.quality_score >= 50 {
+        "fair"
+    } else if info.network.quality_score >= 25 {
+        "poor"
+    } else {
+        "critical"
+    };
+
+    let probe_method_str = match info.network.probe_method {
+        crate::transport::ProbeMethod::TcpConnect => "tcp_connect",
+        crate::transport::ProbeMethod::HttpsHead => "https_head",
+        crate::transport::ProbeMethod::UdpEcho => "udp_echo",
+        crate::transport::ProbeMethod::Mixed => "mixed",
+    };
+
     TransportAdvice {
         path_id: info.id.clone(),
         transport: transport_label(info.transport).to_string(),
         resistance: resistance_label_str(info.resistance).to_string(),
         latency: tier_label_str(info.performance.latency).to_string(),
         throughput: tier_label_str(info.performance.throughput).to_string(),
+        network_quality: NetworkQualityInfo {
+            rtt_ms: info.network.rtt_ms,
+            jitter_ms: info.network.jitter_ms,
+            packet_loss_percent: info.network.loss_rate * 100.0,
+            bandwidth_kbps: info.network.bandwidth_kbps,
+            quality_score: info.network.quality_score,
+            quality_label: quality_label.to_string(),
+            probe_method: probe_method_str.to_string(),
+        },
     }
 }
 
@@ -775,6 +815,15 @@ fn fallback_transport_advice(endpoints: &[MultipathEndpoint]) -> Vec<TransportAd
                 resistance: resistance_label_str(resistance).to_string(),
                 latency: tier_label_str(latency).to_string(),
                 throughput: tier_label_str(throughput).to_string(),
+                network_quality: NetworkQualityInfo {
+                    rtt_ms: 100,
+                    jitter_ms: 15.0,
+                    packet_loss_percent: 1.0,
+                    bandwidth_kbps: 5_000,
+                    quality_score: 70,
+                    quality_label: "fair".to_string(),
+                    probe_method: "fallback".to_string(),
+                },
             }
         })
         .collect()

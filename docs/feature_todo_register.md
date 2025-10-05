@@ -71,8 +71,8 @@
 | F050 | QA             | Регрессионные тесты для всех connect-mode                             | 1.2                   | Запланировано   | CONNECT_MODES TODO           |
 | F051 | Документация   | Обновить README/quickstart с режимами подключения                     | 1.2                   | Запланировано   | CONNECT_MODES TODO           |
 | F052 | Транспорты     | Полноценные data-path для Reality/Shadowsocks/QUIC/DNS                | 1.3                   | Запланировано   | TRANSPORT_STATUS Next steps  |
-| F053 | Транспорты     | Расширенные сетевые пробы (HTTPS HEAD, джиттер)                       | 1.3                   | Запланировано   | TRANSPORT_STATUS Next steps  |
-| F054 | Наблюдаемость  | Метрики `transport_rtt_ms`, `transport_loss_ratio`                    | 1.3                   | Запланировано   | TRANSPORT_STATUS Next steps  |
+| F053 | Транспорты     | Расширенные сетевые пробы (HTTPS HEAD, джиттер)                       | 1.3                   | Готово          | TRANSPORT_STATUS Next steps  |
+| F054 | Наблюдаемость  | Метрики `transport_rtt_ms`, `transport_loss_ratio`                    | 1.3                   | Готово          | TRANSPORT_STATUS Next steps  |
 | F055 | QA             | Интеграционные тесты WebSocket assist sampling                        | 1.3                   | Запланировано   | TRANSPORT_STATUS Next steps  |
 | F056 | Федерация      | Фоновый воркер retry + подпись очереди                                | 1.3                   | Запланировано   | dev_todo_tracker T7          |
 | F057 | Надёжность     | Гранулярная обработка ошибок uploads/pairing/rate limiter             | 1.2                   | Запланировано   | ARCHITECT §7                 |
