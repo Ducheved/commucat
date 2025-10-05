@@ -1,6 +1,7 @@
 mod fec;
 
 use async_trait::async_trait;
+use blake3::hash as blake3_hash;
 use futures_util::{Sink, Stream};
 use raptorq::ObjectTransmissionInformation;
 use std::collections::VecDeque;
@@ -8,12 +9,13 @@ use std::fmt::{self, Display, Formatter};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::io::{self, AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
-use tokio::time::{Duration, sleep, timeout};
+use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::net::TcpStream;
+use tokio::time::{Duration, Instant, timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
-pub use fec::{FecProfile, RaptorqEncoder};
+pub use fec::{FecProfile, RaptorqDecoder, RaptorqEncoder};
 
 pub trait TransportIo: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T> TransportIo for T where T: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -321,28 +323,21 @@ impl MultipathEndpoint {
 
 #[derive(Debug, Clone)]
 pub struct MultipathPathInfo {
-    #[allow(dead_code)]
     pub id: String,
     pub transport: TransportType,
-    #[allow(dead_code)]
     pub resistance: ResistanceLevel,
-    #[allow(dead_code)]
     pub performance: PerformanceProfile,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct MultipathSegment {
     pub path_id: String,
-    #[allow(dead_code)]
     pub payload: Vec<u8>,
     pub repair: bool,
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct MultipathDispatch {
-    #[allow(dead_code)]
     pub oti: ObjectTransmissionInformation,
     pub segments: Vec<MultipathSegment>,
 }
@@ -350,29 +345,24 @@ pub struct MultipathDispatch {
 #[derive(Debug)]
 struct PathSession {
     descriptor: MultipathEndpoint,
-    #[allow(dead_code)]
     session: TransportSession,
 }
 
 #[derive(Debug)]
 pub struct MultipathTunnel {
-    #[allow(dead_code)]
     fec: FecProfile,
     paths: Vec<PathSession>,
 }
 
 impl MultipathTunnel {
-    #[allow(dead_code)]
     fn new(fec: FecProfile, paths: Vec<PathSession>) -> Self {
         Self { fec, paths }
     }
 
-    #[allow(dead_code)]
     pub fn path_count(&self) -> usize {
         self.paths.len()
     }
 
-    #[allow(dead_code)]
     pub fn path_info(&self) -> Vec<MultipathPathInfo> {
         self.paths
             .iter()
@@ -385,7 +375,6 @@ impl MultipathTunnel {
             .collect()
     }
 
-    #[allow(dead_code)]
     pub fn encode_frame(&self, payload: &[u8]) -> MultipathDispatch {
         let encoder = RaptorqEncoder::new(self.fec.clone());
         let batch = encoder.encode(payload);
@@ -426,7 +415,6 @@ impl MultipathTunnel {
         }
     }
 
-    #[allow(dead_code)]
     pub fn primary_path_id(&self) -> Option<&str> {
         self.paths.first().map(|path| path.descriptor.id.as_str())
     }
@@ -521,7 +509,7 @@ impl TransportManager {
         &mut self,
         endpoint: &Endpoint,
     ) -> Result<TransportSession, TransportError> {
-        let network = assess_network_conditions().await;
+        let network = assess_network_conditions(endpoint).await;
         let default_context = TransportContext {
             endpoint,
             network: &network,
@@ -598,7 +586,6 @@ impl TransportManager {
         Err(TransportError::Exhausted)
     }
 
-    #[allow(dead_code)]
     pub async fn establish_multipath(
         &mut self,
         endpoints: &[MultipathEndpoint],
@@ -693,10 +680,53 @@ fn score_transport(
     base + perf + network_bias + bandwidth_bias + latency_bias + loss_bias + censorship_bias
 }
 
-async fn assess_network_conditions() -> NetworkSnapshot {
-    // TODO: integrate actual RTT/bandwidth sampling against measurement endpoints
-    sleep(Duration::from_millis(5)).await;
-    NetworkSnapshot::degraded(0.012, 4_800, 90)
+async fn assess_network_conditions(endpoint: &Endpoint) -> NetworkSnapshot {
+    const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+    const ATTEMPTS: u32 = 3;
+    let target = format!("{}:{}", endpoint.address, endpoint.port);
+    let mut best_rtt: Option<u32> = None;
+    let mut successes = 0u32;
+
+    for attempt in 0..ATTEMPTS {
+        let started = Instant::now();
+        match timeout(CONNECT_TIMEOUT, TcpStream::connect(&target)).await {
+            Ok(Ok(mut stream)) => {
+                let elapsed = started.elapsed();
+                let rtt = elapsed.as_millis().min(u128::from(u32::MAX)) as u32;
+                best_rtt = Some(match best_rtt {
+                    Some(current) if current <= rtt => current,
+                    _ => rtt,
+                });
+                successes += 1;
+                if let Err(err) = stream.shutdown().await {
+                    debug!(target = %target, error = %err, "tcp probe shutdown failed");
+                }
+            }
+            Ok(Err(err)) => {
+                debug!(target = %target, error = %err, attempt = attempt + 1, "tcp probe failed");
+            }
+            Err(_) => {
+                debug!(target = %target, attempt = attempt + 1, "tcp probe timed out");
+            }
+        }
+    }
+
+    if successes == 0 {
+        return NetworkSnapshot::degraded(0.08, 1_000, 280);
+    }
+
+    let rtt_ms = best_rtt.unwrap_or(220);
+    let bandwidth_kbps = match rtt_ms {
+        0..=40 => 12_000,
+        41..=80 => 9_000,
+        81..=150 => 6_000,
+        151..=220 => 3_500,
+        _ => 1_500,
+    };
+    let loss_fraction = 1.0f32 - (successes as f32 / ATTEMPTS as f32);
+    let loss_rate = (0.01 + loss_fraction * 0.25).min(0.2);
+
+    NetworkSnapshot::degraded(loss_rate, bandwidth_kbps, rtt_ms)
 }
 
 fn memory_stream() -> io::Result<(TransportStream, TransportStream)> {
@@ -742,17 +772,63 @@ impl PluggableTransport for RealityTransport {
         if matches!(ctx.censorship, CensorshipStatus::Active) {
             return Err(TransportError::Censorship);
         }
-        if ctx.endpoint.reality.is_none() {
-            return Ok(CensorshipStatus::None);
+        let Some(reality) = ctx.endpoint.reality.as_ref() else {
+            return Ok(ctx.censorship);
+        };
+
+        let computed = blake3_hash(reality.certificate_pem.as_bytes());
+        if computed.as_bytes() != &self.fingerprint {
+            warn!("reality certificate fingerprint mismatch");
+            return Err(TransportError::Censorship);
         }
-        // TODO: Extend with active probing using REALITY tickets
-        Ok(ctx.censorship)
+
+        const PROBE_ATTEMPTS: u32 = 2;
+        let target = format!("{}:{}", ctx.endpoint.address, ctx.endpoint.port);
+        let mut successes = 0u32;
+        for attempt in 0..PROBE_ATTEMPTS {
+            match timeout(Duration::from_millis(200), TcpStream::connect(&target)).await {
+                Ok(Ok(mut stream)) => {
+                    successes += 1;
+                    if let Err(err) = stream.shutdown().await {
+                        debug!(target = %target, error = %err, "reality probe shutdown failed");
+                    }
+                }
+                Ok(Err(err)) => {
+                    debug!(target = %target, attempt = attempt + 1, error = %err, "reality probe tcp error");
+                }
+                Err(_) => {
+                    debug!(target = %target, attempt = attempt + 1, "reality probe timeout");
+                }
+            }
+        }
+
+        let probe_status = if successes == 0 {
+            CensorshipStatus::Active
+        } else if successes < PROBE_ATTEMPTS {
+            CensorshipStatus::Suspected
+        } else {
+            CensorshipStatus::None
+        };
+
+        let final_status = match (ctx.censorship, probe_status) {
+            (CensorshipStatus::Active, _) | (_, CensorshipStatus::Active) => {
+                CensorshipStatus::Active
+            }
+            (CensorshipStatus::Suspected, _) | (_, CensorshipStatus::Suspected) => {
+                CensorshipStatus::Suspected
+            }
+            _ => CensorshipStatus::None,
+        };
+        Ok(final_status)
     }
 
     async fn handshake(
         &self,
         ctx: &TransportContext<'_>,
     ) -> Result<TransportSession, TransportError> {
+        if matches!(ctx.censorship, CensorshipStatus::Active) {
+            return Err(TransportError::Censorship);
+        }
         if let Some(reality) = &ctx.endpoint.reality
             && reality.fingerprint != self.fingerprint
         {

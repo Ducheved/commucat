@@ -88,12 +88,10 @@ pub struct FecBatch {
     pub repair: Vec<Vec<u8>>,
 }
 
-#[allow(dead_code)]
 pub struct RaptorqDecoder {
     decoder: Decoder,
 }
 
-#[allow(dead_code)]
 impl RaptorqDecoder {
     pub fn new(oti: ObjectTransmissionInformation) -> Self {
         Self {

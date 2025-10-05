@@ -10,10 +10,40 @@ static OPENAPI_JSON: OnceLock<String> = OnceLock::new();
 /// Returns the OpenAPI specification as a JSON string.
 pub fn openapi_json() -> &'static str {
     OPENAPI_JSON.get_or_init(|| {
+        ensure_openapi_symbols_linked();
         ApiDoc::openapi()
             .to_pretty_json()
             .unwrap_or_else(|_| "{}".to_string())
     })
+}
+
+fn ensure_openapi_symbols_linked() {
+    let _ = server_info_endpoint as fn();
+    let _ = friends_get_endpoint as fn();
+    let _ = friends_put_endpoint as fn();
+    let _ = upload_avatar_endpoint as fn();
+    let _ = get_upload_endpoint as fn();
+    let _ = friend_devices_endpoint as fn();
+    let _ = friend_request_create_endpoint as fn();
+    let _ = friend_requests_list_endpoint as fn();
+    let _ = friend_request_accept_endpoint as fn();
+    let _ = friend_request_reject_endpoint as fn();
+    let _ = friend_delete_endpoint as fn();
+
+    let friend_devices = FriendDevicesParams {
+        user_id: String::new(),
+    };
+    let friend_request = FriendRequestParams {
+        user_id: String::new(),
+    };
+    let delete_friend = DeleteFriendParams {
+        user_id: String::new(),
+    };
+    let _ = (
+        friend_devices.user_id,
+        friend_request.user_id,
+        delete_friend.user_id,
+    );
 }
 
 #[derive(OpenApi)]
@@ -213,28 +243,24 @@ pub struct ServerInfoResponse {
 }
 
 #[derive(IntoParams)]
-#[allow(dead_code)]
 pub struct FriendDevicesParams {
     #[param(example = "user-abc123")]
     pub user_id: String,
 }
 
 #[derive(IntoParams)]
-#[allow(dead_code)]
 pub struct FriendRequestParams {
     #[param(example = "user-bob")]
     pub user_id: String,
 }
 
 #[derive(IntoParams)]
-#[allow(dead_code)]
 pub struct DeleteFriendParams {
     #[param(example = "user-alice")]
     pub user_id: String,
 }
 
 // Note: These functions are markers for OpenAPI generation and are not called directly
-#[allow(dead_code)]
 #[utoipa::path(
     get,
     path = "/api/server-info",
@@ -246,7 +272,6 @@ pub struct DeleteFriendParams {
 )]
 pub fn server_info_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     get,
     path = "/api/friends",
@@ -259,7 +284,6 @@ pub fn server_info_endpoint() {}
 )]
 pub fn friends_get_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     put,
     path = "/api/friends",
@@ -274,7 +298,6 @@ pub fn friends_get_endpoint() {}
 )]
 pub fn friends_put_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     post,
     path = "/api/users/me/avatar",
@@ -293,7 +316,6 @@ pub fn friends_put_endpoint() {}
 )]
 pub fn upload_avatar_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     get,
     path = "/uploads/{filename}",
@@ -309,7 +331,6 @@ pub fn upload_avatar_endpoint() {}
 )]
 pub fn get_upload_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     get,
     path = "/api/friends/{user_id}/devices",
@@ -324,7 +345,6 @@ pub fn get_upload_endpoint() {}
 )]
 pub fn friend_devices_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     post,
     path = "/api/friends/requests/{user_id}",
@@ -341,7 +361,6 @@ pub fn friend_devices_endpoint() {}
 )]
 pub fn friend_request_create_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     get,
     path = "/api/friends/requests",
@@ -354,7 +373,6 @@ pub fn friend_request_create_endpoint() {}
 )]
 pub fn friend_requests_list_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     post,
     path = "/api/friends/requests/{user_id}/accept",
@@ -369,7 +387,6 @@ pub fn friend_requests_list_endpoint() {}
 )]
 pub fn friend_request_accept_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     post,
     path = "/api/friends/requests/{user_id}/reject",
@@ -384,7 +401,6 @@ pub fn friend_request_accept_endpoint() {}
 )]
 pub fn friend_request_reject_endpoint() {}
 
-#[allow(dead_code)]
 #[utoipa::path(
     delete,
     path = "/api/friends/{user_id}",

@@ -427,9 +427,14 @@ async function connectWithRetry(mode, maxRetries = 5) {
 
 ### 4. Respect Keepalive
 
-Server sends keepalive based on `session.ttl_seconds`:
+Сервер теперь держит downstream активным:
+- **SSE** — каждые ~25 с приходит комментарий `:keepalive`.
+- **Long-poll** — каждые ~25 с приходит строка `{"keepalive":true}` (валидный NDJSON).
+
+Keepalive не отменяет требования поддерживать uplink: читайте тайминги из `/api/server-info` и продолжайте слать присутствие чаще, чем `keepalive_interval`.
+
 ```javascript
-// From /api/server-info
+// /api/server-info сообщает границы для клиента
 {
   "session": {
     "ttl_seconds": 60,
@@ -437,7 +442,7 @@ Server sends keepalive based on `session.ttl_seconds`:
   }
 }
 
-// Client must send data every 30 seconds or less
+// Клиент всё равно отправляет кадры присутствия чуть чаще keepalive_interval
 setInterval(() => {
   sendPresenceFrame();
 }, 25000); // 25s < 30s keepalive_interval

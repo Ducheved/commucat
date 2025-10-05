@@ -1,6 +1,9 @@
 use super::{ApiError, AppState};
 use crate::metrics::SecuritySnapshot;
-use crate::transport::{Endpoint, MultipathEndpoint, RealityConfig, TransportType};
+use crate::transport::{
+    Endpoint, MultipathEndpoint, MultipathPathInfo, PerformanceTier, RaptorqDecoder, RealityConfig,
+    ResistanceLevel, TransportError, TransportType,
+};
 use crate::util::{decode_hex32, encode_hex, generate_id};
 use commucat_crypto::{DeviceKeyPair, HandshakePattern, NoiseConfig, PqxdhBundle, build_handshake};
 use ml_kem::EncodedSizeUser;
@@ -132,7 +135,7 @@ pub(super) async fn handle_assist(
         })
         .unwrap_or_else(crate::transport::FecProfile::default_low_latency);
 
-    let _min_paths = request.min_paths.unwrap_or(2);
+    let requested_paths = request.min_paths.unwrap_or(2).max(1);
     let mut endpoints = Vec::new();
     if request.paths.is_empty() {
         endpoints.extend(default_paths(
@@ -149,46 +152,77 @@ pub(super) async fn handle_assist(
         return Err(ApiError::BadRequest("no paths provided".to_string()));
     }
 
-    // Save FEC parameters
-    let fec_mtu = fec_profile.mtu;
-    let fec_overhead = fec_profile.repair_overhead;
+    let required_paths = requested_paths.min(endpoints.len().max(1));
+    let mut path_info: Vec<MultipathPathInfo> = Vec::new();
+    let mut transports_advice: Vec<TransportAdvice> = Vec::new();
+    let mut sample_segments: HashMap<String, SampleBreakdown> = HashMap::new();
+    let mut primary_path: Option<String> = None;
 
-    // Build transport advice from available endpoints
-    // NOTE: Server does NOT establish connections - that's the CLIENT's job!
-    // We just provide advice about which transports to use
-    let transports_advice: Vec<TransportAdvice> = endpoints
-        .iter()
-        .map(|ep| {
-            // Determine transport type from endpoint
-            let transport = if ep.endpoint.reality.is_some() {
-                "Reality"
-            } else {
-                "WebSocket" // Default
-            };
+    {
+        let mut manager = state.transports.write().await;
+        match manager
+            .establish_multipath(&endpoints, required_paths, fec_profile.clone())
+            .await
+        {
+            Ok(tunnel) => {
+                state.metrics.mark_multipath_session(tunnel.path_count());
+                path_info = tunnel.path_info();
+                transports_advice = path_info.iter().map(transport_advice_from_info).collect();
+                if let Some(primary) = tunnel.primary_path_id() {
+                    primary_path = Some(primary.to_string());
+                }
 
-            TransportAdvice {
-                path_id: ep.id.clone(),
-                transport: transport.to_string(),
-                resistance: "Basic".to_string(),
-                latency: "Medium".to_string(),
-                throughput: "High".to_string(),
+                let sample_payload = generate_sample_payload(fec_profile.mtu as usize);
+                let dispatch = tunnel.encode_frame(&sample_payload);
+                let mut decoder = RaptorqDecoder::new(dispatch.oti);
+                let mut recovered = None;
+                for segment in dispatch.segments.iter() {
+                    let entry = sample_segments.entry(segment.path_id.clone()).or_default();
+                    entry.total += 1;
+                    if segment.repair {
+                        entry.repair += 1;
+                    }
+                    if recovered.is_none() {
+                        recovered = decoder.absorb(&segment.payload);
+                    }
+                }
+                if let Some(decoded) = recovered {
+                    if decoded == sample_payload {
+                        state
+                            .metrics
+                            .mark_fec_packets(dispatch.segments.len() as u64);
+                    } else {
+                        warn!("fec probe decode mismatch for assist response");
+                    }
+                }
             }
-        })
-        .collect();
-
-    // Build sample FEC segments for client guidance
-    let mut sample_segments = HashMap::new();
-    for (idx, ep) in endpoints.iter().enumerate() {
-        sample_segments.insert(
-            ep.id.clone(),
-            SampleBreakdown {
-                total: 10,
-                repair: if idx == 0 { 3 } else { 2 }, // Primary path gets more repair packets
-            },
-        );
+            Err(err) => {
+                warn!(error = %err, "p2p assist multipath establishment failed");
+                if matches!(err, TransportError::Censorship) {
+                    state.metrics.mark_censorship_deflection();
+                }
+            }
+        }
     }
 
-    let obfuscation = build_obfuscation_advice(&[], &endpoints);
+    if transports_advice.is_empty() {
+        transports_advice = fallback_transport_advice(&endpoints);
+    }
+    if sample_segments.is_empty() {
+        sample_segments = fallback_sample_segments(&endpoints);
+    }
+
+    if primary_path.is_none() {
+        primary_path = transports_advice
+            .first()
+            .map(|advice| advice.path_id.clone());
+    }
+
+    for endpoint in &endpoints {
+        sample_segments.entry(endpoint.id.clone()).or_default();
+    }
+
+    let obfuscation = build_obfuscation_advice(&path_info, &endpoints);
     let noise = build_noise_advice(state)?;
     state.metrics.mark_noise_handshake();
     let pq = build_pq_advice()?;
@@ -201,9 +235,9 @@ pub(super) async fn handle_assist(
         ice,
         transports: transports_advice,
         multipath: MultipathAdvice {
-            fec_mtu,
-            fec_overhead,
-            primary_path: Some("primary".to_string()),
+            fec_mtu: fec_profile.mtu,
+            fec_overhead: fec_profile.repair_overhead,
+            primary_path,
             sample_segments,
         },
         obfuscation,
@@ -211,6 +245,127 @@ pub(super) async fn handle_assist(
     };
 
     Ok(response)
+}
+
+fn transport_advice_from_info(info: &MultipathPathInfo) -> TransportAdvice {
+    TransportAdvice {
+        path_id: info.id.clone(),
+        transport: transport_label(info.transport).to_string(),
+        resistance: resistance_label_str(info.resistance).to_string(),
+        latency: tier_label_str(info.performance.latency).to_string(),
+        throughput: tier_label_str(info.performance.throughput).to_string(),
+    }
+}
+
+fn transport_label(transport: TransportType) -> &'static str {
+    match transport {
+        TransportType::AmnesiaWg => "AmnesiaWG",
+        TransportType::Reality => "Reality",
+        TransportType::Shadowsocks => "Shadowsocks",
+        TransportType::Onion => "Onion",
+        TransportType::QuicMasque => "QUICMasque",
+        TransportType::WebSocket => "WebSocket",
+        TransportType::Dns => "DNS",
+    }
+}
+
+fn resistance_label_str(level: ResistanceLevel) -> &'static str {
+    match level {
+        ResistanceLevel::Basic => "Basic",
+        ResistanceLevel::Enhanced => "Enhanced",
+        ResistanceLevel::Maximum => "Maximum",
+        ResistanceLevel::Paranoid => "Paranoid",
+    }
+}
+
+fn tier_label_str(tier: PerformanceTier) -> &'static str {
+    match tier {
+        PerformanceTier::High => "High",
+        PerformanceTier::Medium => "Medium",
+        PerformanceTier::Low => "Low",
+    }
+}
+
+fn default_transport_profile(
+    transport: TransportType,
+) -> (ResistanceLevel, PerformanceTier, PerformanceTier) {
+    match transport {
+        TransportType::Reality => (
+            ResistanceLevel::Maximum,
+            PerformanceTier::High,
+            PerformanceTier::High,
+        ),
+        TransportType::AmnesiaWg => (
+            ResistanceLevel::Maximum,
+            PerformanceTier::Medium,
+            PerformanceTier::Medium,
+        ),
+        TransportType::QuicMasque => (
+            ResistanceLevel::Enhanced,
+            PerformanceTier::High,
+            PerformanceTier::High,
+        ),
+        TransportType::Shadowsocks => (
+            ResistanceLevel::Enhanced,
+            PerformanceTier::Medium,
+            PerformanceTier::High,
+        ),
+        TransportType::Onion => (
+            ResistanceLevel::Paranoid,
+            PerformanceTier::Low,
+            PerformanceTier::Low,
+        ),
+        TransportType::Dns => (
+            ResistanceLevel::Enhanced,
+            PerformanceTier::Low,
+            PerformanceTier::Low,
+        ),
+        TransportType::WebSocket => (
+            ResistanceLevel::Basic,
+            PerformanceTier::Medium,
+            PerformanceTier::Medium,
+        ),
+    }
+}
+
+fn fallback_transport_advice(endpoints: &[MultipathEndpoint]) -> Vec<TransportAdvice> {
+    endpoints
+        .iter()
+        .map(|endpoint| {
+            let transport = if endpoint.endpoint.reality.is_some() {
+                TransportType::Reality
+            } else {
+                TransportType::WebSocket
+            };
+            let (resistance, latency, throughput) = default_transport_profile(transport);
+            TransportAdvice {
+                path_id: endpoint.id.clone(),
+                transport: transport_label(transport).to_string(),
+                resistance: resistance_label_str(resistance).to_string(),
+                latency: tier_label_str(latency).to_string(),
+                throughput: tier_label_str(throughput).to_string(),
+            }
+        })
+        .collect()
+}
+
+fn fallback_sample_segments(endpoints: &[MultipathEndpoint]) -> HashMap<String, SampleBreakdown> {
+    let mut result = HashMap::new();
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let total = if index == 0 { 12 } else { 8 };
+        let repair = ((total as f32) * if index == 0 { 0.3 } else { 0.2 })
+            .round()
+            .max(1.0) as usize;
+        result.insert(endpoint.id.clone(), SampleBreakdown { total, repair });
+    }
+    result
+}
+
+fn generate_sample_payload(mtu: usize) -> Vec<u8> {
+    let chunk = mtu.clamp(512, 2048);
+    let mut payload = vec![0u8; chunk * 3];
+    OsRng.fill_bytes(&mut payload);
+    payload
 }
 
 fn default_paths(

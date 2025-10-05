@@ -64,7 +64,6 @@ impl Metrics {
         self.pq_handshakes.fetch_add(1, Ordering::SeqCst);
     }
 
-    #[allow(dead_code)]
     pub fn mark_fec_packets(&self, packets: u64) {
         if packets == 0 {
             return;
@@ -72,14 +71,12 @@ impl Metrics {
         self.fec_packets.fetch_add(packets, Ordering::SeqCst);
     }
 
-    #[allow(dead_code)]
     pub fn mark_multipath_session(&self, paths: usize) {
         self.multipath_sessions.fetch_add(1, Ordering::SeqCst);
         self.multipath_paths_total
             .fetch_add(paths as u64, Ordering::SeqCst);
     }
 
-    #[allow(dead_code)]
     pub fn mark_censorship_deflection(&self) {
         self.censorship_deflections.fetch_add(1, Ordering::SeqCst);
     }

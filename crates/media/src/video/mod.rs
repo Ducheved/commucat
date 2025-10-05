@@ -76,9 +76,6 @@ enum VideoEncoderBackend {
     Vpx(VpxEncoder),
     #[cfg(feature = "codec-av1")]
     Av1(Rav1eEncoder),
-    #[allow(dead_code)]
-    #[cfg(feature = "codec-h264")]
-    H264,
     Unsupported(VideoCodec),
 }
 
@@ -149,15 +146,7 @@ impl VideoEncoder {
                 }
             }
             VideoCodec::H264Baseline | VideoCodec::H264Main | VideoCodec::H265Main => {
-                #[cfg(feature = "codec-h264")]
-                {
-                    // TODO: integrate hardware/software H264 encoder
-                    VideoEncoderBackend::Unsupported(config.codec)
-                }
-                #[cfg(not(feature = "codec-h264"))]
-                {
-                    VideoEncoderBackend::Unsupported(config.codec)
-                }
+                VideoEncoderBackend::Unsupported(config.codec)
             }
         };
         Ok(Self {
@@ -186,8 +175,6 @@ impl VideoEncoder {
                 self.pts = self.pts.wrapping_add(1);
                 Ok(frames)
             }
-            #[cfg(feature = "codec-h264")]
-            VideoEncoderBackend::H264 => Err(MediaError::Unsupported),
             VideoEncoderBackend::Unsupported(codec) => Err(MediaError::Codec(format!(
                 "encoder for {codec:?} is not available"
             ))),
@@ -240,12 +227,8 @@ enum VideoDecoderBackend {
     None,
     Raw,
     Vpx(VpxDecoder),
-    #[allow(dead_code)]
     #[cfg(feature = "codec-av1")]
     Av1,
-    #[allow(dead_code)]
-    #[cfg(feature = "codec-h264")]
-    H264,
 }
 
 impl fmt::Debug for VideoDecoder {
@@ -283,8 +266,6 @@ impl VideoDecoder {
             VideoDecoderBackend::Vpx(decoder) => decoder.decode(frame),
             #[cfg(feature = "codec-av1")]
             VideoDecoderBackend::Av1 => Err(MediaError::Unsupported),
-            #[cfg(feature = "codec-h264")]
-            VideoDecoderBackend::H264 => Err(MediaError::Unsupported),
             VideoDecoderBackend::None => Err(MediaError::Unsupported),
         }
     }
@@ -297,8 +278,6 @@ impl VideoDecoder {
             }
             #[cfg(feature = "codec-av1")]
             (VideoDecoderBackend::Av1, VideoCodec::Av1Main) => false,
-            #[cfg(feature = "codec-h264")]
-            (VideoDecoderBackend::H264, VideoCodec::H264Baseline | VideoCodec::H264Main) => false,
             _ => true,
         };
         if !need_switch {
@@ -318,14 +297,7 @@ impl VideoDecoder {
                 }
             }
             VideoCodec::H264Baseline | VideoCodec::H264Main | VideoCodec::H265Main => {
-                #[cfg(feature = "codec-h264")]
-                {
-                    VideoDecoderBackend::H264
-                }
-                #[cfg(not(feature = "codec-h264"))]
-                {
-                    return Err(MediaError::Unsupported);
-                }
+                return Err(MediaError::Unsupported);
             }
         };
         Ok(())

@@ -64,7 +64,7 @@ use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::convert::TryFrom;
+use std::convert::{TryFrom, TryInto};
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::future::Future;
@@ -72,7 +72,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant as StdInstant};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{interval, timeout};
 use tokio_tungstenite::WebSocketStream;
@@ -177,6 +177,7 @@ struct HttpChannel {
     format: HttpConnectFormat,
     remote_addr: Option<String>,
     request_summary: String,
+    last_keepalive: StdInstant,
 }
 
 struct WebSocketChannel {
@@ -192,6 +193,8 @@ enum ConnectChannel {
 }
 
 impl HttpChannel {
+    const KEEPALIVE_INTERVAL: StdDuration = StdDuration::from_secs(25);
+
     fn remote_addr(&self) -> Option<&str> {
         self.remote_addr.as_deref()
     }
@@ -247,6 +250,7 @@ impl HttpChannel {
                     .map_err(|_| ServerError::Io)?;
             }
         }
+        self.last_keepalive = StdInstant::now();
         Ok(())
     }
 
@@ -256,8 +260,48 @@ impl HttpChannel {
                 .write_response_body(b":ready\n\n".to_vec().into(), false)
                 .await
                 .map_err(|_| ServerError::Io)?;
+            self.last_keepalive = StdInstant::now();
         }
         Ok(())
+    }
+
+    async fn maybe_send_keepalive(&mut self) -> Result<(), ServerError> {
+        if !matches!(
+            self.format,
+            HttpConnectFormat::Sse | HttpConnectFormat::LongPoll
+        ) {
+            return Ok(());
+        }
+        let now = StdInstant::now();
+        if now.duration_since(self.last_keepalive) < Self::KEEPALIVE_INTERVAL {
+            return Ok(());
+        }
+        match self.format {
+            HttpConnectFormat::Sse => self.write_sse_keepalive().await?,
+            HttpConnectFormat::LongPoll => self.write_longpoll_keepalive().await?,
+            HttpConnectFormat::Binary => {}
+        }
+        self.last_keepalive = now;
+        Ok(())
+    }
+
+    async fn write_sse_keepalive(&mut self) -> Result<(), ServerError> {
+        self.session
+            .write_response_body(b":keepalive\n\n".to_vec().into(), false)
+            .await
+            .map_err(|_| ServerError::Io)
+    }
+
+    async fn write_longpoll_keepalive(&mut self) -> Result<(), ServerError> {
+        let mut message = json!({
+            "keepalive": true,
+        })
+        .to_string();
+        message.push('\n');
+        self.session
+            .write_response_body(message.into_bytes().into(), false)
+            .await
+            .map_err(|_| ServerError::Io)
     }
 
     async fn finish(self) -> Result<(), ServerError> {
@@ -370,6 +414,13 @@ impl ConnectChannel {
         }
     }
 
+    async fn maybe_send_keepalive(&mut self) -> Result<(), ServerError> {
+        match self {
+            Self::Http(channel) => channel.maybe_send_keepalive().await,
+            Self::WebSocket(_) => Ok(()),
+        }
+    }
+
     async fn start_http(
         mut session: ServerSession,
         format: HttpConnectFormat,
@@ -401,6 +452,7 @@ impl ConnectChannel {
             format,
             remote_addr,
             request_summary,
+            last_keepalive: StdInstant::now(),
         };
         channel.send_sse_preamble().await?;
         Ok(Self::Http(channel))
@@ -847,17 +899,14 @@ fn user_snapshot(profile: &UserProfile) -> serde_json::Value {
 
 // P2P relay session for connecting two peers
 pub(crate) struct P2pSession {
-    #[allow(dead_code)]
-    session_id: String,
     peer_a: Option<mpsc::Sender<Vec<u8>>>,
     peer_b: Option<mpsc::Sender<Vec<u8>>>,
     created_at: std::time::Instant,
 }
 
 impl P2pSession {
-    fn new(session_id: String) -> Self {
+    fn new() -> Self {
         Self {
-            session_id,
             peer_a: None,
             peer_b: None,
             created_at: std::time::Instant::now(),
@@ -1003,8 +1052,6 @@ enum ApiError {
     NotFound,
     Conflict(String),
     Internal,
-    #[allow(dead_code)]
-    NotImplemented,
 }
 
 impl ApiError {
@@ -1016,7 +1063,6 @@ impl ApiError {
             Self::NotFound => 404,
             Self::Conflict(_) => 409,
             Self::Internal => 500,
-            Self::NotImplemented => 501,
         }
     }
 
@@ -1028,7 +1074,6 @@ impl ApiError {
             Self::NotFound => "NotFound",
             Self::Conflict(_) => "Conflict",
             Self::Internal => "InternalError",
-            Self::NotImplemented => "NotImplemented",
         }
     }
 }
@@ -1389,6 +1434,24 @@ fn parse_federated_id(input: &str) -> (String, Option<String>) {
         }
     }
     (input.to_string(), None)
+}
+
+fn canonical_friend_request_bytes(
+    request_id: &str,
+    from: &str,
+    to: &str,
+    message: Option<&str>,
+    timestamp: &str,
+) -> Vec<u8> {
+    format!(
+        "{}|{}|{}|{}|{}",
+        request_id.trim(),
+        from.trim(),
+        to.trim(),
+        message.unwrap_or("").trim(),
+        timestamp.trim()
+    )
+    .into_bytes()
 }
 
 fn decode_friend_user_id(segment: &str) -> Result<String, ApiError> {
@@ -2362,13 +2425,24 @@ impl CommuCatApp {
 
         // Создаём задачу в federation_outbox для отправки
         let outbox_id = generate_id("fed-outbox");
+        let timestamp = now.to_rfc3339();
+        let canonical = canonical_friend_request_bytes(
+            &request_id,
+            &from_federated_id,
+            &to_federated_id,
+            message.as_deref(),
+            &timestamp,
+        );
+        let signature = self.state.federation_signer.sign(&canonical);
+        let message_for_payload = message.clone();
         let payload = json!({
             "type": "friend_request",
             "request_id": request_id,
             "from": from_federated_id,
             "to": to_federated_id,
-            "message": message,
-            "timestamp": now.to_rfc3339(),
+            "message": message_for_payload,
+            "timestamp": timestamp,
+            "signature": encode_hex(&signature),
         });
 
         // Ставим задачу в очередь federation_outbox
@@ -2465,7 +2539,12 @@ impl CommuCatApp {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let _signature = payload
+        let timestamp = payload
+            .get("timestamp")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ApiError::BadRequest("missing 'timestamp' field".to_string()))?;
+
+        let signature_hex = payload
             .get("signature")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ApiError::BadRequest("missing 'signature' field".to_string()))?;
@@ -2496,19 +2575,37 @@ impl CommuCatApp {
         }
 
         // Проверяем, что отправитель - известный peer
-        let _peer = self
-            .state
-            .config
-            .peers
-            .iter()
-            .find(|p| p.domain == from_domain)
-            .ok_or_else(|| {
+        let peer = match self.fetch_peer_config(&from_domain).await {
+            Some(peer) => peer,
+            None => {
                 tracing::error!("unknown peer domain: {}", from_domain);
-                ApiError::BadRequest(format!("unknown peer: {}", from_domain))
-            })?;
+                return Err(ApiError::BadRequest(format!(
+                    "unknown peer: {}",
+                    from_domain
+                )));
+            }
+        };
 
-        // TODO: Проверить подпись запроса
-        tracing::warn!("signature verification not yet implemented");
+        let signature_raw = decode_hex(signature_hex)
+            .map_err(|_| ApiError::BadRequest("invalid signature encoding".to_string()))?;
+        let signature: [u8; 64] = signature_raw
+            .as_slice()
+            .try_into()
+            .map_err(|_| ApiError::BadRequest("invalid signature length".to_string()))?;
+        let canonical = canonical_friend_request_bytes(
+            request_id,
+            from_federated_id,
+            to_federated_id,
+            message.as_deref(),
+            timestamp,
+        );
+        let verifier = EventVerifier {
+            public: peer.public_key,
+        };
+        if let Err(err) = verifier.verify(&canonical, &signature) {
+            tracing::warn!("friend request signature verification failed: {}", err);
+            return Err(ApiError::BadRequest("invalid signature".to_string()));
+        }
 
         // Проверяем, существует ли локальный пользователь 'to_handle'
         let to_user = self
@@ -2532,7 +2629,7 @@ impl CommuCatApp {
             to_user_id: to_federated_id.to_string(),
             from_domain: from_domain.clone(),
             to_domain: self.state.config.domain.clone(),
-            message,
+            message: message.clone(),
             status: "pending".to_string(),
             federation_event_id: Some(request_id.to_string()),
             created_at: now,
@@ -2555,7 +2652,15 @@ impl CommuCatApp {
             to_user.user_id
         );
 
-        // TODO: Уведомить локального пользователя (push notification, websocket, etc.)
+        self.notify_user_friend_request(
+            &to_user,
+            request_id,
+            from_federated_id,
+            message.as_deref(),
+            true,
+            timestamp,
+        )
+        .await;
 
         // Возвращаем успех
         let response = json!({
@@ -3583,7 +3688,6 @@ impl CommuCatApp {
             ApiError::Internal => Some("internal server error"),
             ApiError::BadRequest(reason) => Some(reason.as_str()),
             ApiError::Conflict(reason) => Some(reason.as_str()),
-            ApiError::NotImplemented => Some("feature not yet implemented"),
         };
         let mut body = json!({
             "type": "about:blank",
@@ -3641,6 +3745,68 @@ impl CommuCatApp {
                 device = device_id,
                 "failed to deliver key rotation notification"
             );
+        }
+    }
+
+    async fn notify_user_friend_request(
+        &self,
+        user: &UserProfile,
+        request_id: &str,
+        from: &str,
+        message: Option<&str>,
+        federated: bool,
+        timestamp: &str,
+    ) {
+        let devices = match self
+            .state
+            .storage
+            .list_devices_for_user(&user.user_id)
+            .await
+        {
+            Ok(devices) => devices,
+            Err(err) => {
+                warn!(user = %user.user_id, error = %err, "friend request notify enumerate devices failed");
+                return;
+            }
+        };
+        for device in devices {
+            let mut properties = serde_json::Map::new();
+            properties.insert("type".to_string(), json!("friend_request"));
+            properties.insert("request_id".to_string(), json!(request_id));
+            properties.insert("from".to_string(), json!(from));
+            properties.insert("user_id".to_string(), json!(user.user_id));
+            properties.insert("federated".to_string(), json!(federated));
+            properties.insert("timestamp".to_string(), json!(timestamp));
+            properties.insert("handle".to_string(), json!(&user.handle));
+            if let Some(display) = user.display_name.clone() {
+                properties.insert("display_name".to_string(), json!(display));
+            }
+            if let Some(avatar) = user.avatar_url.clone() {
+                properties.insert("avatar_url".to_string(), json!(avatar));
+            }
+            if let Some(msg) = message {
+                properties.insert("message".to_string(), json!(msg));
+            }
+            properties.insert("target_device".to_string(), json!(device.device_id.clone()));
+            let payload = FramePayload::Control(ControlEnvelope {
+                properties: Value::Object(properties),
+            });
+            let frame = Frame {
+                channel_id: self.state.config.device_rotation.notify_channel,
+                sequence: 0,
+                frame_type: FrameType::GroupEvent,
+                payload,
+            };
+            if let Err(err) = self
+                .deliver_federation_frame(&device.device_id, frame)
+                .await
+            {
+                warn!(
+                    device = %device.device_id,
+                    error = %err,
+                    "failed to deliver friend request notification"
+                );
+            }
         }
     }
 
@@ -4136,6 +4302,15 @@ impl CommuCatApp {
                         error!("Empty session_id received");
                         return None;
                     }
+                    let valid = trimmed.len() >= 16
+                        && trimmed.len() <= 96
+                        && trimmed
+                            .chars()
+                            .all(|ch| matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_'));
+                    if !valid {
+                        error!("Invalid session_id format received");
+                        return None;
+                    }
                     trimmed.to_string()
                 }
                 Err(_) => {
@@ -4191,7 +4366,7 @@ impl CommuCatApp {
                 }
                 std::collections::hash_map::Entry::Vacant(entry) => {
                     // Create new session with this as first peer
-                    let mut new_session = P2pSession::new(session_id.clone());
+                    let mut new_session = P2pSession::new();
                     new_session.peer_a = Some(tx);
                     entry.insert(new_session);
                     info!(session_id = %session_id, "New P2P session created, waiting for second peer");
@@ -4821,6 +4996,10 @@ impl CommuCatApp {
                 }
                 Err(_) => {
                     if rx_out.is_closed() && rx_out.is_empty() {
+                        break;
+                    }
+                    if let Err(err) = channel.maybe_send_keepalive().await {
+                        error!("keepalive send failed: {}", err);
                         break;
                     }
                     continue;

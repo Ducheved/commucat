@@ -3,11 +3,11 @@
 ## Overview
 
 The CommuCat P2P Assist API helps establish peer-to-peer connections by providing:
-- **Multipath transport** configuration with performance metrics
+- **Multipath transport** configuration with live performance metrics captured during the request
 - **ICE credentials** for NAT traversal (STUN/TURN)
 - **Cryptographic parameters** (Noise Protocol + Post-Quantum)
-- **Forward Error Correction (FEC)** settings for packet loss resilience
-- **Obfuscation advice** for censorship resistance
+- **Forward Error Correction (FEC)** settings for packet loss resilience with RaptorQ sampling results
+- **Obfuscation advice** for censorship resistance derived from active transport probing
 
 ## Endpoint
 
@@ -115,14 +115,14 @@ Content-Type: application/json
     {
       "path_id": "primary",
       "transport": "WebSocket",
-      "resistance": "Normal",
+      "resistance": "Basic",
       "latency": "Low",
       "throughput": "High"
     },
     {
       "path_id": "backup",
       "transport": "Reality",
-      "resistance": "Paranoid",
+      "resistance": "Maximum",
       "latency": "Medium",
       "throughput": "Medium"
     }
@@ -133,12 +133,12 @@ Content-Type: application/json
     "primary_path": "primary",
     "sample_segments": {
       "primary": {
-        "total": 10,
-        "repair": 3
+        "total": 24,
+        "repair": 7
       },
       "backup": {
-        "total": 5,
-        "repair": 2
+        "total": 18,
+        "repair": 6
       }
     }
   },
@@ -192,10 +192,10 @@ Content-Type: application/json
 | Field | Type | Description |
 |-------|------|-------------|
 | `path_id` | string | Unique path identifier |
-| `transport` | string | Transport type: WebSocket, QuicMasque, Dns, Shadowsocks, Onion, Reality |
-| `resistance` | string | Censorship resistance: Normal, High, Paranoid |
-| `latency` | string | Expected latency: Low, Medium, High |
-| `throughput` | string | Expected throughput: Low, Medium, High |
+| `transport` | string | Transport type: `WebSocket`, `QuicMasque`, `Dns`, `Shadowsocks`, `Onion`, `Reality`, `AmnesiaWG` |
+| `resistance` | string | Censorship resistance tier (`Basic`, `Enhanced`, `Maximum`, `Paranoid`) |
+| `latency` | string | Measured latency tier (`Low`, `Medium`, `High`) |
+| `throughput` | string | Estimated throughput tier (`Low`, `Medium`, `High`) |
 
 #### `multipath` Object - Multipath Configuration
 
@@ -204,7 +204,7 @@ Content-Type: application/json
 | `fec_mtu` | integer | Maximum transmission unit for FEC |
 | `fec_overhead` | float | Repair packet ratio (e.g., 0.35 = 35% redundancy) |
 | `primary_path` | string | Primary path ID |
-| `sample_segments` | object | FEC test results per path |
+| `sample_segments` | object | FEC test results per path (derived from on-the-fly RaptorQ encode) |
 
 #### `obfuscation` Object - Censorship Circumvention
 
