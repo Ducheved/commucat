@@ -596,6 +596,7 @@ struct HandshakeContext {
     certificate: Option<DeviceCertificate>,
     noise_key: Option<NoiseKey>,
     transport: Option<Arc<Mutex<NoiseTransport>>>,
+    device_known: bool,
 }
 
 pub struct CommuCatApp {
@@ -3580,6 +3581,7 @@ impl CommuCatApp {
             certificate: None,
             noise_key: None,
             transport: None,
+            device_known: false,
         };
         let mut server_sequence = 1u64;
         let mut shutdown_rx = shutdown.clone();
@@ -3588,10 +3590,24 @@ impl CommuCatApp {
             match session.read_request_body().await {
                 Ok(Some(chunk)) => buffer.extend_from_slice(&chunk),
                 Ok(None) => {
+                    self.emit_handshake_failure(
+                        &handshake,
+                        remote_addr.as_deref(),
+                        "client-closed",
+                        json!({
+                            "error": "client_closed",
+                            "source": "body",
+                        }),
+                    );
                     return None;
                 }
                 Err(err) => {
-                    error!("handshake read failed: {}", err);
+                    error!(
+                        stage = handshake.stage.as_str(),
+                        remote_addr = remote_addr.as_deref().unwrap_or("unknown"),
+                        error = %err,
+                        "handshake read failed"
+                    );
                     self.emit_handshake_failure(
                         &handshake,
                         remote_addr.as_deref(),
@@ -3609,6 +3625,7 @@ impl CommuCatApp {
                 match decoded {
                     Ok((frame, consumed)) => {
                         buffer.drain(0..consumed);
+                        let previous_stage = handshake.stage.as_str();
                         if let Err(err) = self
                             .process_handshake_frame(
                                 &mut session,
@@ -3643,6 +3660,18 @@ impl CommuCatApp {
                             let _ = self.write_frame(&mut session, error_frame, None).await;
                             session.finish().await.ok()?;
                             return None;
+                        } else {
+                            let stage = handshake.stage.as_str();
+                            if stage != previous_stage {
+                                debug!(
+                                    remote_addr = remote_addr.as_deref().unwrap_or("unknown"),
+                                    device = %handshake.device_id,
+                                    user = %handshake.user_id,
+                                    from = previous_stage,
+                                    to = stage,
+                                    "handshake stage advanced"
+                                );
+                            }
                         }
                         if matches!(handshake.stage, HandshakeStage::Established) {
                             break;
@@ -3650,7 +3679,12 @@ impl CommuCatApp {
                     }
                     Err(commucat_proto::CodecError::UnexpectedEof) => break,
                     Err(err) => {
-                        error!("handshake decode failure: {}", err);
+                        error!(
+                            remote_addr = remote_addr.as_deref().unwrap_or("unknown"),
+                            stage = handshake.stage.as_str(),
+                            error = %err,
+                            "handshake decode failure"
+                        );
                         self.emit_handshake_failure(
                             &handshake,
                             remote_addr.as_deref(),
@@ -3691,6 +3725,24 @@ impl CommuCatApp {
                 }
             },
         };
+
+        let remote = remote_addr.as_deref().unwrap_or("unknown");
+        let (noise_key_version, noise_key_active) = match handshake.noise_key.as_ref() {
+            Some(key) => (key.version, true),
+            None => (0, false),
+        };
+        info!(
+            remote_addr = remote,
+            device = %device_id,
+            user = %user_id,
+            session = %session_id,
+            protocol_version = handshake.protocol_version,
+            noise_key_version,
+            noise_key_active,
+            device_known = handshake.device_known,
+            stage = handshake.stage.as_str(),
+            "handshake established"
+        );
 
         if let Some(addr) = remote_addr.clone() {
             let mut peers = self.state.peer_sessions.write().await;
@@ -4347,6 +4399,7 @@ impl CommuCatApp {
                 context.user_id = user_id.clone();
                 context.user_profile = Some(user_profile.clone());
                 context.certificate = Some(certificate.clone());
+                context.device_known = device_was_known;
 
                 let session_id = generate_id(&device_id);
                 let user_payload = user_snapshot(&user_profile);
@@ -4445,12 +4498,30 @@ impl CommuCatApp {
         detail: serde_json::Value,
     ) {
         let recorded_at = Utc::now();
+        let remote_for_hash = remote_addr.unwrap_or("");
+        let remote_label = if remote_for_hash.is_empty() {
+            "unknown"
+        } else {
+            remote_for_hash
+        };
+        let detail_log = detail.clone();
+        warn!(
+            remote_addr = remote_label,
+            stage = context.stage.as_str(),
+            device = %context.device_id,
+            user = %context.user_id,
+            device_known = context.device_known,
+            reason,
+            detail = ?detail_log,
+            "handshake failure"
+        );
+
         let digest_seed = format!(
             "handshake-failure:{}:{}:{}:{}:{}",
             reason,
             context.device_id,
             context.user_id,
-            remote_addr.unwrap_or(""),
+            remote_for_hash,
             recorded_at.timestamp_nanos_opt().unwrap_or_default()
         );
         let digest_hash = blake3_hash(digest_seed.as_bytes());
@@ -4463,6 +4534,7 @@ impl CommuCatApp {
         metadata.insert("stage".to_string(), json!(context.stage.as_str()));
         metadata.insert("reason".to_string(), json!(reason));
         metadata.insert("detail".to_string(), detail);
+        metadata.insert("device_known".to_string(), json!(context.device_known));
         if let Some(addr) = remote_addr {
             metadata.insert("remote_addr".to_string(), json!(addr));
         }
