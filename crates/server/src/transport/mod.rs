@@ -88,21 +88,21 @@ impl AsyncRead for WebSocketAdapter {
             Poll::Ready(Some(Ok(Message::Ping(data)))) => {
                 // Respond to ping with pong
                 tracing::info!(
-                    "📥 Received WebSocket Ping with {} bytes of data",
+                    "📥 WebSocket Ping received ({} bytes) - responding with Pong",
                     data.len()
                 );
                 let pong = Message::Pong(data.clone());
                 if let Err(e) = Pin::new(&mut self.stream).start_send(pong) {
-                    tracing::error!("❌ Failed to send pong: {}", e);
+                    tracing::error!("❌ Failed to send WebSocket Pong: {}", e);
                 } else {
-                    tracing::info!("📤 Sent WebSocket Pong response");
+                    tracing::info!("📤 WebSocket Pong sent successfully");
                 }
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Poll::Ready(Some(Ok(Message::Pong(data)))) => {
                 // Pong received, continue reading
-                tracing::info!(
+                tracing::debug!(
                     "📥 Received WebSocket Pong with {} bytes of data",
                     data.len()
                 );

@@ -31,6 +31,12 @@ pub struct Metrics {
     noise_rotations: AtomicU64,
     admin_rotations: AtomicU64,
     device_rotations: AtomicU64,
+    // WebSocket-specific metrics
+    websocket_connections: AtomicU64,
+    websocket_pings_received: AtomicU64,
+    websocket_pongs_sent: AtomicU64,
+    websocket_pongs_received: AtomicU64,
+    websocket_connection_errors: AtomicU64,
 }
 
 impl Metrics {
@@ -165,6 +171,69 @@ impl Metrics {
         self.device_rotations.fetch_add(1, Ordering::SeqCst);
     }
 
+    // WebSocket metrics
+    #[allow(dead_code)]
+    pub fn incr_websocket_connections(&self) {
+        self.websocket_connections.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn decr_websocket_connections(&self) {
+        self.websocket_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_websocket_ping_received(&self) {
+        self.websocket_pings_received.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_websocket_pong_sent(&self) {
+        self.websocket_pongs_sent.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_websocket_pong_received(&self) {
+        self.websocket_pongs_received.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[allow(dead_code)]
+    pub fn mark_websocket_error(&self) {
+        self.websocket_connection_errors
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    // Public getters for basic metrics
+    pub fn connections_active(&self) -> u64 {
+        self.connections_active.load(Ordering::SeqCst)
+    }
+
+    pub fn frames_ingress(&self) -> u64 {
+        self.frames_ingress.load(Ordering::SeqCst)
+    }
+
+    pub fn frames_egress(&self) -> u64 {
+        self.frames_egress.load(Ordering::SeqCst)
+    }
+
+    pub fn websocket_snapshot(&self) -> WebSocketSnapshot {
+        let pings = self.websocket_pings_received.load(Ordering::SeqCst);
+        let pongs_sent = self.websocket_pongs_sent.load(Ordering::SeqCst);
+
+        WebSocketSnapshot {
+            active_connections: self.websocket_connections.load(Ordering::SeqCst),
+            pings_received: pings,
+            pongs_sent,
+            pongs_received: self.websocket_pongs_received.load(Ordering::SeqCst),
+            connection_errors: self.websocket_connection_errors.load(Ordering::SeqCst),
+            ping_pong_ratio: if pings > 0 {
+                pongs_sent as f64 / pings as f64
+            } else {
+                0.0
+            },
+        }
+    }
+
     pub fn security_snapshot(&self) -> SecuritySnapshot {
         let sessions = self.multipath_sessions.load(Ordering::SeqCst);
         let paths_total = self.multipath_paths_total.load(Ordering::SeqCst);
@@ -225,4 +294,26 @@ pub struct SecuritySnapshot {
     pub multipath_sessions: u64,
     pub average_paths: f64,
     pub censorship_deflections: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WebSocketSnapshot {
+    pub active_connections: u64,
+    pub pings_received: u64,
+    pub pongs_sent: u64,
+    pub pongs_received: u64,
+    pub connection_errors: u64,
+    pub ping_pong_ratio: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HealthSnapshot {
+    pub status: String,
+    pub uptime_seconds: u64,
+    pub version: String,
+    pub connections: u64,
+    pub traffic_ingress: u64,
+    pub traffic_egress: u64,
+    pub websocket: WebSocketSnapshot,
+    pub security: SecuritySnapshot,
 }

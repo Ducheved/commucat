@@ -75,6 +75,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use std::time::{Duration as StdDuration, Instant as StdInstant};
 use tokio::sync::{Mutex, RwLock, mpsc};
 use tokio::time::{interval, timeout};
@@ -1038,6 +1039,7 @@ pub struct AppState {
     pub transports: RwLock<TransportManager>,
     pub ice: IceRuntime,
     pub pq: Option<PqRuntime>,
+    pub started_at: Instant,
     pub p2p_sessions: RwLock<HashMap<String, P2pSession>>,
 }
 
@@ -1404,6 +1406,7 @@ impl CommuCatApp {
             transports: RwLock::new(transports),
             ice: ice_runtime,
             pq: pq_runtime,
+            started_at: Instant::now(),
             p2p_sessions: RwLock::new(HashMap::new()),
             config,
         });
@@ -1653,14 +1656,33 @@ impl CommuCatApp {
             }
             "/healthz" => {
                 self.state.metrics.mark_ingress();
+
+                // Create detailed health snapshot
+                let uptime = self.state.started_at.elapsed().as_secs();
+                let health = crate::metrics::HealthSnapshot {
+                    status: "healthy".to_string(),
+                    uptime_seconds: uptime,
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                    connections: self.state.metrics.connections_active(),
+                    traffic_ingress: self.state.metrics.frames_ingress(),
+                    traffic_egress: self.state.metrics.frames_egress(),
+                    websocket: self.state.metrics.websocket_snapshot(),
+                    security: self.state.metrics.security_snapshot(),
+                };
+
+                let health_json = serde_json::to_string_pretty(&health)
+                    .unwrap_or_else(|_| "{\"error\":\"serialization_failed\"}".to_string());
+
                 let mut response = ResponseHeader::build_no_case(200, None).ok()?;
-                response.append_header("content-type", "text/plain").ok()?;
+                response
+                    .append_header("content-type", "application/json")
+                    .ok()?;
                 session
                     .write_response_header(Box::new(response))
                     .await
                     .ok()?;
                 session
-                    .write_response_body(Vec::from("ok".as_bytes()).into(), true)
+                    .write_response_body(Vec::from(health_json.as_bytes()).into(), true)
                     .await
                     .ok()?;
                 session.finish().await.ok()?;
