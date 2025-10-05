@@ -286,6 +286,17 @@ _Обновляется по мере выполнения задач_
 - ✅ Добавлено поле expires_at в IceAdvice для TURN credentials
 - ✅ Исправлены все ошибки clippy, проект компилируется без warnings
 - ✅ ICE-lite и TURN интеграция подтверждена как полностью функциональная
+- ✅ **Сделан P2P assist user-friendly и автоматическим:**
+  - PQ advice теперь опциональный (не ломает 500 если не настроен)
+  - Используются pre-configured ключи из state вместо генерации каждый раз
+  - Graceful fallback если PQ не доступен
+- ✅ **Создана полная интеграционная документация** (`docs/P2P_PQ_INTEGRATION_GUIDE.md`):
+  - Discovery API (`/api/server-info`)
+  - P2P Assist API (`/api/p2p/assist`)
+  - Hybrid PQ handshake flow
+  - ICE/TURN NAT traversal guide
+  - Примеры для Python, JavaScript, cURL
+  - Troubleshooting секция
 
 ---
 
