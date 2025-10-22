@@ -959,20 +959,28 @@ fn build_obfuscation_advice(
 fn build_noise_advice(state: &AppState) -> Result<NoiseAdvice, ApiError> {
     let mut seed = [0u8; 32];
     OsRng.fill_bytes(&mut seed);
-    let device = DeviceKeyPair::from_seed(&seed).map_err(|_| ApiError::Internal)?;
+    let device = DeviceKeyPair::from_seed(&seed).map_err(|err| {
+        warn!(error = %err, "p2p assist failed to derive noise device keypair");
+        ApiError::Internal
+    })?;
     let prologue = state.config.prologue.clone();
+    let server_static = state.config.noise_public;
     let config = NoiseConfig {
         pattern: HandshakePattern::Xk,
         prologue: prologue.clone(),
         local_private: device.private,
         local_static_public: Some(device.public),
-        remote_static_public: None,
+        remote_static_public: Some(server_static),
     };
     // Produce a dummy initiator handshake to ensure parameters are valid.
-    let mut handshake = build_handshake(&config, true).map_err(|_| ApiError::Internal)?;
-    let _ = handshake
-        .write_message(&[])
-        .map_err(|_| ApiError::Internal)?;
+    let mut handshake = build_handshake(&config, true).map_err(|err| {
+        warn!(error = %err, "p2p assist failed to build noise handshake preview");
+        ApiError::Internal
+    })?;
+    let _ = handshake.write_message(&[]).map_err(|err| {
+        warn!(error = %err, "p2p assist failed to emit noise handshake message");
+        ApiError::Internal
+    })?;
     Ok(NoiseAdvice {
         pattern: config.pattern,
         prologue_hex: encode_hex(&prologue),
